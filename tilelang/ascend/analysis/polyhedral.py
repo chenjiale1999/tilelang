@@ -683,13 +683,20 @@ class ValueNode:
 
     @property
     def is_uniform(self) -> bool:
-        """整个子表达式是否 lane 内均匀（不需要向量寄存器）。"""
+        """整个子表达式是否 lane 内均匀（不需要向量寄存器）。
+
+        ``all([])`` 为真，所以**必须**在递归之前先把所有「无 args 的叶子」挡掉：
+        ``lane_index`` / ``vbrc``（有 args，显式覆盖）之外，``vload`` / ``vload_strided`` /
+        ``gather`` 都是无 args 叶子，它们承载的是**逐 lane 变化**的向量值，一旦被真空判为
+        均匀就会喂进 ``vadds``/``vmuls`` 之类的标量-向量变体，在发射期报
+        ``cannot scalarize vector value``。
+        """
         if self.recipe in ("lane_index", "vbrc"):
             return False
         if self.recipe in _UNIFORM_RECIPES:
             return True
-        if self.recipe == "vload":
-            return self.access is not None and self.access._uniform
+        if not self.args:  # 其余无 args 叶子（vload / vload_strided / gather）恒非均匀
+            return False
         return all(arg.is_uniform for arg in self.args)
 
 
@@ -698,12 +705,6 @@ def _dtype_of(expr) -> str:
     if isinstance(dtype, str):
         return dtype
     return str(dtype)
-
-
-def _is_scalar_dtype(expr) -> bool:
-    dtype = expr.dtype
-    lanes = getattr(dtype, "lanes", 1)
-    return int(lanes) == 1
 
 
 @dataclass
@@ -924,7 +925,6 @@ def load_node(info: AccessInfo, ctx: _ValueContext, is_global_ok: bool) -> Value
             "global-memory operand inside T.Parallel (方案 §0 Case II): needs an explicit UB staging copy before the parallel nest"
         )
     kind, stride = info.axis_class(ctx.vector_axis)
-    info._uniform = kind == AccessClass.UNIFORM  # type: ignore[attr-defined]
     if kind == AccessClass.CONTIGUOUS:
         return ValueNode("vload", ctx.vector_dtype, access=info)
     if kind == AccessClass.UNIFORM:
@@ -983,15 +983,26 @@ class StorePlan:
     mask: ValueNode | None = None
     kind: AccessClass = AccessClass.CONTIGUOUS
     index: ValueNode | None = None  # 分片/置换/间接写的每 lane 索引向量（scatter）
+    reduce: ReduceInfo | None = None  # 归约段里**逐 store** 的归约描述（方案 §2 Case II）
 
 
 @dataclass
 class ReduceInfo:
-    """归约：store 沿某轴 Δ==0 而取值沿该轴变化（方案 §2 Case II）。"""
+    """归约：store 沿某轴 Δ==0 而取值沿该轴变化（方案 §2 Case II）。
+
+    ``op``/``recipe`` 决定用哪种跨 lane 原语；``varying`` 是**已剥离旧值**的逐 lane
+    取值（lane 均匀加数保留在内——跨 lane 归约天然正确处理）；``accumulate`` 表示
+    这是累加写 ``dst op= x``，发射时末尾并入目标里原有的值。
+
+    ``VectorPlan.reduce`` 只是「本段是归约段、代表元是哪条 store」的段级标记；真正
+    逐条发射用的是 :attr:`StorePlan.reduce`（一个段内可有多条归约，缺陷 D6）。
+    """
 
     axis: Axis
     op: str
     recipe: str = "vcadd"
+    varying: ValueNode | None = None
+    accumulate: bool = False
 
 
 # 逐元素算子 → 跨 lane 归约原语（§2 Case II 把内层轴压成标量）。
@@ -1188,7 +1199,7 @@ def _prepare_segment(
     if not main_specs:
         raise Unsupported("T.Parallel body has no store to vectorize")
 
-    elem = _buffer_elem_dtype(main_specs[0].buffer)
+    elem = _elem_dtype(main_specs[0].buffer.dtype)
     if lanes is None:
         lanes = _vreg_lanes(elem)
 
@@ -1407,9 +1418,7 @@ def rank_vector_axes(
     归约轴（store 沿该轴均匀且取值沿该轴变化）始终排在最前。
     """
     for axis in axes:
-        if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
-            _value_varies_along(spec.value, axis, analyzer) for spec in stores
-        ):
+        if _is_reduce_axis(axis, stores, store_infos, analyzer):
             return [axis]
 
     ranked: list[tuple[int, Axis]] = []
@@ -1469,16 +1478,39 @@ def _value_varies_along(expr, axis: Axis, analyzer: arith.Analyzer) -> bool:
     return any(axis.var.same_as(v) for v in _free_vars(expr)) or bool(varies)
 
 
+def _is_reduce_axis(
+    axis: Axis,
+    stores: list[StoreSpec],
+    store_infos: list[AccessInfo],
+    analyzer: arith.Analyzer,
+) -> bool:
+    """第一层归约判据（纯 Δ 分类，尚未建值 DAG）：store 全部沿 ``axis`` ``Δ==0``
+    且至少一条取值沿该轴变化。
+
+    :func:`rank_vector_axes`（轴排序 / 提前返回）与 :func:`_classify_reduce`（段级归约
+    判定）**共用**这一处判据（缺陷 D13：原先两处各写一份、口径可能不一致）；单条 store
+    是否真是累加形式再由 :func:`_plan_reduce` 精化。
+    """
+    return all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
+        _value_varies_along(spec.value, axis, analyzer) for spec in stores
+    )
+
+
+_REDUCE_OPS = {"Add": "vadd", "Max": "vmax", "Min": "vmin"}
+
+
 def _reduce_op(stores: list[StoreSpec]) -> str:
+    """归约算子名：只认 ``Add`` / ``Max`` / ``Min``。
+
+    未识别的算子（如 ``Mul`` 的**乘积归约**）必须显式拒绝——旧实现默认落到 ``vadd``，
+    会把它静默发射成求和，产出**错误结果**且不报任何诊断（缺陷 D1）。
+    """
     for spec in stores:
-        node_name = type(spec.value).__name__
-        if node_name == "Add":
-            return "vadd"
-        if node_name == "Max":
-            return "vmax"
-        if node_name == "Min":
-            return "vmin"
-    return "vadd"
+        op = _REDUCE_OPS.get(type(spec.value).__name__)
+        if op is not None:
+            return op
+    names = ", ".join(sorted({type(spec.value).__name__ for spec in stores})) or "<empty>"
+    raise Unsupported(f"unsupported reduction operator(s) {names} (方案 §2 Case II): only Add/Max/Min reductions are supported")
 
 
 def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorProgram:
@@ -1605,7 +1637,6 @@ def _build_plan_for_axis(
         lanes=lanes,
         chunks=chunks,
         tail=tail,
-        reduce=_detect_reduce(main_specs, main_infos, vector_axis, analyzer),
     )
 
     def _plan_store(spec, info):
@@ -1621,27 +1652,125 @@ def _build_plan_for_axis(
         plan.pre_stores.append(_plan_store(spec, info))
     for spec, info in zip(post_specs, post_infos):
         plan.post_stores.append(_plan_store(spec, info))
+    # 归约判定必须等值 DAG 建好之后（D13 统一判据）：逐 store 剥离旧值，顺带在 build 期
+    # 就把不支持的形态拒绝掉，保证 build 成功 ⇒ emit 成功。
+    plan.reduce = _classify_reduce(plan, analyzer)
     return plan
 
 
-def _detect_reduce(
-    stores: list[StoreSpec],
-    store_infos: list[AccessInfo],
-    vector_axis: Axis,
-    analyzer: arith.Analyzer,
-) -> ReduceInfo | None:
-    """归约检测（§2 Case II）：store 沿该轴均匀，但取值沿该轴变化。"""
-    if all(info.axis_class(vector_axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
-        _value_varies_along(spec.value, vector_axis, analyzer) for spec in stores
-    ):
-        op = _reduce_op(stores)
-        return ReduceInfo(axis=vector_axis, op=op, recipe=_REDUCE_RECIPE[op])
-    return None
+def _classify_reduce(plan: VectorPlan, analyzer: arith.Analyzer) -> ReduceInfo | None:
+    """归约段判定 + 逐 store 归约拆分（缺陷 D13：单一「累积写」判据）。
+
+    一条 store 是**可向量化的归约**，当且仅当：目标地址沿向量轴 ``Δ==0``（lane 均匀）
+    且取值是**累加形式** ``dst[...] = dst[...] <op> x``（``op`` ∈ Add/Max/Min）。标量语义
+    下 ``for v: dst[i] = f(v)`` 本是「后写覆盖」，只有累加形式才等价于跨 lane 归约；因此
+    「store 均匀 + 取值变化」**不再**单独构成归约（否则 ``dst[i] = a[i,v] + 1.0`` 会被
+    静默发成错的和）。
+
+    返回段级代表元（第一条归约 store 的 :class:`ReduceInfo`），并给每条归约 store 填
+    :attr:`StorePlan.reduce`。段内取值沿轴均匀的 uniform store 是「广播写」，原样保留
+    （每条都独立发射，缺陷 D6 不再丢 store）。若该轴不是归约轴（:func:`_is_reduce_axis`
+    为假，即 store 未全部 lane 均匀或取值也均匀），本函数返回 ``None``，走普通逐元素路径。
+    """
+    stores = plan.stores
+    if not stores:
+        return None
+    if not _is_reduce_axis(plan.vector_axis, [store.spec for store in stores], [store.access for store in stores], analyzer):
+        return None  # store 未全部 lane 均匀（与连续/步长写混用）或取值也均匀 → 逐元素路径
+    primary: ReduceInfo | None = None
+    for store in stores:
+        if not _value_varies_along(store.spec.value, plan.vector_axis, analyzer):
+            continue  # 取值沿轴均匀 → 一次广播写即可，不参与归约
+        store.reduce = _plan_reduce(store, plan.vector_axis)
+        if primary is None:
+            primary = store.reduce
+    return primary
 
 
-def _buffer_elem_dtype(buffer) -> str:
-    dtype = buffer.dtype
-    return str(dtype).split("x", 1)[0]
+def _plan_reduce(store: StorePlan, vector_axis: Axis) -> ReduceInfo:
+    """把一条 lane 均匀的 store 拆成 :class:`ReduceInfo`（不支持的形态在 **build 期** 拒绝）。"""
+    buffer = store.spec.buffer
+    if not _reads_buffer(store.value, buffer):
+        raise Unsupported(
+            f"store to '{buffer.name}' is lane-uniform along axis '{vector_axis.name}' but its value does not read "
+            f"'{buffer.name}': only the accumulate form 'dst[...] = dst[...] <op> x' (op ∈ Add/Max/Min) is a "
+            "reduction (方案 §2 Case II); a lane-varying value written to a lane-uniform address is a "
+            "last-write-wins overwrite and has no vector form"
+        )
+    op = _reduce_op([store.spec])  # Add/Max/Min 之外显式拒绝（缺陷 D1）
+    varying, accumulated = _strip_reduce(store.value, op, store.spec, vector_axis)
+    if not accumulated or varying is None:
+        raise Unsupported(
+            f"the old value of '{buffer.name}' must be a direct operand of the '{op}' reduction "
+            "(方案 §2 Case II); it cannot be scaled or nested inside another operation"
+        )
+    return ReduceInfo(axis=vector_axis, op=op, recipe=_REDUCE_RECIPE[op], varying=varying, accumulate=True)
+
+
+# 归约算子 → 其「一个操作数 lane 均匀」的标量同构指令（脊上同样允许剥离旧值）。
+_REDUCE_SCALAR_RECIPE = {"vadd": "vadds", "vmax": "vmaxs", "vmin": "vmins"}
+
+
+def _strip_reduce(value: ValueNode, op: str, site: StoreSpec, vector_axis: Axis) -> tuple[ValueNode | None, bool]:
+    """在归约算子**脊**上剥离目标 buffer 的 lane 均匀旧值读取。
+
+    返回 ``(varying, accumulated)``：``varying`` 是逐 lane 取值（lane 均匀加数**保留在内**，
+    因为跨 lane 归约本身就会正确处理它们）；``accumulated`` 表示剥到了旧值。剥离等价于
+    沿脊消去该算子的单位元（Add→0 / Max→-inf / Min→+inf），故与 ``dst op= x`` 同义。
+
+    旧值必须与写入地址**同址**（``site.indices``）：``s[i] = s[i] + a[i,j]`` 的 ``s[i]``
+    才是可剥离的旧值；``s[i] = s[i-1] + a[i,j]`` 这类 stencil 跨位读不是累加，留在
+    ``varying`` 内并触发末尾的显式拒绝。只有脊上（``op`` 及其标量同构）的直接子树的旧值
+    才能安全剥离；旧值若被缩放了或藏在别的算子/``uniform_expr`` 里，``varying`` 仍会读到
+    dst → 明确拒绝（不静默错发）。
+    """
+    buffer = site.buffer
+    spine = {op, _REDUCE_SCALAR_RECIPE[op]}
+    accumulated = False
+
+    def strip(node: ValueNode) -> ValueNode | None:
+        nonlocal accumulated
+        if (
+            node.recipe == "uniform_load"
+            and node.access is not None
+            and _same_buffer(node.access.buffer, buffer)
+            and _same_indices(tuple(node.access.indices), tuple(site.indices))
+        ):
+            accumulated = True
+            return None
+        if node.recipe in spine and len(node.args) == 2:
+            kept = [child for child in (strip(node.args[0]), strip(node.args[1])) if child is not None]
+            if not kept:
+                return None
+            if len(kept) == 1:
+                return kept[0]
+            return ValueNode(node.recipe, node.dtype, kept, detail=node.detail)
+        return node
+
+    varying = strip(value)
+    if varying is not None and _reads_buffer(varying, buffer):
+        raise Unsupported(
+            f"the reduction body reads the destination buffer '{buffer.name}' outside the accumulate position "
+            "(方案 §2 Case II): the old value must be a direct operand of the reduction operator"
+        )
+    return varying, accumulated
+
+
+def _reads_buffer(node: ValueNode, buffer) -> bool:
+    """值 DAG 是否在**任何位置**读取给定 buffer（含 ``uniform_expr`` 折叠的标量表达式）。"""
+    if node.access is not None and _same_buffer(node.access.buffer, buffer):
+        return True
+    if node.scalar is not None:
+        found: list[bool] = []
+
+        def visit(sub):
+            if isinstance(sub, tirx.BufferLoad) and _same_buffer(sub.buffer, buffer):
+                found.append(True)
+
+        tirx.stmt_functor.post_order_visit(node.scalar, visit)
+        if found:
+            return True
+    return any(_reads_buffer(arg, buffer) for arg in node.args)
 
 
 # ---------------------------------------------------------------------------
@@ -1711,11 +1840,15 @@ def _unsigned_index(reg):
 
 
 def _reduce_identity(recipe: str, elem: str):
-    """归约原语的单位元（``vadd``→0，``vmax``→-inf，``vmin``→+inf）。"""
+    """归约原语的单位元（``vadd``→0，``vmax``→最小可表示值，``vmin``→最大可表示值）。
+
+    单位元必须**按元素类型派生**：旧实现把 ``vmax``/``vmin`` 硬编码为 f32 极值
+    ``±3.402823e38``，于是 ``int32`` / ``float16`` 的极值归约在发射期抛 ``ValueError``
+    （``FloatImm supports only float, but int32 was supplied`` / ``exceeds minimum of float16``，缺陷 D3）。
+    """
     if recipe == "vcadd":
         return tirx.FloatImm(elem, 0.0) if elem.startswith("float") else tirx.IntImm(elem, 0)
-    sign = -1.0 if recipe == "vcmax" else 1.0
-    return tirx.FloatImm(elem, sign * 3.402823e38)
+    return tirx.min_value(elem) if recipe == "vcmax" else tirx.max_value(elem)
 
 
 class _Emitter:
@@ -2034,21 +2167,35 @@ def _emit_program(program: VectorProgram) -> tirx.Stmt:
 
 
 def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
-    """归约 store（§2 Case II）：展开 chunk、SSA 串累加器、``ONEPT`` 回写。
+    """归约段（§2 Case II）：按源码顺序逐条发射段内每个 store。
+
+    段内可能有**多条**归约（缺陷 D6 原先用 ``next(...)`` 只发第一条）以及取值沿向量轴
+    均匀的广播写（一次 ``ONEPT`` 写即可）。每条归约各自展开 chunk、各起一条 SSA 累加链、
+    各回写一次。
+    """
+    for store in plan.stores:
+        if store.reduce is None:
+            _emit_outer_store(plan, store, emitter)  # 取值沿轴均匀 → 与归约同级，发一次
+            continue
+        _emit_one_reduce(plan, store, emitter)
+
+
+def _emit_one_reduce(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
+    """发射单条归约 store：展开 chunk、SSA 串累加器、``ONEPT`` 回写。
 
     先要 ``vcadd/vcmax/vcmin`` 把每个 chunk 压成 lane0 的部分结果，再用
-    ``vadd/vmax/vmin`` 累加；若写成累加形式 ``dst = dst op x``，末尾再并入目标
-    里原有的值（``vld(..., BRC_B{bits})`` 广播）。``extent % lanes != 0`` 时最后
-    一个 chunk 是尾块：``update_mask`` 造尾块谓词，``vsel`` 把无效车道填成归约
-    单位元（改进 6），再按全 lane 掩码归约。
+    ``vadd/vmax/vmin`` 累加；累加写（``dst op= x``）末尾再并入目标里原有的值
+    （``vld(..., BRC_B{bits})`` 广播）。``extent % lanes != 0`` 时最后一个 chunk 是尾块：
+    ``update_mask`` 造尾块谓词，``vsel`` 把无效车道填成归约单位元（改进 6），再按全 lane
+    掩码归约。逐 lane 取值与旧值已由 :func:`_plan_reduce` 在 build 期拆好。
 
     结果写回 ``emitter.lets``；外层轴与 ``pre``/``post`` 的包裹交给 :func:`emit_plan`。
     """
-    store = next(s for s in plan.stores if s.kind == AccessClass.UNIFORM)
+    reduce = store.reduce
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
     mask = emitter.all_mask(bits)
-    recipe = plan.reduce.recipe
+    recipe = reduce.recipe
     element_op = _REDUCE_ELEMENT[recipe]
     identity = _reduce_identity(recipe, elem)
     acc = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
@@ -2058,7 +2205,7 @@ def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
     # 替换成归约单位元（add→0，max→-inf，min→+inf），再按全 lane 掩码归约，结果正确。
     fill = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets) if plan.tail else None
 
-    varying = _varying_operand(store.value)
+    varying = reduce.varying
     last_chunk = (plan.chunks or 1) - 1
     for ck in range(plan.chunks or 1):
         lane_base = _int(ck * plan.lanes)
@@ -2071,7 +2218,7 @@ def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
         reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
 
-    if _is_accumulate(store):
+    if reduce.accumulate:
         # ``dst = dst op x``：末尾并入目标里原有的值（读到的是本 chunk 之前的结果）。
         old = emitter.bind(simd.vld(emitter.addr(store.access, uniform=True), f"BRC_B{bits}"), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, old, mask, _MODE), emitter.lets)
@@ -2080,27 +2227,8 @@ def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
     emitter.lets.append(tirx.Evaluate(simd.vsts(dst, acc, mask, f"ONEPT_B{bits}")))
 
 
-def _is_accumulate(store: StorePlan) -> bool:
-    """``dst = dst op x``（累加写）：存在一个读同一目标 buffer 的 lane 均匀操作数。"""
-    for arg in store.value.args:
-        if arg.recipe == "uniform_load" and arg.access is not None and _same_buffer(arg.access.buffer, store.spec.buffer):
-            return True
-    return False
-
-
 def _same_buffer(lhs, rhs) -> bool:
     return bool(lhs.data.same_as(rhs.data))
-
-
-def _varying_operand(node: ValueNode) -> ValueNode:
-    """从 ``op(uniform, varying)`` 里挑出随 lane 变化的那一侧。"""
-    if len(node.args) == 2:
-        lhs, rhs = node.args
-        if rhs.is_uniform and not lhs.is_uniform:
-            return lhs
-        if lhs.is_uniform and not rhs.is_uniform:
-            return rhs
-    return node
 
 
 def render_plan(plan: VectorPlan | VectorProgram) -> str:
@@ -2168,8 +2296,6 @@ def vectorize_parallel_nests(stmt: tirx.Stmt, *, lanes: int | None = None) -> ti
         if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL:
             try:
                 plan = build_plan(node, lanes=lanes)
-                # plan_text = render_plan(plan)
-                # print(plan_text, "*************************\n\n")
                 return emit_plan(plan)
             except Unsupported:
                 return None

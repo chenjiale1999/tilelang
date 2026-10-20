@@ -3,7 +3,7 @@
 >
 > 本文说明一套把 `T.Parallel` 标量循环**统一向量化**的编译分析与发射方案。为了让没有代码仓库访问权限的同事也能完整读懂，本文**自包含**：所有关键算法都附上**伪代码**或**真实实现片段**，无需打开任何源文件。
 >
-> 对应实现是一个约 2060 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 59 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
+> 对应实现是一个约 2304 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 80 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
 
 ---
 
@@ -111,8 +111,8 @@ polyhedral.py
 | `AccessInfo` | 一次访存 + 逐轴分类 | `buffer, indices, offset, is_store, per_axis, indirect, in_global, reason` | `classify_access` |
 | `StoreSpec` | 一条写 | `buffer, indices, value, mask` | `normalize_body` |
 | `ValueNode` | 值 DAG 节点 | `recipe, dtype, args, access, scalar, detail` | `build_value` |
-| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind, index` | `_build_plan_for_axis` |
-| `ReduceInfo` | 归约信息 | `axis, op, recipe` | `_detect_reduce` |
+| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind, index, reduce` | `_build_plan_for_axis` |
+| `ReduceInfo` | 归约信息（逐 store） | `axis, op, recipe, varying, accumulate` | `_classify_reduce` → `_plan_reduce` |
 | `VectorPlan` | **段级**硬件无关计划（段 = 主体 + 可选 `pre`/`post`） | `axes, vector_axis, lanes, chunks, tail, stores, pre_stores, post_stores, reduce, diagnostics` | `_build_plan_for_axis`（每段一个） |
 | `VectorProgram` | 统一计划（1..N 段，`build_plan` 的返回类型） | `axes`（提层的并行轴前缀）, `segments`, `diagnostics` | `build_plan` |
 
@@ -334,7 +334,7 @@ def normalize_body(stmt, aliases, out=None, mask=None) -> list[StoreSpec]:
    * `*100 / *10` 让写侧成为主序、读侧次之（避免「写连续、读四处乱跳」的轴被误选）；
    * `+axis.index` 让同分取**更内层**（更内层通常更连续）。
 3. **轴回退**：返回**排序后的整条轴列表**，`build_plan` 依次尝试；某轴发射失败时自动退到次优轴。
-4. **归约轴**（见 §3.5）始终排在最前。
+4. **归约轴**（见 §3.5）：经 `_is_reduce_axis` 识别后**独占**返回（不回退）。
 
 **为什么"打分"和"回退"分两阶段**：打分只能基于**分析期的形态**（Δ 的分类），但一个轴最终能否发射还取决于**发射期**才能确定的细节——元素偏移能否在「每 lane 索引向量」通道构造出来（如非 2 的幂常量除法就构造不出）、值算子是否有 strength-reduction 等。所以打分只作"优先级"，真正的可行性用 `try/except` 在发射期兜底。
 
@@ -360,9 +360,8 @@ selected vector axis 'm' (score=330)
 
 ```python
 def rank_vector_axes(axes, stores, store_infos, load_infos, analyzer):
-    for axis in axes:                                   # 归约轴优先
-        if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and \
-           any(_value_varies_along(s.value, axis, analyzer) for s in stores):
+    for axis in axes:                                   # 归约轴优先（独占，不回退）
+        if _is_reduce_axis(axis, stores, store_infos, analyzer):
             return [axis]
 
     ranked = []
@@ -385,24 +384,36 @@ def rank_vector_axes(axes, stores, store_infos, load_infos, analyzer):
 
 条件（同时满足）：
 
-* 该轴所有 store 都 `UNIFORM`（`Δ_store = 0`）；
-* 取值沿该轴**变化**（自由变量出现 **或** 被访问 buffer 沿轴 `CONTIGUOUS/STRIDED`）。
+* 该轴所有 store 都 `UNIFORM`（`Δ_store = 0`）——第一层判据 `_is_reduce_axis`；
+* 取值沿该轴**变化**（自由变量出现 **或** 被访问 buffer 沿轴 `CONTIGUOUS/STRIDED`）；
+* 单条 store 还须是**累加形式** `dst[...] = dst[...] <op> x`（`op` ∈ Add/Max/Min），旧值作为归约算子的**直接操作数**且与写入地址**同址**——第二层判据 `_plan_reduce`。
 
-命中则构造 `ReduceInfo(axis, op, recipe)`，其中 `op` 由取值最外层算子挑（`Add→vadd`、`Max→vmax`、`Min→vmin`），`recipe ∈ {vcadd, vcmax, vcmin}`，并用归约轴覆盖 `vector_axis`。
+命中则构造 `ReduceInfo(axis, op, recipe, varying, accumulate)`，其中 `op` 由取值脊上的归约算子挑（`Add→vadd`、`Max→vmax`、`Min→vmin`），`recipe ∈ {vcadd, vcmax, vcmin}`，`varying` 是剥离旧值后的逐 lane 取值，并用归约轴覆盖 `vector_axis`。
+
+> ⚠️ **使用者须知（归约算子的支持范围）**：
+> 1. **只识别 `Add`(`+=`) / `T.max` / `T.min`**：其它算子（如 `Mul` 的乘积归约 `s[i] *= a[i,j]`）会被**显式拒绝**（`unsupported reduction operator(s) Mul`）——不会再静默发成求和，但也无法向量化。
+> 2. **必须有累加形式**：`s[i] = a[i,j]`（last-write-wins 覆写）会被**显式拒绝**（`does not read 's' … accumulate form`）；旧值被缩放（`s[i] = s[i]*2.0 + a[i,j]`）或跨位（stencil）读（`s[i] = s[i-1] + a[i,j]`）同样拒绝。
+>
+> 因此**写归约时请只用 `+=`（Add）/ `T.max` / `T.min` 三种形态，且旧值直接作为操作数**。
 
 **实现**
 
 ```python
 _REDUCE_RECIPE = {"vadd": "vcadd", "vmax": "vcmax", "vmin": "vcmin"}
 
-# 在 rank_vector_axes 内（见 §3.4）：
-for axis in axes:
-    if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
-            _value_varies_along(spec.value, axis, analyzer) for spec in stores):
-        op = _reduce_op(stores)
-        reduce_info = ReduceInfo(axis=axis, op=op, recipe=_REDUCE_RECIPE[op])
-        best = axis
-        break
+# 第一层：轴是否为归约轴（rank_vector_axes 与 _classify_reduce 共用）
+def _is_reduce_axis(axis, stores, store_infos, analyzer):
+    return all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
+        _value_varies_along(spec.value, axis, analyzer) for spec in stores)
+
+# 第二层：逐 store 精化为累加形式（build 期；不支持即拒绝）
+def _plan_reduce(store, vector_axis):
+    op = _reduce_op([store.spec])                      # Add/Max/Min 之外显式拒绝
+    varying, accumulated = _strip_reduce(store.value, op, store.spec, vector_axis)
+    if not accumulated or varying is None:
+        raise Unsupported("... must be a direct operand ... accumulate position")
+    return ReduceInfo(axis=vector_axis, op=op, recipe=_REDUCE_RECIPE[op],
+                      varying=varying, accumulate=True)
 ```
 
 ### 3.6 值 DAG 构造与 `is_uniform`
@@ -449,7 +460,7 @@ def is_uniform(self) -> bool:
 * **比较特化**：一侧均匀 → `vcmps`；`vcmps` 要求 `(vector, scalar)` 顺序，交换操作数时谓词**必须翻转**（`lt↔gt`、`le↔ge`）。
 * 是否需要 `vdup`；归约的累加写判定。
 
-> ⚠️ **必须理解的坑**：`all([]) == True`。叶子节点若不在 `_UNIFORM_RECIPES` 里会被**误判为均匀**，所以 `lane_index` / `vbrc` / `vload` 必须显式返回 `False`。
+> ⚠️ **必须理解的坑**：`all([]) == True`。叶子节点若不在 `_UNIFORM_RECIPES` 里会被**误判为均匀**。实现已统一在递归之前挡掉**所有无 args 叶子**（`lane_index`/`vbrc`/`vload`/`vload_strided`/`gather`），所以步长/索引向量装载不会再被当成标量喂进标量-向量指令。若仍遇到发射期 `cannot scalarize vector value ...`，请按新用例上报。
 
 `Select` 的处理有两种条件来源，汇入同一 `vsel`：
 
@@ -537,6 +548,11 @@ def _build(self, node: ValueNode):
 
 **掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。尾块掩码 `update_mask(extent - chunk*lanes, bits)`，整除时为 `None`。
 
+> ⚠️ **使用者须知（三条已知缺陷，详见 §6）**：
+> 1. **尾块掩码只加在 store 侧**：装载 `vld(addr, "NORM")` **没有谓词形参**，故**非归约**路径在最后一个 chunk 会**整 lane 越界读**（归约路径有 `vsel` 兜底，非归约没有）。建议显式保证**非归约的向量轴长度是 `lanes` 的整数倍**，或把校验交给下游。
+> 2. **负步长不支持**：`vload_strided` 用**无符号** lane 斜坡乘步长，只对正步长成立；`Δ ≤ -2` 的负步长会**静默发出错误偏移**。逆序但步长为 `-1` 的场景请走 `PERMUTE`（`vgather2` 索引向量）。
+> 3. **extent 必须是编译期可证常量**：符号 extent 下 `chunks/tail` 为 `None`，发射退化为**只发一个 chunk 且无尾掩码**，对大于 `lanes` 的符号形状会**静默少算**。请尽量使用编译期常量形状。
+
 **系统常量**：
 
 * `lanes = 2048 / elem_bits`：float32→64、f16/bf16→128、int8→256；向量寄存器 2048 位。
@@ -566,23 +582,37 @@ vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
 
 **尾块（改进 6）**：`extent % lanes != 0` 时最后一个 chunk 只有 `tail` 个有效车道，其余车道的 `vld` 读到越界/脏数据；用 `update_mask(extent - ck*lanes, bits)` 造尾块谓词、`vsel(x, fill, tail_mask)` 把无效车道替换成**归约单位元**，再按全 lane 掩码归约（`vadd` 填 0、`vmax` 填 -inf、`vmin` 填 +inf 均不影响结果）。这样 `tail != 0` 也能正确发射，不再需要整除前提。
 
+> ✅ **使用者须知（归约相关，D4/D5/D6/D13 已修）**：
+> 1. **归约体可以夹 lane 均匀加数**：`s[i] += a[i,j] + 1.0` 现按正确语义发射（均匀加数保留在归约体内，跨 lane 归约天然正确处理）。
+> 2. **累加读须与写入地址同址**：`s[i] = s[i] + a[i,j] + 1.0` 会正确识别为累加；但 `s[i] = s[i] * 2.0 + a[i,j]`（旧值被缩放）或 `s[i] = s[i-1] + a[i,j]`（跨位 stencil 读）会被**显式拒绝**（旧值必须作为归约算子的直接操作数且同址），请改写为 `s[i] += a[i,j]`。
+> 3. **一个 nest 内支持多条归约**：`s1[i]+=a[i,j]` / `s2[i]+=b[i,j]` 乃至求和+求最大混合，各自独立发射（求和用 `vcadd`、求最大用 `vcmax`），不再丢写。
+>
+> 注：单位元已按元素类型派生，`int32` / `float16` 的 `max`/`min` 归约不会再抛 `ValueError`（缺陷 D3 已修）。
+
 **实现**
 
 ```python
-def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
-    store = next(s for s in plan.stores if s.kind == AccessClass.UNIFORM)
-    emitter = _Emitter(plan, chunk)
+def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
+    for store in plan.stores:                       # D6：逐 store 发射，不再只取第一条
+        if store.reduce is None:
+            _emit_outer_store(plan, store, emitter)  # 取值沿轴均匀 → 一次广播写
+            continue
+        _emit_one_reduce(plan, store, emitter)
+
+
+def _emit_one_reduce(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
+    reduce = store.reduce                          # D13：归约描述由 _classify_reduce 在 build 期填好
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
     mask = emitter.all_mask(bits)
-    recipe = plan.reduce.recipe
+    recipe = reduce.recipe
     element_op = _REDUCE_ELEMENT[recipe]
     identity = _reduce_identity(recipe, elem)
 
     acc = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
     fill = (emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
             if plan.tail else None)                 # 尾块填充寄存器（改进 6）
-    varying = _varying_operand(store.value)
+    varying = reduce.varying                        # D4/D5：_strip_reduce 已剥离同址旧值，均匀加数在内
     last_chunk = (plan.chunks or 1) - 1
 
     for ck in range(plan.chunks or 1):              # 编译期展开
@@ -597,7 +627,7 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
         reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
 
-    if _is_accumulate(store):                       # dst = dst op x：并入目标旧值
+    if reduce.accumulate:                           # dst = dst op x：并入目标旧值
         old = emitter.bind(simd.vld(emitter.addr(store.access, uniform=True),
                                     f"BRC_B{bits}"), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, old, mask, _MODE), emitter.lets)
@@ -610,8 +640,8 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
 
 配套细节：
 
-* `_reduce_identity`：`vmax→-FLT_MAX`、`vmin→+FLT_MAX`、`vadd→0`。
-* `_is_accumulate`：DAG 里存在读**同一 buffer** 的 `uniform_load` → 判定为 `dst = dst op x`，末尾用 `BRC` 广播读并入旧值。
+* `_reduce_identity`：按元素类型派生——`vcadd→0`、`vcmax→tirx.min_value(elem)`、`vmin→tirx.max_value(elem)`。
+* `_strip_reduce`：在归约算子**脊**（`op` 及其标量同构 `vadds/vmaxs/vmins`）上递归剥离与写入地址**同址**的旧值读取；`accumulate=True` 时末尾用 `BRC` 广播读并入旧值。旧值被缩放或跨位（stencil）读则显式拒绝。
 * 归约路径逐 chunk 改 `lane_base` 并**清空 `memo`**（地址随 chunk 变，缓存必须失效）。
 * 尾块（改进 6）：`tail != 0` 时用 `update_mask` + `vsel` 把无效车道填成归约单位元，无需整除前提。
 
@@ -749,6 +779,16 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 | §6 第二步 | 多条语句夹一个 serial（M1/M2/M3/夹心、S2 私有标量） | 支持 | body 恰好含一个干净 serial 循环时，其前后兄弟语句作为 `pre`/`post` 段，在 chunk 循环外每迭代一次（`pre → 主体 → post`） |
 | §6 第三步 | 多个**并列**的干净 serial 循环（≥2 段） | 支持 | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间依赖须沿向量轴均匀 |
 | §6 | 嵌套 serial / 跨迭代标量状态 / 并列段中有一段不干净 | 拒绝 | `nested ... loop ... is not affine-vectorizable` |
+| §1-I | **双臂 `if` 的某一臂再嵌 `if`**（臂自带谓词） | 拒绝 | `masked branch merging is not supported`（先前文档未声明；缺陷 D12） |
+| §2-II | **一个 nest 内多条归约**（`s1+=…` 且 `s2+=…`，或求和+求最大混合） | 支持 | **D6 已修**：逐 store 发射——每条归约各起独立累加链、各写一次 `ONEPT vsts`（求和用 `vcadd`、求最大用 `vcmax`） |
+| §2-II | **归约体含 lane 均匀加数**（`s[i] += a[i,j] + 1.0`） | 支持 | **D4/D5 已修**：沿归约算子脊递归剥离旧值，lane 均匀加数保留在归约体内（跨 lane 归约天然正确处理） |
+| §2-II | **非 Add/Max/Min 的归约**（乘积归约 `s[i] *= a[i,j]`） | 拒绝 | **D1 已修**：显式拒绝 `unsupported reduction operator(s) Mul`，不再静默发成求和 |
+| §2-II | **覆写 `s[i] = a[i,j]`（store 沿轴均匀、取值变化）** | 拒绝 | **D2 已修**（随 D1）：显式拒绝，不再误判为 `vcadd` 归约 |
+| §2-II | **`int`/`fp16` 的 `max`/`min` 归约** | 支持 | **D3 已修**：单位元按 dtype 派生，不再抛 `ValueError` |
+| §4-II-a | **负步长（`Δ ≤ -2`，如 `a[N-2-2*i]`）** | 拒绝（静默） | 无符号 ramp × 负步长 → **结果错误**（缺陷 D8） |
+| §4-I | **符号 extent 的向量化**（`a: (n,)` 且 `n` 为变量） | 拒绝（静默） | `chunks/tail=None` → 只发一个 chunk，**静默少算**（缺陷 D9） |
+| §0-I | **非归约 + 尾块**（向量轴长度非 `lanes` 整数倍） | 部分支持 | 尾块掩码只加在 store 侧 → **整 lane 越界读**（缺陷 D10） |
+| — | **多 store 混合 / 语句外置**（含间接下标等非均匀语句） | 部分修复 | **D7 已修**（混合 store 现 build+emit 均成功）；**D11 待修**（语句外置仍「规划成功、发射期 `Unsupported`」） |
 | — | 数学核心 Δ 分类 | 支持 | 6 个直接单测 |
 | — | 语句树变换（整段下降） | 支持 | 自顶向下替换 |
 | — | 诊断（改进 7） | 支持 | 成败都收集全部卡点 |
@@ -776,6 +816,8 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 ```
 
 共 **36** 个场景：**31 OK**、**5 拒绝**（嵌套循环 / 跨迭代 stencil / 并列段含不干净 serial / GM 操作数 / `TRUE_RANDOM`），拒绝用例统一置于列表尾部。
+
+> 脚本尾部另有 `d1`–`d12`（12 例）**已知缺陷复现**（上表「拒绝（静默）」各行对应），其输出顶部同样打印 `[OK ]`/`[ERR]`，**不计入上面的 31/5 统计**。
 
 ---
 
@@ -836,6 +878,30 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 ## 6. 边界与已知局限
 
+### 6.1 已知缺陷（务必规避，均已有回归基线）
+
+下列问题是**当前实现**的确定性行为，**多数为静默错误结果**。写 kernel 时请按「规避方式」列绕开；对应复现用例在 `tmp/drive_plan.py` 尾部（`d*`）与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾成对固化。
+
+| 编号 | 触发场景 | 现象 | 规避方式 | 状态 |
+|---|---|---|---|---|
+| D1 | 乘积归约 `s[i] *= a[i,j]` | 原先静默发成求和（**结果错误**） | 只用 `+=` / `T.max` / `T.min` | ✅ **已修**：显式拒绝 |
+| D2 | 覆写 `s[i] = a[i,j]`（store 均匀 + 取值变化） | 原先被判成归约（**结果错误**） | 避免该形态 | ✅ **已修**（随 D13）：显式拒绝 |
+| D3 | `int32` / `float16` 的 `max`/`min` 归约 | 原先发射期抛 `ValueError` | 无需再规避 | ✅ **已修**：单位元按 dtype 派生 |
+| D4 | 归约体含 lane 均匀加数 `s[i] += a[i,j] + 1.0` | `1.0` **被静默丢弃** | 无需再规避 | ✅ **已修**：沿脊递归剥离，均匀加数保留在归约体内 |
+| D5 | 累积读不在最外层（`s[i] = s[i] + a[i,j] + 1.0`） | 漏判累加写，旧值可能被覆盖 | 无需再规避 | ✅ **已修**：递归「累积写」谓词；旧值被缩放/跨位读仍显式拒绝 |
+| D6 | 一个 nest 内两条归约 / 求和+求最大混合 | **只发射第一条 store** | 无需再规避 | ✅ **已修**：逐 store 发射，各写一次 `ONEPT vsts` |
+| D7 | store 混合 + 步长/索引向量装载 | 原先规划成功、**发射期** `cannot scalarize … 'vload_strided'` | 无需再规避 | ✅ **已修**：`is_uniform` 挡掉无 args 叶子 |
+| D8 | 负步长 `Δ ≤ -2`（`a[N-2-2*i]`） | 无符号 ramp × 负步长 → **结果错误** | 逆序用 `a[N-1-i]`（`PERMUTE`） | ⏳ 待修 |
+| D9 | 符号 extent（`a: (n,)`，`n` 为变量） | 只发一个 chunk → **静默少算** | 用编译期常量形状 | ⏳ 待修 |
+| D10 | 非归约 + 向量轴长度非 `lanes` 整数倍 | 尾块**整 lane 越界读** | 保证长度是 `lanes`（f32=64 / f16=128 / int8=256）整数倍 | ⏳ 待修 |
+| D11 | 语句外置且下标非沿轴均匀（如 `c[b[0]] = 1.0`） | 规划成功、**发射期** `Unsupported` | 避免该类外置语句 | ⏳ 待修 |
+| D12 | 双臂 `if` 的某一臂再嵌 `if` | `masked branch merging is not supported` | 扁平化分支结构 | 已文档化（非缺陷） |
+| D13 | 「归约判据」原先有两套口径（分析期 vs 发射期不一致） | 与 D2/D5 同源 | 无需再规避 | ✅ **已修**：统一为「lane 均匀地址 + **同址**累加形式」单一判据 |
+
+> 上述用例在 pytest 中挂 `xfail(strict=True)` 断言**正确契约**；修复后会 `XPASS` 报错，届时同步更新本表。
+
+### 6.2 设计边界与长期局限
+
 | 类别 | 局限 | 说明 / 潜在改进 |
 |---|---|---|
 | 归约 | 展开式需整 chunk，尾块已用单位元填充 | `tail != 0` 已支持（改进 6）；仍无通用 masked-load |
@@ -844,8 +910,8 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)） |
 | 地址 | 仅 `TRUE_RANDOM` 拒绝 | `PERMUTE`/`PIECEWISE`/`INDIRECT` 已走索引向量通道（`vgather2`/`vscatter`）；不可构造的索引明确报错，不静默降级 |
 | 语句 | 发散分支、atomic 拒绝；serial 支持面有限 | 直接内嵌、链式嵌套、或「一个/多个并列干净 serial 循环夹在语句序列中」可吸收；含循环携带状态、并列段中有一段不干净、非直接内嵌者拒绝（见 §3.3 / §6） |
-| 代码 | `vload.is_uniform` 分支等价于 `False` | `all([])` 坑的防御性写法，可简化 |
-| 代码 | `AccessInfo._uniform` 动态挂属性 | 可提升为 dataclass 字段 |
+| 代码 | ~~`vload.is_uniform` 分支等价于 `False`~~ | ✅ **已删**：`is_uniform` 统一在递归前挡掉所有无 args 叶子（`vload`/`vload_strided`/`gather`），见 D7 |
+| 代码 | ~~`AccessInfo._uniform` 动态挂属性~~ | ✅ **已删**：随 `is_uniform` 统一而移除 |
 | 判定 | `_const_int` 已支持符号常量证明 | 传 `analyzer` 时用 `simplify` + `const_int_bound`（上下界相等即常数）；更复杂的可证常量仍受化简器 / 区间分析能力限制 |
 | 模型 | 只做连续性判定，无完整依赖分析 / 调度 | 迭代域已建模，可扩展到依赖 / 调度 |
 
@@ -854,7 +920,8 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 ## 7. 测试策略
 
 * **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan`（恒返回 `VectorProgram`）/ `emit_plan`，检查 `program.segments[*]`（单段用例取 `segments[0]`）与发射出的 `tl.simd.*` 调用序列。不涉及设备执行。
-* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例。
+* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例；另有 §6.1 **已知缺陷回归基线** 17 个用例（13 个已修 `pass` + 4 个仍 `xfail(strict=True)` + 1 个特征化 `pass`），合计 **80** 个。
+* **已知缺陷基线**：缺陷用例断言**正确契约**并挂 `xfail(strict=True)`——修复后会 `XPASS` 报错，从而强制同步摘除标记。当前 D1/D2/D3/D4/D5/D6/D7/D13 已修、对应用例已摘除标记，运行预期 `76 passed, 4 xfailed`（余 D8、D9、D10、D11）。
 * **辅助工具**：
   * `_first_parallel`：取**最外层** `T.Parallel`（后序遍历先出最内层，故取最后一个）。
   * `_single_segment`：断言 `build_plan` 恒返回 `VectorProgram` 且恰 1 段，取回 `program.segments[0]`（单段用例经它访问段级字段）。

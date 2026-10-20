@@ -64,6 +64,8 @@ tested directly, since every case above is decided by the sign/shape of
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 import tilelang.ascend.language as T
@@ -1549,3 +1551,448 @@ def test_vectorize_parallel_nests_lowers_multi_serial_program():
     assert kinds.count(tirx.ForKind.SERIAL) == 3  # 共享并行轴 i + 两个 chunk 循环
     ops = _emitted_ops(transformed)
     assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
+
+
+# ---------------------------------------------------------------------------
+# 已知缺陷回归基线（探针 A–M）
+#
+# 下面每个用例都断言**正确的契约**，并用 ``xfail(strict=True)`` 标注当前尚未满足：
+#   * 修复后测试会 XPASS，``strict=True`` 使其直接报错 —— 强制顺手删掉 xfail 标记；
+#   * 若某个缺陷被"以另一种合理方式"修复（例如从静默错发改为明确拒绝），
+#     用例里已把「拒绝」当作可接受结果一并接受，无需改动。
+# 复现入口：``tmp/drive_plan.py`` 尾部的 ``d*`` 用例；对应 ``log_poly.log`` 中的诊断。
+# ---------------------------------------------------------------------------
+
+
+def _for_extents(stmt) -> list:
+    """收集所有 ``For`` 的 extent（用于检查符号 extent 未被静默截断）。"""
+    extents: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.For):
+            extents.append(node.extent)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return extents
+
+
+def _negative_immediate_muls(stmt) -> bool:
+    """是否存在 ``vmuls(<uint32 ramp>, <负常量>)`` —— 无符号斜坡乘负步长无意义（缺陷 D8）。"""
+    bad: list = []
+
+    def visit(node):
+        if (
+            isinstance(node, tirx.Call)
+            and str(getattr(node.op, "name", "")) == "tl.simd.vmuls"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], tirx.IntImm)
+            and int(node.args[1].value) < 0
+        ):
+            bad.append(True)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return bool(bad)
+
+
+def _over_reading_contiguous_load(stmt) -> bool:
+    """连续 ``vld`` 的 access_ptr footprint 是否超出源 buffer 最内维。
+
+    这是 ``p_two_serial_independent``（``log_poly.log`` 第 1322 行）暴露的越界读形态：
+    ``vld(access_ptr(a[i, chunk_s0 * 64], 64, 1))`` 在 ``a: (64, 8)`` 上整 lane 读，
+    每行越界 56 个元素（缺陷 D10）。判据：多维 buffer 的整 lane 连续读跨度超过最内维长度。
+    """
+    bad: list = []
+
+    def is_over_reading(node) -> bool:
+        if not (isinstance(node, tirx.Call) and str(getattr(node.op, "name", "")) == "tl.simd.vld"):
+            return False
+        addr = node.args[0]
+        if not (isinstance(addr, tirx.Call) and str(getattr(addr.op, "name", "")) == "tl.access_ptr"):
+            return False
+        inner, extent = addr.args[0], addr.args[1]
+        if not (isinstance(inner, tirx.BufferLoad) and isinstance(extent, tirx.IntImm)):
+            return False
+        shape = inner.buffer.shape
+        if len(shape) < 2 or len(inner.indices) < 2:
+            return False
+        return int(shape[-1]) < int(extent)
+
+    def visit(node):
+        if is_over_reading(node):
+            bad.append(True)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return bool(bad)
+
+
+def test_defect_d1_product_reduction_is_not_emitted_as_sum():
+    """D1 已修：乘积归约显式拒绝（`_reduce_op` 不再默认 `vadd`）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] * a[i, j]
+
+    # 正确契约（D1 已修）：乘积归约必须**显式拒绝**；绝不静默发射成 vcadd 求和。
+    with pytest.raises(Unsupported, match="reduction operator"):
+        _single_segment(k)
+
+
+def test_defect_d2_plain_overwrite_is_not_treated_as_reduction():
+    """D2 已修（D13 统一判据后）：覆写 ``s[i] = a[i,j]`` 不再是「后写覆盖」被当成归约。
+
+    归约判定现统一为「lane 均匀地址 + **累加形式** ``dst = dst op x``」；本形态取值不读
+    ``s``，故以「不是累加形式」的精确诊断拒绝。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i, j in T.Parallel(MS, KS):
+                s[i] = a[i, j]
+
+    with pytest.raises(Unsupported, match="accumulate form"):
+        _single_segment(k)
+
+
+def test_defect_d3_int_max_reduction_does_not_crash():
+    """D3 已修：单位元按 dtype 派生（`tirx.min_value`），int32 max 归约不再抛 ValueError。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "int32"), S: T.Tensor((MS,), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "int32")
+            s = T.alloc_shared((MS,), "int32")
+            for i, j in T.Parallel(MS, KS):
+                s[i] = T.max(s[i], a[i, j])
+
+    # 正确契约：发射要么成功，要么以 Unsupported 优雅拒绝；不得抛出 ValueError。
+    with contextlib.suppress(Unsupported):
+        emit_plan(_single_segment(k))
+
+
+def test_defect_d3_f16_max_reduction_does_not_crash():
+    """D3 已修：单位元按 dtype 派生，f16 max 归约不再超出值域抛 ValueError。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float16"), S: T.Tensor((MS,), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float16")
+            s = T.alloc_shared((MS,), "float16")
+            for i, j in T.Parallel(MS, KS):
+                s[i] = T.max(s[i], a[i, j])
+
+    with contextlib.suppress(Unsupported):
+        emit_plan(_single_segment(k))
+
+
+def test_defect_d4_uniform_addend_inside_reduction_is_not_dropped():
+    """D4/D5 已修（D13 统一判据）：归约体里的 lane 均匀加数不再被丢弃。
+
+    ``s[i] = s[i] + a[i,j] + 1.0`` 的逐 lane 取值现为 ``vadds(vload(a), 1.0)``（``1.0``
+    保留在内，跨 lane 归约天然正确处理），旧值 ``s[i]`` 作为独立项在末尾并入。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] + a[i, j] + 1.0
+
+    segment = _single_segment(k)
+    assert segment.reduce is not None
+    varying = segment.stores[0].reduce.varying
+    # 逐 lane 取值保留常量加数（vadds 的另一侧是 imm 1.0），旧值独立并入。
+    assert varying.recipe == "vadds"
+    assert "1.0" in str(varying.args[1].scalar)
+    assert segment.stores[0].reduce.accumulate
+    ops = _emitted_ops(emit_plan(segment))
+    assert "tl.simd.vadds" in ops and "tl.simd.vcadd" in ops
+
+
+def test_defect_d6_two_reductions_in_one_nest_are_both_emitted():
+    """D6 已修：同一 nest 内两条归约各自发射（两条独立累加链 + 两次 ONEPT 回写）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((MS, KS), "float32"),
+        S1: T.Tensor((MS,), "float32"),
+        S2: T.Tensor((MS,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            s1 = T.alloc_shared((MS,), "float32")
+            s2 = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s1[i] = s1[i] + a[i, j]
+                    s2[i] = s2[i] + b[i, j]
+
+    segment = _single_segment(k)
+    assert [s.reduce is not None for s in segment.stores] == [True, True]
+    ops = _emitted_ops(emit_plan(segment))
+    # 两条归约都要回写（两次 ONEPT vsts）与两次跨 lane 归约，不得静默丢 store。
+    assert ops.count("tl.simd.vsts") >= 2
+    assert ops.count("tl.simd.vcadd") == 2
+
+
+def test_defect_d13_lane_varying_overwrite_is_not_a_reduction():
+    """D13 已修（统一判据）：``s[i] = a[i,j] + 1.0`` 是「后写覆盖」，不再被静默发成求和。
+
+    归约的唯一判据是累加形式 ``dst = dst op x``；取值不读 ``s`` 时明确拒绝（原先会被当成
+    ``vadd`` 归约发成 ``vcadd`` 求和 → 结果错误且无诊断）。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i, j in T.Parallel(MS, KS):
+                s[i] = a[i, j] + 1.0
+
+    with pytest.raises(Unsupported, match="accumulate form"):
+        _single_segment(k)
+
+
+def test_defect_d5_scaled_old_value_is_rejected():
+    """D5/D13：旧值被缩放（``s[i] = s[i] * 2.0 + a[i,j]``）无法安全剥离 → 明确拒绝。
+
+    旧值必须作为归约算子的**直接操作数**；被缩放的旧值无法用「末尾并入一次旧值」表达，
+    因此拒绝而不是静默丢掉缩放系数。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] * 2.0 + a[i, j]
+
+    with pytest.raises(Unsupported, match="accumulate position"):
+        _single_segment(k)
+
+
+def test_defect_d6b_mixed_reductions_keep_their_own_recipe():
+    """D6 已修：同一 nest 内求和与求最大**各自**用自己的归约原语（不再只认第一条）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((MS, KS), "float32"),
+        S1: T.Tensor((MS,), "float32"),
+        S2: T.Tensor((MS,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            s1 = T.alloc_shared((MS,), "float32")
+            s2 = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s1[i] = s1[i] + a[i, j]
+                    s2[i] = T.max(s2[i], b[i, j])
+
+    segment = _single_segment(k)
+    assert [store.reduce.recipe for store in segment.stores] == ["vcadd", "vcmax"]
+    ops = _emitted_ops(emit_plan(segment))
+    assert "tl.simd.vcadd" in ops and "tl.simd.vcmax" in ops
+
+
+def test_reduce_segment_with_uniform_broadcast_sibling():
+    """归约段内「取值沿轴均匀」的 store 是一次广播写：既不参与归约，也不被丢掉。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S1: T.Tensor((MS,), "float32"), S2: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s1 = T.alloc_shared((MS,), "float32")
+            s2 = T.alloc_shared((MS,), "float32")
+            for i, j in T.Parallel(MS, KS):
+                s1[i] = s1[i] + a[i, j]
+                s2[i] = 3.0
+
+    segment = _single_segment(k)
+    assert segment.reduce is not None
+    assert [store.reduce is not None for store in segment.stores] == [True, False]
+    ops = _emitted_ops(emit_plan(segment))
+    assert "tl.simd.vcadd" in ops
+    assert ops.count("tl.simd.vsts") == 2  # 归约回写 + 广播写各一次
+
+
+def test_defect_d13_stencil_shifted_read_is_not_an_accumulation():
+    """D13/D5：``s[i] = s[i-1] + a[i,j]`` 的 ``s[i-1]`` 与写入地址**不同址**，不是累加。
+
+    旧值可剥离的前提是「与目标地址同址回读」；跨位（stencil）读留在 ``varying`` 内并触发
+    显式拒绝，而不是被误当成 ``dst op= x`` 后静默丢掉 ``s[i-1]``。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i, j in T.Parallel(MS, KS):
+                s[i] = s[i - 1] + a[i, j]
+
+    with pytest.raises(Unsupported, match="accumulate position"):
+        _single_segment(k)
+
+
+def test_defect_d7_build_success_implies_emit_success_for_mixed_stores():
+    """D7 已修：`is_uniform` 显式挡掉无 args 叶子，`vload_strided` 不再被误判 lane 均匀。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        D: T.Tensor((MS, KS), "float32"),
+        S: T.Tensor((MS,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] + a[i, j]
+                    d[i, j] = s[i]
+
+    # 正确契约：build_plan 成功 ⇒ emit_plan 必须成功（不能出现「分析期 OK、发射期 Unsupported」）。
+    plan = build_plan(_first_parallel(k))
+    emit_plan(plan)
+
+
+@pytest.mark.xfail(strict=True, reason="缺陷 D8：vload_strided 发射(L1828) 假定正步长 → Δ≤-2 负步长静默错发")
+def test_defect_d8_negative_stride_below_minus_one():
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((256,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((256,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[N - 2 - 2 * i]
+
+    try:
+        stmt = emit_plan(_single_segment(k))
+    except Unsupported:
+        return
+    # 正确契约：要么拒绝，要么不得用「无符号 lane 斜坡 × 负步长」表达负步长访问。
+    assert not _negative_immediate_muls(stmt)
+
+
+@pytest.mark.xfail(strict=True, reason="缺陷 D9：符号 extent(L1590) 的 chunks/tail 为 None → 只发一个 chunk 且无尾掩码（静默少算）")
+def test_defect_d9_symbolic_extent_is_not_silently_truncated():
+    n = tirx.Var("n", "int32")
+
+    @T.prim_func
+    def k(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((n,), "float32")
+            c = T.alloc_shared((n,), "float32")
+            for i in T.Parallel(n):
+                c[i] = a[i]
+
+    try:
+        stmt = emit_plan(_single_segment(k))
+    except Unsupported:
+        return
+    # 正确契约：要么拒绝，要么 chunk 循环必须由符号 extent 驱动（不能硬编码成单 chunk）。
+    assert any(not isinstance(extent, tirx.IntImm) for extent in _for_extents(stmt))
+
+
+@pytest.mark.xfail(strict=True, reason="缺陷 D10：非归约尾块的连续 vld 无掩码 → 整 lane 越界读（log_poly.log:1322）")
+def test_defect_d10_non_reduction_tail_load_is_bounded():
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    try:
+        stmt = emit_plan(_single_segment(k))
+    except Unsupported:
+        return
+    # 正确契约：要么拒绝，要么不发出跨越源 buffer 最内维的整 lane 读。
+    assert not _over_reading_contiguous_load(stmt)
+
+
+@pytest.mark.xfail(strict=True, reason="缺陷 D11：pre/post 的均匀性门禁在 emit 期(L1940) → build 成功但 emit 失败（契约不一致）")
+def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((1,), "int32"),
+        D: T.Tensor((MS, KS), "float32"),
+        C: T.Tensor((MS,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((1,), "int32")
+            d = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                c[b[0]] = 1.0
+                for j in T.serial(KS):
+                    d[i, j] = a[i, j] * 2.0
+
+    plan = build_plan(_first_parallel(k))
+    emit_plan(plan)
+
+
+def test_masked_branch_merging_is_rejected():
+    """特征化用例（缺陷 D12）：``if/else`` 同址合并时某一臂自带谓词 → 明确拒绝。
+
+    该路径在两份文档的 §4/§6 中**均未声明**（``normalize_body`` L615），此处把它固定成
+    可观测行为；若后续支持掩码合并，本用例需同步更新。
+    """
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), B: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            b = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if a[i] > 0.0:
+                    c[i] = 1.0
+                else:
+                    if b[i] > 0.0:
+                        c[i] = 2.0
+
+    with pytest.raises(Unsupported, match="masked branch merging"):
+        build_plan(_first_parallel(k))
