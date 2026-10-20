@@ -466,8 +466,10 @@ def classify_access(
 
     Δ 层给出常数形态；非常数 Δ 再做一次**结构判定**：
 
-    * 下标含 ``BufferLoad``（``A[B[i]]``）→ :attr:`AccessClass.INDIRECT`，
-      索引向量来自被装载的寄存器；
+    * 下标含 ``BufferLoad``（``A[B[i]]``）且沿该轴**变化** → :attr:`AccessClass.INDIRECT`，
+      索引向量来自被装载的寄存器；沿该轴**不变**（``Δ == 0``，如 ``c[b[0]]``）时它是
+      lane 内均匀的标量地址，仍归 :attr:`AccessClass.UNIFORM`（pre/post 语句因此可以
+      只发一次单元素写，而不是整段拒绝）；
     * 否则尝试在索引向量通道构造元素偏移（:func:`index_vector_reason`）：
       可构造 → :attr:`AccessClass.PIECEWISE`（分块置换/高维摊平等）；不可构造 →
       :attr:`AccessClass.TRUE_RANDOM`（如非 2 的幂常量除法、数据相关下标）。
@@ -488,13 +490,23 @@ def classify_access(
     )
     piecewise_reason = None if indirect else index_vector_reason(offset, analyzer)
     for axis in axes:
-        if indirect:
-            info.per_axis[axis.index] = (AccessClass.INDIRECT, None)
-            continue
         delta = finite_difference(offset, axis.var, analyzer)
         kind, stride = classify_delta(delta, analyzer)
+        if indirect:
+            # 间接下标（含 ``BufferLoad``）不必然是「每 lane 索引向量」：地址沿该轴 **不变**
+            # （Δ==0）时它就是 lane 内均匀的标量地址，例如 pre/post 语句 ``c[b[0]] = 1.0``。
+            # 只有沿轴变化的间接地址才必须走索引向量通道（``vgather2`` / ``vscatter``）。
+            if kind != AccessClass.UNIFORM:
+                kind, stride = AccessClass.INDIRECT, None
+            info.per_axis[axis.index] = (kind, stride)
+            continue
         if kind == AccessClass.PIECEWISE and piecewise_reason is not None:
             # Δ 非常数，但索引向量通道构造不出来 → 真正的"无结构"访问。
+            kind, stride = AccessClass.TRUE_RANDOM, None
+            info.reason = piecewise_reason
+        elif kind == AccessClass.STRIDED and stride is not None and stride < 0 and piecewise_reason is not None:
+            # 负步长**必须**走索引向量通道（无符号 lane 斜坡乘负步长没有意义，缺陷 D8）；
+            # 该通道构造不出来时明确拒绝，而不是落到 ``vload_strided``。
             kind, stride = AccessClass.TRUE_RANDOM, None
             info.reason = piecewise_reason
         info.per_axis[axis.index] = (kind, stride)
@@ -930,6 +942,10 @@ def load_node(info: AccessInfo, ctx: _ValueContext, is_global_ok: bool) -> Value
     if kind == AccessClass.UNIFORM:
         return ValueNode("uniform_load", _dtype_of_scalar(info), access=info, detail="lane-uniform")
     if kind == AccessClass.STRIDED:
+        if stride is not None and stride < 0:
+            # 负步长（Δ ≤ -2）：无符号 lane 斜坡乘负步长表达不了负方向（缺陷 D8），改走
+            # ``vgather2`` 的每 lane 索引向量——它的补码表示本就支持负偏移。
+            return ValueNode("gather", ctx.vector_dtype, [index_value(info, ctx)], access=info, detail=f"stride={stride} (index vector)")
         return ValueNode("vload_strided", ctx.vector_dtype, access=info, detail=f"stride={stride}")
     if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT):
         return ValueNode("gather", ctx.vector_dtype, [index_value(info, ctx)], access=info, detail=kind.value)
@@ -1198,6 +1214,8 @@ def _prepare_segment(
     post_specs = normalize_body(_seq(post_stmts), aliases) if post_stmts else []
     if not main_specs:
         raise Unsupported("T.Parallel body has no store to vectorize")
+    for spec in (*pre_specs, *main_specs, *post_specs):
+        _require_supported_element(spec.buffer)
 
     elem = _elem_dtype(main_specs[0].buffer.dtype)
     if lanes is None:
@@ -1619,7 +1637,7 @@ def _build_plan_for_axis(
             "a T.Parallel body with sibling statements around a serial loop can only be vectorized along that serial axis (方案 §6 第二步)"
         )
 
-    extent = _const_int(vector_axis.extent)
+    extent = _const_int(vector_axis.extent, analyzer)
     chunks = None if extent is None else (extent + lanes - 1) // lanes
     tail = None if extent is None else extent % lanes
 
@@ -1640,10 +1658,14 @@ def _build_plan_for_axis(
     )
 
     def _plan_store(spec, info):
-        kind = info.axis_class(vector_axis)[0]
+        kind, stride = info.axis_class(vector_axis)
         value = build_value(spec.value, ctx)
         mask = build_value(spec.mask, ctx) if spec.mask is not None else None
-        index = index_value(info, ctx) if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT) else None
+        # 负步长与 PERMUTE / PIECEWISE / INDIRECT 共用「每 lane 索引向量」通道（缺陷 D8）。
+        needs_index = kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT) or (
+            kind == AccessClass.STRIDED and stride is not None and stride < 0
+        )
+        index = index_value(info, ctx) if needs_index else None
         return StorePlan(spec=spec, access=info, value=value, mask=mask, kind=kind, index=index)
 
     for spec, info in zip(main_specs, main_infos):
@@ -1652,9 +1674,37 @@ def _build_plan_for_axis(
         plan.pre_stores.append(_plan_store(spec, info))
     for spec, info in zip(post_specs, post_infos):
         plan.post_stores.append(_plan_store(spec, info))
+    # pre/post 必须是沿向量轴均匀的语句（与 serial 循环同级的语句天然满足；间接下标若沿轴
+    # 不变也归 UNIFORM，见 :func:`classify_access`）。这是**防御性**门禁：把原先只在发射期
+    # （:func:`_emit_outer_store`）的检查前移到 build 期，保证 build 成功 ⇒ emit 成功。
+    for where, stores in (("before", plan.pre_stores), ("after", plan.post_stores)):
+        for store in stores:
+            if store.kind != AccessClass.UNIFORM:
+                raise Unsupported(
+                    f"a statement {where} the serial loop must be uniform along vector axis "
+                    f"'{vector_axis.name}' (got {store.kind.value}) (方案 §6 第二步)"
+                )
     # 归约判定必须等值 DAG 建好之后（D13 统一判据）：逐 store 剥离旧值，顺带在 build 期
     # 就把不支持的形态拒绝掉，保证 build 成功 ⇒ emit 成功。
     plan.reduce = _classify_reduce(plan, analyzer)
+    # 缺陷 A0：吸收的 serial 轴上，「部分归约」没有向量形式。lane 均匀的地址配逐 lane 变化的
+    # 取值，只有**全段归约**（:func:`_classify_reduce` 成功）才能表达；否则逐元素路径会用
+    # ``ONEPT`` 只保留 lane 0，把其余迭代的累加静默丢掉（结果错误且无诊断）。
+    if plan.reduce is None and not vector_axis.is_parallel:
+        for store in plan.stores:
+            if store.kind == AccessClass.UNIFORM and not store.value.is_uniform:
+                raise Unsupported(
+                    f"store to '{store.spec.buffer.name}' is lane-uniform along the absorbed serial axis "
+                    f"'{vector_axis.name}' but its value varies with it: a partial reduction mixed with "
+                    "element-wise stores has no vector form (方案 §2 Case II)"
+                )
+    # 缺陷 D9（归约分支）：归约的 chunk 循环在编译期展开，符号 extent 无法展开；宁可拒绝，
+    # 也不能像旧实现那样只展开 1 个 chunk（静默少算）。
+    if plan.reduce is not None and plan.chunks is None:
+        raise Unsupported(
+            "a reduction needs a compile-time vector-axis extent (the chunk loop is unrolled at build time): "
+            f"axis '{vector_axis.name}' has symbolic extent {vector_axis.extent}"
+        )
     return plan
 
 
@@ -1831,6 +1881,20 @@ def _elem_dtype(dtype_like) -> str:
     return str(dtype_like).split("x", 1)[0]
 
 
+def _require_supported_element(buffer) -> None:
+    """store 的元素类型必须能推出谓词宽度（``_mask_bits`` 的能力边界）。
+
+    ``bool`` 是典型反例：``_vreg_lanes("bool")`` 给出 256 而不报错，但 ``_mask_bits("bool")``
+    在发射期抛 ``ValueError``——于是出现「build 成功、emit 崩溃」（与缺陷 D11 同族）。
+    在 build 期统一转成 ``Unsupported``，保持「拒绝一律走 Unsupported」的约定。
+    """
+    elem = _elem_dtype(buffer.dtype)
+    try:
+        _mask_bits(elem)
+    except ValueError as err:
+        raise Unsupported(f"store element dtype '{elem}' of buffer '{buffer.name}' is not supported: {err}") from err
+
+
 def _unsigned_index(reg):
     """把有符号整数索引向量按位重解释为无符号（``vgather2`` / ``vscatter`` 需要）。"""
     dtype = str(reg.dtype)
@@ -1860,11 +1924,12 @@ class _Emitter:
     重设（并清空 ``memo``，因为地址随 chunk 变化）。
     """
 
-    def __init__(self, plan: VectorPlan, chunk: tirx.Var, prefix: str = ""):
+    def __init__(self, plan: VectorPlan, chunk: tirx.Var, prefix: str = "", *, masked_tail: bool = False):
         self.plan = plan
         self.chunk = chunk
         self.prefix = prefix  # 多段路径下按段命名（``s0_``/``s1_``...），避免跨段重名
         self.lane_base: tirx.PrimExpr = chunk * _int(plan.lanes)
+        self.masked_tail = masked_tail  # 本发射块是否需要屏蔽尾部车道（尾块，见 tail_mask）
         self.memo: dict = {}
         self.lets: list = []  # chunk 体内的 Bind / Evaluate
         self.prologue: list = []  # chunk 无关的 Bind（掩码）
@@ -1888,6 +1953,43 @@ class _Emitter:
         self.prologue.append(tirx.Bind(var, simd.pset(bits, "PAT_ALL")))
         self._mask_vars[bits] = var
         return var
+
+    def data_mask(self, dtype_like):
+        """数据向量的执行掩码：元素类型 → 谓词宽度 → 全 lane 谓词（按宽度缓存）。"""
+        return self.all_mask(_mask_bits(dtype_like))
+
+    def tail_mask(self, bits: int):
+        """尾块谓词：只有在本发射块需要屏蔽尾部车道时非空（整 chunk 块返回 ``None``）。
+
+        常量 extent（``plan.tail`` 已知）用常量车道数；符号 extent 则在每个 chunk 运行时
+        算 ``min(extent - chunk*lanes, lanes)``——``update_mask`` 只保证 ``[0, lanes]``
+        内有意义，超宽车道数不做假设（缺陷 A5）。
+
+        掩码按宽度缓存：同一个块内只绑定一次，避免每条 ``vsts`` 前重复绑定。
+        """
+        if not self.masked_tail:
+            return None
+        key = ("tail", bits)
+        cached = self._mask_vars.get(key)
+        if cached is not None:
+            return cached
+        if self.plan.tail is not None:
+            count = _int(self.plan.tail)
+        else:
+            remaining = self.plan.vector_axis.extent - self.chunk * _int(self.plan.lanes)
+            count = tirx.min(remaining, _int(self.plan.lanes))
+        var = self.bind(simd.update_mask(count, bits), self.lets)
+        self._mask_vars[key] = var
+        return var
+
+    def load_mask(self, bits: int):
+        """装载谓词：尾块用尾块谓词，整 chunk 用全 lane 谓词（缺陷 D10）。
+
+        旧实现只把尾块谓词加在 store 侧，load 一律全 lane，于是尾块整 lane 读越过
+        buffer 尾部（``vld`` / 步长 ``vgather2`` / 间接 ``vgather2`` 都有这个问题）。
+        """
+        tail = self.tail_mask(bits)
+        return tail if tail is not None else self.all_mask(bits)
 
     def predicate_combine(self, lhs, rhs):
         """两个谓词的合取：``pand(lhs, rhs, ALL)``。"""
@@ -1944,7 +2046,7 @@ class _Emitter:
         """把一个 lane 内均匀的标量提升成向量寄存器（``vdup``），否则走 ``value``。"""
         if node.recipe in _SCALAR_ONLY_RECIPES:
             elem = _elem_dtype(node.dtype)
-            return self.bind(simd.vdup(self.scalar(node), elem, self.all_mask(_mask_bits(elem)), _MODE), self.lets)
+            return self.bind(simd.vdup(self.scalar(node), elem, self.data_mask(elem), _MODE), self.lets)
         return self.value(node)
 
     def _build(self, node: ValueNode):
@@ -1957,46 +2059,42 @@ class _Emitter:
             # 向量轴的绝对取值 = chunk 基址 + lane id（用于谓词比较，如 ``i < j``）。
             return self.bind(simd.vci(self.lane_base, _elem_dtype(node.dtype)), self.lets)
         if recipe == "vload":
-            return self.bind(simd.vld(self.addr(node.access), "NORM"), self.lets)
+            tail = self.tail_mask(_mask_bits(node.dtype))
+            if tail is None:
+                return self.bind(simd.vld(self.addr(node.access), "NORM"), self.lets)
+            # ``vld`` 没有谓词形式：尾块退化成带谓词的 ``vgather2``（相对 lane 偏移），
+            # 否则整 lane 读会越过 buffer 尾部（缺陷 D10）。
+            return self.bind(simd.vgather2(self.addr(node.access), simd.vci(_int(0), "uint32"), tail), self.lets)
         if recipe == "vload_strided":
             # simd 没有带步长装载：用 ``vgather2`` + 步长索引斜坡表达。
             _, stride = node.access.axis_class(self.plan.vector_axis)
             bits = _mask_bits(node.dtype)
-            mask = self.all_mask(bits)
+            mask = self.load_mask(bits)
             index = simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask)
             return self.bind(simd.vgather2(self.addr(node.access), index, mask), self.lets)
         if recipe == "gather":
             # 每 lane 索引向量通道（改进 1）：``args[0]`` 是绝对元素偏移向量。
             bits = _mask_bits(node.dtype)
-            mask = self.all_mask(bits)
+            mask = self.load_mask(bits)
             index = _unsigned_index(self.value(args[0]))
             return self.bind(simd.vgather2(self.index_addr(node.access), index, mask), self.lets)
         if recipe in ("uniform_load", "uniform_expr", "vbrc"):
             operand = node if recipe != "vbrc" else args[0]
             elem = _elem_dtype(operand.dtype)
-            return self.bind(
-                simd.vdup(self.scalar(operand), elem, self.all_mask(_mask_bits(elem)), _MODE),
-                self.lets,
-            )
+            return self.bind(simd.vdup(self.scalar(operand), elem, self.data_mask(elem), _MODE), self.lets)
         if recipe in _VEC_SCALAR_BINARY.values():
-            mask = self.all_mask(_mask_bits(node.dtype))
-            return self.bind(getattr(simd, recipe)(self.value(args[0]), self.scalar(args[1]), mask, _MODE), self.lets)
+            return self.bind(getattr(simd, recipe)(self.value(args[0]), self.scalar(args[1]), self.data_mask(node.dtype), _MODE), self.lets)
         if recipe in ("vshrs", "vshls"):
             # 常量移位量走标量-向量移位（`vshrs` = 算术右移，即整型 FloorDiv by 2^k）。
-            mask = self.all_mask(_mask_bits(node.dtype))
-            return self.bind(getattr(simd, recipe)(self.value(args[0]), node.scalar, mask, _MODE), self.lets)
+            return self.bind(getattr(simd, recipe)(self.value(args[0]), node.scalar, self.data_mask(node.dtype), _MODE), self.lets)
         if recipe in _ELEMENTWISE_UNARY.values():
-            mask = self.all_mask(_mask_bits(node.dtype))
-            return self.bind(getattr(simd, recipe)(self.value(args[0]), mask, _MODE), self.lets)
+            return self.bind(getattr(simd, recipe)(self.value(args[0]), self.data_mask(node.dtype), _MODE), self.lets)
         if recipe in _ELEMENTWISE_BINARY.values():
-            mask = self.all_mask(_mask_bits(node.dtype))
-            return self.bind(getattr(simd, recipe)(self.value(args[0]), self.value(args[1]), mask, _MODE), self.lets)
+            return self.bind(getattr(simd, recipe)(self.value(args[0]), self.value(args[1]), self.data_mask(node.dtype), _MODE), self.lets)
         if recipe == "vcmp":
-            mask = self.all_mask(_mask_bits(args[0].dtype))
-            return self.bind(simd.vcmp(self.value(args[0]), self.value(args[1]), mask, node.detail), self.lets)
+            return self.bind(simd.vcmp(self.value(args[0]), self.value(args[1]), self.data_mask(args[0].dtype), node.detail), self.lets)
         if recipe == "vcmps":
-            mask = self.all_mask(_mask_bits(args[0].dtype))
-            return self.bind(simd.vcmps(self.value(args[0]), self.scalar(args[1]), mask, node.detail), self.lets)
+            return self.bind(simd.vcmps(self.value(args[0]), self.scalar(args[1]), self.data_mask(args[0].dtype), node.detail), self.lets)
         if recipe == "vsel":
             # ``args = [cond, true, false]``；``vsel`` 的顺序是 ``(t, f, mask)``。
             # 循环不变条件（沿向量轴均匀）→ 广播成全 lane 谓词（整个 chunk 同真同假）；
@@ -2018,19 +2116,12 @@ class _Emitter:
         raise Unsupported(f"no emitter for value recipe '{recipe}'")
 
 
-def _tail_mask(plan: VectorPlan, chunk: tirx.Var, bits: int):
-    """尾块谓词：``update_mask(extent - chunk*L, bits)``（整除时返回 None）。"""
-    if not plan.tail:
-        return None
-    return simd.update_mask(plan.vector_axis.extent - chunk * _int(plan.lanes), bits)
-
-
-def _store_mask(plan: VectorPlan, store: StorePlan, emitter: _Emitter, bits: int):
-    """store 的最终谓词 = 尾块掩码 ∧ 用户谓词（都为空时用全 1）。"""
+def _store_mask(store: StorePlan, emitter: _Emitter, bits: int):
+    """chunk 内 store 的最终谓词 = 尾块掩码 ∧ 用户谓词（都为空时用全 1）。"""
     mask = None
     if store.mask is not None:
         mask = emitter.value(store.mask)
-    tail = _tail_mask(plan, emitter.chunk, bits)
+    tail = emitter.tail_mask(bits)
     if tail is not None:
         mask = tail if mask is None else emitter.predicate_combine(mask, tail)
     if mask is None:
@@ -2038,46 +2129,107 @@ def _store_mask(plan: VectorPlan, store: StorePlan, emitter: _Emitter, bits: int
     return mask
 
 
+def _emit_vector_write(store: StorePlan, emitter: _Emitter, bits: int, mask) -> None:
+    """发射一条 ``vsts``：lane 内均匀（``UNIFORM``）用 ``ONEPT``，否则连续 ``NORM``。
+
+    ``mask`` 由调用方给：chunk 内写用 :func:`_store_mask`（含尾块谓词）；与 serial 循环
+    同级的 pre/post 写只用用户谓词（**不能**含尾块谓词，见 :func:`_emit_outer_store`）。
+    """
+    value = emitter.vector_operand(store.value)
+    uniform = store.kind == AccessClass.UNIFORM
+    dist = f"ONEPT_B{bits}" if uniform else f"NORM_B{bits}"
+    emitter.lets.append(tirx.Evaluate(simd.vsts(emitter.addr(store.access, uniform=uniform), value, mask, dist)))
+
+
 def _emit_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
     """发射一次写入：连续/均匀写走 ``vsts``，其余走每 lane 索引 ``vscatter``。"""
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
-    value = emitter.vector_operand(store.value)
-    mask = _store_mask(plan, store, emitter, bits)
+    mask = _store_mask(store, emitter, bits)
 
     if store.kind in (AccessClass.CONTIGUOUS, AccessClass.UNIFORM):
-        uniform = store.kind == AccessClass.UNIFORM
-        dist = f"ONEPT_B{bits}" if uniform else f"NORM_B{bits}"
-        addr = emitter.addr(store.access, uniform=uniform)
-        emitter.lets.append(tirx.Evaluate(simd.vsts(addr, value, mask, dist)))
+        _emit_vector_write(store, emitter, bits, mask)
         return
 
+    value = emitter.vector_operand(store.value)
     if store.kind == AccessClass.STRIDED:
-        # 常量步长写：chunk lane 基址 + 步长斜坡（与 ``vload_strided`` 对称）。
+        # 常量**正**步长写：chunk lane 基址 + 步长斜坡（与 ``vload_strided`` 对称）。
+        # 负步长落到下面的索引向量通道：无符号斜坡乘负步长表达不了负方向（缺陷 D8）。
         _, stride = store.access.axis_class(plan.vector_axis)
-        index = emitter.bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask), emitter.lets)
-        emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.addr(store.access), index, mask)))
-        return
+        if stride is not None and stride > 0:
+            index = emitter.bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask), emitter.lets)
+            emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.addr(store.access), index, mask)))
+            return
 
-    # PERMUTE / PIECEWISE / INDIRECT：绝对元素偏移索引向量 + 缓冲区起点基址。
+    # PERMUTE / PIECEWISE / INDIRECT / 负步长 STRIDED：绝对元素偏移索引向量 + 缓冲区起点基址。
+    if store.index is None:  # 防御：这条通道必须带每 lane 索引向量
+        raise Unsupported(f"no per-lane index vector for a {store.kind.value} store")
     index = _unsigned_index(emitter.value(store.index))
     emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.index_addr(store.access), index, mask)))
 
 
-def _emit_outer_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
+def _emit_outer_store(store: StorePlan, emitter: _Emitter) -> None:
     """发射一条与 serial 循环**同级**的语句（pre/post，方案 §6 第二步）。
 
-    这类语句不含 serial 变量，沿向量轴 ``Δ==0``，因此每个外层迭代只执行一次——
+    这类语句不含 serial 向量轴变量，沿该轴 ``Δ==0``，因此每个外层迭代只执行一次——
     发射在 chunk 循环**之外**，用 ``ONEPT`` 单点写（值经 ``vdup`` 广播）。
     """
     if store.kind != AccessClass.UNIFORM:
         raise Unsupported(f"a statement outside the serial loop must be uniform along the vector axis (got {store.kind.value})")
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
-    value = emitter.vector_operand(store.value)
     mask = emitter.value(store.mask) if store.mask is not None else emitter.all_mask(bits)
-    addr = emitter.addr(store.access, uniform=True)
-    emitter.lets.append(tirx.Evaluate(simd.vsts(addr, value, mask, f"ONEPT_B{bits}")))
+    _emit_vector_write(store, emitter, bits, mask)
+
+
+def _emit_elementwise_chunks(plan: VectorPlan, chunk: tirx.Var, prefix: str) -> tuple[list, list]:
+    """逐元素主路径的 chunk 发射（尾块单独成块），返回 ``(prologue, blocks)``。
+
+    常量 extent 且 ``tail != 0`` 时**拆出尾块**：前 ``chunks-1`` 个整 chunk 用全 lane 掩码，
+    尾块单独一块用尾块掩码——整 chunk 仍走 ``vld``，只有尾块退化成带谓词的 ``vgather2``
+    （``vld`` 没有谓词形式，整 lane 读会越过 buffer 尾部，缺陷 D10）。
+
+    符号 extent（``chunks is None``）无法预知尾块位置：只发一个运行时 chunk 循环，
+    每个 chunk 都带夹紧后的尾块掩码（缺陷 D9 / A5）。
+
+    每块用独立的 :class:`_Emitter`（SSA 名不撞车），因此各自的 ``prologue``（``pset`` 全 lane
+    掩码）也必须一并返回，由调用方提到最外层。
+    """
+
+    prologue: list = []
+
+    def emit_body(chunk_var, masked_tail: bool, body_prefix: str) -> list:
+        body_emitter = _Emitter(plan, chunk_var, body_prefix, masked_tail=masked_tail)
+        for store in plan.stores:
+            _emit_store(plan, store, body_emitter)
+        prologue.extend(body_emitter.prologue)
+        return body_emitter.lets
+
+    if plan.chunks is None:
+        count = tirx.ceildiv(plan.vector_axis.extent, _int(plan.lanes))
+        blocks = [tirx.For(chunk, 0, count, tirx.ForKind.SERIAL, _seq(emit_body(chunk, True, "")))]
+        return prologue, blocks
+
+    if not plan.tail:
+        blocks = [tirx.For(chunk, 0, _int(plan.chunks), tirx.ForKind.SERIAL, _seq(emit_body(chunk, False, "")))]
+        return prologue, blocks
+
+    blocks: list = []
+    full = plan.chunks - 1
+    if full > 0:
+        blocks.append(tirx.For(chunk, 0, _int(full), tirx.ForKind.SERIAL, _seq(emit_body(chunk, False, ""))))
+    # 尾块是单次循环（``[chunks-1, chunks)``）：只有这一块带尾块谓词，整 chunk 保留全 lane。
+    tail_chunk = tirx.Var(f"{prefix}tailchunk", "int32")
+    blocks.append(
+        tirx.For(
+            tail_chunk,
+            _int(full),
+            _int(plan.chunks),
+            tirx.ForKind.SERIAL,
+            _seq(emit_body(tail_chunk, True, f"{prefix}tail_")),
+        )
+    )
+    return prologue, blocks
 
 
 def emit_plan(plan: VectorPlan | VectorProgram) -> tirx.Stmt:
@@ -2114,7 +2266,7 @@ def _emit_segment_stmts(plan: VectorPlan, chunk: tirx.Var, *, hoisted: list[Axis
     emitter = _Emitter(plan, chunk, prefix)
 
     for store in plan.pre_stores:  # 前置语句：chunk 循环之前，每个外层迭代一次
-        _emit_outer_store(plan, store, emitter)
+        _emit_outer_store(store, emitter)
     pre_lets = emitter.lets
     emitter.lets = []
 
@@ -2122,15 +2274,12 @@ def _emit_segment_stmts(plan: VectorPlan, chunk: tirx.Var, *, hoisted: list[Axis
         _emit_reduce(plan, emitter)  # 填 emitter.lets（编译期展开 chunk）
         main_lets = emitter.lets
         emitter.lets = []
+        main_prologue: list = []
     else:
-        for store in plan.stores:
-            _emit_store(plan, store, emitter)
-        inner = _seq(emitter.lets)
-        emitter.lets = []
-        main_lets = [tirx.For(chunk, 0, _int(plan.chunks or 1), tirx.ForKind.SERIAL, inner)]
+        main_prologue, main_lets = _emit_elementwise_chunks(plan, chunk, prefix)
 
     for store in plan.post_stores:  # 后置语句：chunk 循环之后，每个外层迭代一次
-        _emit_outer_store(plan, store, emitter)
+        _emit_outer_store(store, emitter)
     post_lets = emitter.lets
 
     body = _seq([*pre_lets, *main_lets, *post_lets])
@@ -2140,7 +2289,7 @@ def _emit_segment_stmts(plan: VectorPlan, chunk: tirx.Var, *, hoisted: list[Axis
         if any(axis.var.same_as(h.var) for h in hoisted):
             continue
         body = tirx.For(axis.var, 0, axis.extent, tirx.ForKind.SERIAL, body)
-    return emitter.prologue, body
+    return [*emitter.prologue, *main_prologue], body
 
 
 def _emit_program(program: VectorProgram) -> tirx.Stmt:
@@ -2175,7 +2324,7 @@ def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
     """
     for store in plan.stores:
         if store.reduce is None:
-            _emit_outer_store(plan, store, emitter)  # 取值沿轴均匀 → 与归约同级，发一次
+            _emit_outer_store(store, emitter)  # 取值沿轴均匀 → 与归约同级，发一次
             continue
         _emit_one_reduce(plan, store, emitter)
 
@@ -2201,22 +2350,26 @@ def _emit_one_reduce(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> N
     acc = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
 
     # 尾块（``extent % lanes != 0``，改进 6）：最后一个 chunk 只有 ``tail`` 个有效车道，
-    # 其余车道在 ``vld`` 里读到的是越界/脏数据。用 ``vsel(loaded, fill, tail_mask)`` 把它们
-    # 替换成归约单位元（add→0，max→-inf，min→+inf），再按全 lane 掩码归约，结果正确。
+    # 其余车道在 ``vld`` 里读到的是越界/脏数据。尾块装载带谓词（不再整 lane 越界读，
+    # 缺陷 D10），再用 ``vsel(loaded, fill, tail_mask)`` 把无效车道替换成归约单位元
+    # （add→0，max→-inf，min→+inf），最后按全 lane 掩码归约，结果正确。
     fill = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets) if plan.tail else None
 
     varying = reduce.varying
-    last_chunk = (plan.chunks or 1) - 1
-    for ck in range(plan.chunks or 1):
+    chunks = plan.chunks
+    assert chunks is not None, "a reduction requires a compile-time chunk count (see _build_plan_for_axis)"
+    last_chunk = chunks - 1
+    for ck in range(chunks):
         lane_base = _int(ck * plan.lanes)
         emitter.lane_base = lane_base
         emitter.memo = {}  # 地址随 chunk 变化，缓存必须按 chunk 失效
+        emitter.masked_tail = fill is not None and ck == last_chunk
         loaded = emitter.value(varying)
-        if fill is not None and ck == last_chunk:
-            tail_mask = emitter.bind(simd.update_mask(plan.vector_axis.extent - lane_base, bits), emitter.lets)
-            loaded = emitter.bind(simd.vsel(loaded, fill, tail_mask), emitter.lets)
+        if emitter.masked_tail:
+            loaded = emitter.bind(simd.vsel(loaded, fill, emitter.tail_mask(bits)), emitter.lets)
         reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
+    emitter.masked_tail = False
 
     if reduce.accumulate:
         # ``dst = dst op x``：末尾并入目标里原有的值（读到的是本 chunk 之前的结果）。

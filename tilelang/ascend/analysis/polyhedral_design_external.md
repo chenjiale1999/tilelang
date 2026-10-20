@@ -3,7 +3,7 @@
 >
 > 本文说明一套把 `T.Parallel` 标量循环**统一向量化**的编译分析与发射方案。为了让没有代码仓库访问权限的同事也能完整读懂，本文**自包含**：所有关键算法都附上**伪代码**或**真实实现片段**，无需打开任何源文件。
 >
-> 对应实现是一个约 2304 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 80 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
+> 对应实现是一个约 2454 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 87 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
 
 ---
 
@@ -546,12 +546,20 @@ def _build(self, node: ValueNode):
 | `lets` | chunk 体内的 SSA 语句 |
 | `memo` | `id(node) → 变量`，同一子表达式去重 |
 
-**掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。尾块掩码 `update_mask(extent - chunk*lanes, bits)`，整除时为 `None`。
+**掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。
 
-> ⚠️ **使用者须知（三条已知缺陷，详见 §6）**：
-> 1. **尾块掩码只加在 store 侧**：装载 `vld(addr, "NORM")` **没有谓词形参**，故**非归约**路径在最后一个 chunk 会**整 lane 越界读**（归约路径有 `vsel` 兜底，非归约没有）。建议显式保证**非归约的向量轴长度是 `lanes` 的整数倍**，或把校验交给下游。
-> 2. **负步长不支持**：`vload_strided` 用**无符号** lane 斜坡乘步长，只对正步长成立；`Δ ≤ -2` 的负步长会**静默发出错误偏移**。逆序但步长为 `-1` 的场景请走 `PERMUTE`（`vgather2` 索引向量）。
-> 3. **extent 必须是编译期可证常量**：符号 extent 下 `chunks/tail` 为 `None`，发射退化为**只发一个 chunk 且无尾掩码**，对大于 `lanes` 的符号形状会**静默少算**。请尽量使用编译期常量形状。
+* 常量 extent 且 `tail != 0` 时，发射拆成「整 chunk 块（全 lane 掩码）+ 尾块块（`update_mask(tail)`）」，
+  尾块块只有一次迭代；整 chunk 不再背一个恒真的 `update_mask`。
+* 符号 extent 只发一个运行时 chunk 循环 `ceildiv(extent, lanes)`，尾块车道数在运行时
+  **夹到 lanes**：`update_mask(min(extent - chunk*lanes, lanes))`。
+
+> ✅ **原「三条已知缺陷」均已修复**（详见 §6）：
+> 1. **尾块装载不再越界**：尾块内的连续装载退化成**带谓词的 `vgather2`**（`vld` 本身没有谓词形参），
+>    步长/间接装载直接使用尾块谓词；归约尾块也先带谓词装载再用 `vsel` 填单位元（D10）。
+> 2. **负步长已支持**：`Δ ≤ -2` 改走「每 lane 索引向量」通道（`vgather2`/`vscatter`，负偏移以补码表达），
+>    读、写两侧都覆盖（D8）。
+> 3. **符号 extent 已支持（非归约）**：运行时 chunk 循环驱动，尾块掩码运行时夹紧；归约的 chunk 循环
+>    需要编译期展开，符号 extent 会在**规划期明确拒绝**而不是静默少算（D9）。
 
 **系统常量**：
 
@@ -613,19 +621,20 @@ def _emit_one_reduce(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> N
     fill = (emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
             if plan.tail else None)                 # 尾块填充寄存器（改进 6）
     varying = reduce.varying                        # D4/D5：_strip_reduce 已剥离同址旧值，均匀加数在内
-    last_chunk = (plan.chunks or 1) - 1
+    chunks = plan.chunks                            # D9：归约要求编译期常量 chunk 数（build 期保证）
+    last_chunk = chunks - 1
 
-    for ck in range(plan.chunks or 1):              # 编译期展开
+    for ck in range(chunks):                        # 编译期展开
         lane_base = _int(ck * plan.lanes)
         emitter.lane_base = lane_base
         emitter.memo = {}                           # 地址随 chunk 变化，缓存按 chunk 失效
-        loaded = emitter.value(varying)
-        if fill is not None and ck == last_chunk:   # 尾块：无效车道填单位元
-            tail_mask = emitter.bind(
-                simd.update_mask(plan.vector_axis.extent - lane_base, bits), emitter.lets)
-            loaded = emitter.bind(simd.vsel(loaded, fill, tail_mask), emitter.lets)
+        emitter.masked_tail = fill is not None and ck == last_chunk
+        loaded = emitter.value(varying)             # 尾块装载带谓词（D10：vld→带谓词的 vgather2）
+        if emitter.masked_tail:                     # 尾块：无效车道填单位元
+            loaded = emitter.bind(simd.vsel(loaded, fill, emitter.tail_mask(bits)), emitter.lets)
         reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
+    emitter.masked_tail = False
 
     if reduce.accumulate:                           # dst = dst op x：并入目标旧值
         old = emitter.bind(simd.vld(emitter.addr(store.access, uniform=True),
@@ -785,10 +794,11 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 | §2-II | **非 Add/Max/Min 的归约**（乘积归约 `s[i] *= a[i,j]`） | 拒绝 | **D1 已修**：显式拒绝 `unsupported reduction operator(s) Mul`，不再静默发成求和 |
 | §2-II | **覆写 `s[i] = a[i,j]`（store 沿轴均匀、取值变化）** | 拒绝 | **D2 已修**（随 D1）：显式拒绝，不再误判为 `vcadd` 归约 |
 | §2-II | **`int`/`fp16` 的 `max`/`min` 归约** | 支持 | **D3 已修**：单位元按 dtype 派生，不再抛 `ValueError` |
-| §4-II-a | **负步长（`Δ ≤ -2`，如 `a[N-2-2*i]`）** | 拒绝（静默） | 无符号 ramp × 负步长 → **结果错误**（缺陷 D8） |
-| §4-I | **符号 extent 的向量化**（`a: (n,)` 且 `n` 为变量） | 拒绝（静默） | `chunks/tail=None` → 只发一个 chunk，**静默少算**（缺陷 D9） |
-| §0-I | **非归约 + 尾块**（向量轴长度非 `lanes` 整数倍） | 部分支持 | 尾块掩码只加在 store 侧 → **整 lane 越界读**（缺陷 D10） |
-| — | **多 store 混合 / 语句外置**（含间接下标等非均匀语句） | 部分修复 | **D7 已修**（混合 store 现 build+emit 均成功）；**D11 待修**（语句外置仍「规划成功、发射期 `Unsupported`」） |
+| §4-II-a | **负步长（`Δ ≤ -2`，如 `a[126-2*i]`）** | 支持 | **D8 已修**：负步长走每 lane 索引向量（`vgather2`/`vscatter`），负偏移以补码表达；读、写两侧都覆盖 |
+| §4-I | **符号 extent 的向量化**（`a: (n,)` 且 `n` 为变量） | 支持（非归约）/ 拒绝（归约） | **D9 已修**：非归约发运行时 chunk 循环 `ceildiv(n, lanes)` + 运行时夹紧的尾块掩码；归约的 chunk 循环需编译期展开，符号 extent 在**规划期**明确拒绝 |
+| §0-I | **非归约 + 尾块**（向量轴长度非 `lanes` 整数倍） | 支持 | **D10 已修**：尾块单独成块，装载带谓词（连续装载退化成带谓词的 `vgather2`），三条 load 通道与归约尾块都不再越界读 |
+| — | **多 store 混合 / 语句外置**（含间接下标等非均匀语句） | 支持 | **D7 已修**（混合 store 现 build+emit 均成功）；**D11 已支持**：间接下标只在**沿轴变化**时走索引向量通道，`Δ==0`（如 `c[b[0]]`）是 lane 内均匀标量地址 → pre/post 发一次 `ONEPT`，serial 主体照常向量化（部分向量化）；`bool` 等不支持的 store 元素类型在规划期拒绝 |
+| §2-II | **吸收的 serial 轴上的部分归约**（`s[2*i] += a[i,j]` 与 `u[i,j] = s[2*i]` 混排） | 拒绝（单段路径回退并行轴） | **A0 已修**：逐元素路径会把 lane 均匀写发成 `ONEPT` 只留 lane 0（只累加 2/128 项）；现规划期拒绝，单段路径自动回退到并行轴 |
 | — | 数学核心 Δ 分类 | 支持 | 6 个直接单测 |
 | — | 语句树变换（整段下降） | 支持 | 自顶向下替换 |
 | — | 诊断（改进 7） | 支持 | 成败都收集全部卡点 |
@@ -817,7 +827,7 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 
 共 **36** 个场景：**31 OK**、**5 拒绝**（嵌套循环 / 跨迭代 stencil / 并列段含不干净 serial / GM 操作数 / `TRUE_RANDOM`），拒绝用例统一置于列表尾部。
 
-> 脚本尾部另有 `d1`–`d12`（12 例）**已知缺陷复现**（上表「拒绝（静默）」各行对应），其输出顶部同样打印 `[OK ]`/`[ERR]`，**不计入上面的 31/5 统计**。
+> 脚本尾部另有 `d1`–`d15`（21 例）**已知缺陷复现**，其输出顶部同样打印 `[OK ]`/`[REJ]`/`[ERR]`，**不计入上面的 31/5 统计**；当前整体为 **45 OK / 11 REJ / 0 ERR**。
 
 ---
 
@@ -844,7 +854,7 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 
 ### 5.3 换发射目标 / 新增硬件指令
 
-因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_tail_mask` / `_store_mask` 里的指令名。分析层（§3 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
+因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_Emitter.tail_mask` / `_store_mask` 里的指令名。分析层（§3 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
 
 **成本**：与目标指令集规模成正比，与场景数量无关。
 
@@ -878,41 +888,42 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 ## 6. 边界与已知局限
 
-### 6.1 已知缺陷（务必规避，均已有回归基线）
+### 6.1 已知缺陷（均已有回归基线）
 
-下列问题是**当前实现**的确定性行为，**多数为静默错误结果**。写 kernel 时请按「规避方式」列绕开；对应复现用例在 `tmp/drive_plan.py` 尾部（`d*`）与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾成对固化。
+下列问题原本是**当前实现**的确定性行为，**多数为静默错误结果**。现在全部已修复，下表保留「触发场景 → 原现象」作为回归对照；对应复现用例在 `tmp/drive_plan.py` 尾部（`d*`）与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾成对固化。
 
-| 编号 | 触发场景 | 现象 | 规避方式 | 状态 |
-|---|---|---|---|---|
-| D1 | 乘积归约 `s[i] *= a[i,j]` | 原先静默发成求和（**结果错误**） | 只用 `+=` / `T.max` / `T.min` | ✅ **已修**：显式拒绝 |
-| D2 | 覆写 `s[i] = a[i,j]`（store 均匀 + 取值变化） | 原先被判成归约（**结果错误**） | 避免该形态 | ✅ **已修**（随 D13）：显式拒绝 |
-| D3 | `int32` / `float16` 的 `max`/`min` 归约 | 原先发射期抛 `ValueError` | 无需再规避 | ✅ **已修**：单位元按 dtype 派生 |
-| D4 | 归约体含 lane 均匀加数 `s[i] += a[i,j] + 1.0` | `1.0` **被静默丢弃** | 无需再规避 | ✅ **已修**：沿脊递归剥离，均匀加数保留在归约体内 |
-| D5 | 累积读不在最外层（`s[i] = s[i] + a[i,j] + 1.0`） | 漏判累加写，旧值可能被覆盖 | 无需再规避 | ✅ **已修**：递归「累积写」谓词；旧值被缩放/跨位读仍显式拒绝 |
-| D6 | 一个 nest 内两条归约 / 求和+求最大混合 | **只发射第一条 store** | 无需再规避 | ✅ **已修**：逐 store 发射，各写一次 `ONEPT vsts` |
-| D7 | store 混合 + 步长/索引向量装载 | 原先规划成功、**发射期** `cannot scalarize … 'vload_strided'` | 无需再规避 | ✅ **已修**：`is_uniform` 挡掉无 args 叶子 |
-| D8 | 负步长 `Δ ≤ -2`（`a[N-2-2*i]`） | 无符号 ramp × 负步长 → **结果错误** | 逆序用 `a[N-1-i]`（`PERMUTE`） | ⏳ 待修 |
-| D9 | 符号 extent（`a: (n,)`，`n` 为变量） | 只发一个 chunk → **静默少算** | 用编译期常量形状 | ⏳ 待修 |
-| D10 | 非归约 + 向量轴长度非 `lanes` 整数倍 | 尾块**整 lane 越界读** | 保证长度是 `lanes`（f32=64 / f16=128 / int8=256）整数倍 | ⏳ 待修 |
-| D11 | 语句外置且下标非沿轴均匀（如 `c[b[0]] = 1.0`） | 规划成功、**发射期** `Unsupported` | 避免该类外置语句 | ⏳ 待修 |
-| D12 | 双臂 `if` 的某一臂再嵌 `if` | `masked branch merging is not supported` | 扁平化分支结构 | 已文档化（非缺陷） |
-| D13 | 「归约判据」原先有两套口径（分析期 vs 发射期不一致） | 与 D2/D5 同源 | 无需再规避 | ✅ **已修**：统一为「lane 均匀地址 + **同址**累加形式」单一判据 |
+| 编号 | 触发场景 | 原现象 | 现状 |
+|---|---|---|---|
+| D1 | 乘积归约 `s[i] *= a[i,j]` | 静默发成求和（**结果错误**） | ✅ **已修**：显式拒绝 |
+| D2 | 覆写 `s[i] = a[i,j]`（store 均匀 + 取值变化） | 判成归约（**结果错误**） | ✅ **已修**（随 D13）：显式拒绝 |
+| D3 | `int32` / `float16` 的 `max`/`min` 归约 | 发射期抛 `ValueError` | ✅ **已修**：单位元按 dtype 派生 |
+| D4 | 归约体含 lane 均匀加数 `s[i] += a[i,j] + 1.0` | `1.0` **被静默丢弃** | ✅ **已修**：沿脊递归剥离，均匀加数保留在归约体内 |
+| D5 | 累积读不在最外层（`s[i] = s[i] + a[i,j] + 1.0`） | 漏判累加写，旧值可能被覆盖 | ✅ **已修**：递归「累积写」谓词；旧值被缩放/跨位读仍显式拒绝 |
+| D6 | 一个 nest 内两条归约 / 求和+求最大混合 | **只发射第一条 store** | ✅ **已修**：逐 store 发射，各写一次 `ONEPT vsts` |
+| D7 | store 混合 + 步长/索引向量装载 | 规划成功、**发射期** `cannot scalarize … 'vload_strided'` | ✅ **已修**：`is_uniform` 挡掉无 args 叶子 |
+| D8 | 负步长 `Δ ≤ -2`（`a[126-2*i]`） | 无符号 ramp × 负步长 → **结果错误** | ✅ **已修**：负步长走索引向量（`vgather2`/`vscatter`），读+写两侧 |
+| D9 | 符号 extent（`a: (n,)`，`n` 为变量） | 只发一个 chunk → **静默少算** | ✅ **已修**：非归约发运行时 `ceildiv` chunk 循环；归约在规划期拒绝 |
+| D10 | 非归约 + 向量轴长度非 `lanes` 整数倍 | 尾块**整 lane 越界读** | ✅ **已修**：尾块拆块 + 装载带谓词（三条 load 通道 + 归约尾块） |
+| D11 | 语句外置且下标含 `BufferLoad`（如 `c[b[0]] = 1.0`） | 原先规划成功、**发射期** `Unsupported`（所有轴一刀切 `INDIRECT`） | ✅ **已支持**：间接下标只在沿轴**变化**时归 `INDIRECT`；`Δ==0` 归 `UNIFORM`，pre/post 发一次 `ONEPT`，serial 主体照常向量化；`bool` 等 store 元素类型在规划期拒绝 |
+| A0 | 吸收的 serial 轴上的部分归约（`s[2*i] += a[i,j]` 与 `u[i,j] = s[2*i]` 混排） | `ONEPT` 只留 lane 0 → **只累加 2/128 项** | ✅ **已修**：规划期拒绝；单段路径自动回退到并行轴 |
+| D12 | 双臂 `if` 的某一臂再嵌 `if` | `masked branch merging is not supported` | 已文档化（设计边界，非缺陷） |
+| D13 | 「归约判据」原先有两套口径（分析期 vs 发射期不一致） | 与 D2/D5 同源 | ✅ **已修**：统一为「lane 均匀地址 + **同址**累加形式」单一判据 |
 
-> 上述用例在 pytest 中挂 `xfail(strict=True)` 断言**正确契约**；修复后会 `XPASS` 报错，届时同步更新本表。
+> 上述用例断言**正确契约**（历史上有 `xfail(strict=True)` 标注，修复后 `XPASS` 强制同步摘除；现已全部转为正常 `pass`）。
 
 ### 6.2 设计边界与长期局限
 
 | 类别 | 局限 | 说明 / 潜在改进 |
 |---|---|---|
-| 归约 | 展开式需整 chunk，尾块已用单位元填充 | `tail != 0` 已支持（改进 6）；仍无通用 masked-load |
-| 诊断 | 已有结构化 `diagnostics`（改进 7） | 成功 / 失败都收集全部卡点；尚无机器可读的 error code |
+| 归约 | 展开式需整 chunk | `tail != 0` 已支持（尾块带谓词装载 + 单位元填充）；归约的 chunk 循环仍要求编译期常量 extent |
+| 诊断 | 已有结构化 `diagnostics`（改进 7） | 成功 / 失败都收集全部卡点；暂无机器可读的 error code（没有消费者，待接入管线时再加） |
 | 内存域 | GM 操作数拒绝 | 需 UB staging（§5.4(c)） |
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)） |
 | 地址 | 仅 `TRUE_RANDOM` 拒绝 | `PERMUTE`/`PIECEWISE`/`INDIRECT` 已走索引向量通道（`vgather2`/`vscatter`）；不可构造的索引明确报错，不静默降级 |
 | 语句 | 发散分支、atomic 拒绝；serial 支持面有限 | 直接内嵌、链式嵌套、或「一个/多个并列干净 serial 循环夹在语句序列中」可吸收；含循环携带状态、并列段中有一段不干净、非直接内嵌者拒绝（见 §3.3 / §6） |
 | 代码 | ~~`vload.is_uniform` 分支等价于 `False`~~ | ✅ **已删**：`is_uniform` 统一在递归前挡掉所有无 args 叶子（`vload`/`vload_strided`/`gather`），见 D7 |
 | 代码 | ~~`AccessInfo._uniform` 动态挂属性~~ | ✅ **已删**：随 `is_uniform` 统一而移除 |
-| 判定 | `_const_int` 已支持符号常量证明 | 传 `analyzer` 时用 `simplify` + `const_int_bound`（上下界相等即常数）；更复杂的可证常量仍受化简器 / 区间分析能力限制 |
+| 判定 | ~~取 extent 时未传 `analyzer`~~ | ✅ 已补（`_build_plan_for_axis`）；严格符号 extent 仍由 D9 的运行时 chunk 循环处理 |
 | 模型 | 只做连续性判定，无完整依赖分析 / 调度 | 迭代域已建模，可扩展到依赖 / 调度 |
 
 ---
@@ -920,8 +931,8 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 ## 7. 测试策略
 
 * **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan`（恒返回 `VectorProgram`）/ `emit_plan`，检查 `program.segments[*]`（单段用例取 `segments[0]`）与发射出的 `tl.simd.*` 调用序列。不涉及设备执行。
-* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例；另有 §6.1 **已知缺陷回归基线** 17 个用例（13 个已修 `pass` + 4 个仍 `xfail(strict=True)` + 1 个特征化 `pass`），合计 **80** 个。
-* **已知缺陷基线**：缺陷用例断言**正确契约**并挂 `xfail(strict=True)`——修复后会 `XPASS` 报错，从而强制同步摘除标记。当前 D1/D2/D3/D4/D5/D6/D7/D13 已修、对应用例已摘除标记，运行预期 `76 passed, 4 xfailed`（余 D8、D9、D10、D11）。
+* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例；另有 §6.1 **已知缺陷回归基线** 24 个用例（D8–D11 与 A0 已修并各自新增读/写、二维/一维、归约/回退、部分向量化等用例，全部正常 `pass`，1 个特征化 `pass`），合计 **87** 个。
+* **已知缺陷基线**：缺陷用例断言**正确契约**（历史上有 `xfail(strict=True)`）；现在全部已修、标记已摘除，运行预期 `87 passed`。
 * **辅助工具**：
   * `_first_parallel`：取**最外层** `T.Parallel`（后序遍历先出最内层，故取最后一个）。
   * `_single_segment`：断言 `build_plan` 恒返回 `VectorProgram` 且恰 1 段，取回 `program.segments[0]`（单段用例经它访问段级字段）。

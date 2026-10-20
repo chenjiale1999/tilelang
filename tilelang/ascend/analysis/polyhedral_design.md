@@ -1,7 +1,7 @@
 # Ascend 统一多面体向量化 —— 设计文档
 
-> 对应实现：[`polyhedral.py`](./polyhedral.py)（约 2304 行）
-> 对应测试：[`testing/ascend/analysis/test_polyhedral_vectorize.py`](../../../../testing/ascend/analysis/test_polyhedral_vectorize.py)（80 个用例）
+> 对应实现：[`polyhedral.py`](./polyhedral.py)（约 2454 行）
+> 对应测试：[`testing/ascend/analysis/test_polyhedral_vectorize.py`](../../../../testing/ascend/analysis/test_polyhedral_vectorize.py)（87 个用例）
 > 需求基准：[`Parallel_ascend.md`](../../../../Parallel_ascend.md) §315–484「支持场景」
 > 参考实现（发射风格权威）：`src/ascend/transform/ascend_simdvf_lower_parallel.cc`
 
@@ -397,27 +397,40 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 | `lets`     | chunk 体内的 SSA 语句                                                    |
 | `memo`     | `id(node) → 变量`，同一子表达式去重                                            |
 
-**掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。尾块掩码 `update_mask(extent - chunk*lanes, bits)`，整除时为 `None`。
+**掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。
 
-> ⚠️ **缺陷 D10（未修，回归基线见 §4.2）**：上述尾块掩码**只加在 store 侧**（`vsts` 带 `update_mask`），
-> 而装载 `vld(addr, "NORM")` **没有 mask 形参**（`simd.py` 的 `vld` 签名里根本没有谓词参数）。
-> 于是**非归约**的连续读写路径在最后一个 chunk 上会**整 lane 越界读**：例如
-> `a: (64, 8)` 上发射 `vld(access_ptr(a[i, chunk*64], 64, 1))`，每行多读 56 个元素
-> （`log_poly.log` 第 1322 行 / `p_two_serial_independent`；复现 `d10_non_reduction_tail_overread`）。
-> 归约路径靠 `vsel(x, fill, tail_mask)` 兜住了越界车道（§3.8），**非归约路径没有对应兜底**。
-> 修法：装载后同样用 `vsel` 把越界车道清零，或要求非归约路径的 `extent` 是 `lanes` 的整数倍。
+- **尾块掩码只在尾块块里出现**：常量 extent 且 `tail != 0` 时，发射被拆成「前 `chunks-1` 个整
+  chunk（全 lane 掩码，走 `vld`）」+「尾块 `for ck in [chunks-1, chunks)`（尾块掩码，
+  `update_mask(tail)`）」。整 chunk 不再背一个恒真的 `update_mask`。
+- 符号 extent（`chunks is None`）只发一个运行时 chunk 循环 `ceildiv(extent, lanes)`，
+  尾块掩码在运行时计算并**夹到 lanes**：`update_mask(min(extent - chunk*lanes, lanes))`
+  （`update_mask` 只保证 `[0, lanes]` 内有意义，缺陷 A5）。
 
-> ⚠️ **缺陷 D8（未修，回归基线见 §4.2）**：`vload_strided` 的发射式
-> `vgather2(addr, vmuls(vci(0,"uint32"), k, m), m)` 用**无符号** lane 斜坡乘步长 `k`，
-> 只对 `k > 0` 成立。对 `Δ ≤ -2` 的**负步长**（如 `a[N-2-2*i]`，`Δ=-2`）会静默发出
-> 无意义的无符号偏移（复现 `d8_negative_stride`，`vmuls(<uint32 ramp>, -2)`），**结果错误且不报错**。
-> 修法：负步长走 `PERMUTE`/索引向量通道（绝对偏移），或显式拒绝 `k < 0`。
+> ✅ **缺陷 D10（已修，回归基线见 §4.2）**：旧实现把尾块掩码**只加在 store 侧**，而装载
+> `vld(addr, "NORM")` 没有 mask 形参（`simd.py` 的 `vld` 签名里根本没有谓词参数），于是
+> **所有 load 通道**（连续 `vld`、步长 `vgather2`、间接 `vgather2`）以及**归约尾块的 `vld`**
+> 都在最后一个 chunk 上整 lane 越过 buffer 尾部（`a: (64, 8)` 上
+> `vld(access_ptr(a[i, chunk*64], 64, 1))` 多读 56 个元素；一维 `(100,)` 上 `vld(a[64], 64)`
+> 多读 28 个元素）。现改为：
+> * 尾块内的连续装载**退化成带谓词的 `vgather2`**（`vci(0)` 相对 lane 偏移 + 尾块谓词）；
+> * 步长/间接装载直接用 `load_mask()`（尾块谓词 ∧ 其它）；
+> * 归约尾块同样先带谓词装载，再用 `vsel` 填单位元（数值正确性 + 访问边界都成立）。
+>
+> 回归：`test_defect_d10_non_reduction_tail_load_is_bounded`（二维）、
+> `test_defect_d10_one_dimensional_tail_load_is_bounded`（一维）。
 
-> ⚠️ **缺陷 D9（未修，回归基线见 §4.2）**：`extent` 取自 `_const_int`（L1595–1597），
-> 只有**编译期可证常量**才会算出 `chunks/tail`；符号 extent 时 `chunks = tail = None`，
-> 发射端 `range(plan.chunks or 1)`（L2001 / L2067）退化为**只发一个 chunk 且无尾掩码**，
-> 对 `n > lanes` 的符号形状**静默少算**（复现 `d9_symbolic_extent`）。
-> 修法：符号 extent 应驱动运行时 chunk 循环，或明确拒绝。
+> ✅ **缺陷 D8（已修，回归基线见 §4.2）**：`vload_strided` / `STRIDED` store 的发射式
+> `vmuls(vci(0,"uint32"), k, m)` 用**无符号** lane 斜坡乘步长，只对 `k > 0` 成立；`Δ ≤ -2`
+> 的负步长会静默发出无意义的无符号偏移。现**负步长改走「每 lane 索引向量」通道**
+> （与 `PERMUTE`/`PIECEWISE`/`INDIRECT` 同一条路：绝对偏移 + `vscatter`/`vgather2`，
+> 负偏移以补码表达），索引向量构造不出来时在分析期落 `TRUE_RANDOM` 拒绝。
+> 读写两侧同时覆盖；复现用例已修正为合法下标（旧用例 `a[N-2-2*i]` 在 `i ≥ 64` 时本身越界）。
+
+> ✅ **缺陷 D9（已修，回归基线见 §4.2）**：符号 extent 时 `chunks = tail = None`，旧发射端
+> `range(plan.chunks or 1)` 退化为**只发一个 chunk 且无尾掩码**（`n > lanes` 时静默少算）。
+> 现改为：非归约路径发**运行时 chunk 循环** `ceildiv(extent, lanes)` + 运行时夹紧的尾块掩码；
+> 归约路径的 chunk 循环是编译期展开的，符号 extent **在 build 期明确拒绝**
+> （`a reduction needs a compile-time vector-axis extent`），不再伪造成 1 个 chunk。
 
 **系统常量**：
 
@@ -433,9 +446,10 @@ mask = pset(bits, "PAT_ALL")
 acc  = vdup(identity, elem, mask)               # vadd→0, vmax→-inf, vmin→+inf
 fill = tail ? vdup(identity, elem, mask) : None # 尾块填充寄存器（改进 6）
 for ck in range(chunks):                        # 编译期展开，不是运行时 for！
-    x = vld(src_addr(ck), "NORM")
-    if tail and ck == last:                                  # 尾块：越界车道填单位元
-        x = vsel(x, fill, update_mask(extent - ck*lanes, bits))
+    x = vld(src_addr(ck), "NORM")               # 整 chunk
+    if tail and ck == last:                     # 尾块：装载带谓词（vgather2），再填单位元
+        x = vgather2(src_addr(ck), vci(0), tail_mask)   # 不越过 buffer 尾部（D10）
+        x = vsel(x, fill, tail_mask)
     red = vcadd(x, mask)                        # 跨 lane 归约，结果只在 lane0
     acc = vadd(acc, red, mask)
 if 累加写: old = vld(dst_addr, "BRC_B{bits}"); acc = vadd(acc, old, mask)
@@ -464,7 +478,7 @@ vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
   > （`s[i] = s[i] * 2.0 + a[i,j]`）则显式拒绝 `... must be a direct operand ... accumulate position`。
   > 回归：`test_defect_d5_scaled_old_value_is_rejected`。
 - 归约路径逐 chunk 改 `lane_base` 并**清空** **`memo`**（地址随 chunk 变，缓存必须失效）。
-- **尾块（改进 6）**：`extent % lanes != 0` 时最后一个 chunk 只有 `tail` 个有效车道，其余车道的 `vld` 读到越界/脏数据；用 `update_mask(extent - ck*lanes, bits)` 造尾块谓词、`vsel(x, fill, tail_mask)` 把无效车道替换成**归约单位元**，再按全 lane 掩码归约（`vadd` 填 0、`vmax` 填 -inf、`vmin` 填 +inf 均不影响结果）。这样 `tail != 0` 也能正确发射，不再需要整除前提。
+- **尾块（改进 6）**：`extent % lanes != 0` 时最后一个 chunk 只有 `tail` 个有效车道。尾块**先带谓词装载**（`vld` 无谓词形式 → 带谓词的 `vgather2`，缺陷 D10），再用 `vsel(x, fill, tail_mask)` 把无效车道替换成**归约单位元**，最后按全 lane 掩码归约（`vadd` 填 0、`vmax` 填 -inf、`vmin` 填 +inf 均不影响结果）。这样 `tail != 0` 既能正确归约，也不会越过 buffer 尾部。
 
 > ✅ **缺陷 D4（已修，随 D5 一并修）**：原先 `_varying_operand`（只下探一层）会**静默丢弃** lane 均匀
 > 常量加数（复现 `d4_uniform_addend`：`s[i] = s[i] + a[i,j] + 1.0` 发射成 `vadds(vld(a), s[i])`，`1.0`
@@ -573,7 +587,7 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 | §1-II     | 三元：逐 lane 条件                        | ✅            | `vcmp` 逐 lane 谓词                                                                                                                       | `test_ternary`                                                                                                                                                                                                                                                       |
 | §2-I      | 操作数维度不一致                            | ✅            | Δ=0 一侧广播（`vbrc`/`vdup`）                                                                                                                | `test_operand_rank_mismatch_broadcasts_outer_load`                                                                                                                                                                                                                   |
 | §2-II     | 规约（`+=` / `max`）                    | ✅            | `ReduceInfo` → `vcadd/vcmax/vcmin`                                                                                                     | `test_reduction_detected`、`test_reduction_max_maps_to_vcmax`                                                                                                                                                                                                         |
-| §2-II     | 规约 + 尾块（`extent % lanes != 0`）      | ✅            | 尾块 `update_mask` + `vsel` 单位元填充（改进 6）                                                                                                  | `test_reduction_with_tail_fills_identity`                                                                                                                                                                                                                            |
+| §2-II     | 规约 + 尾块（`extent % lanes != 0`）      | ✅            | 尾块带谓词装载（`vgather2`）+ `vsel` 单位元填充（改进 6 / D10）                                                                                                  | `test_reduction_with_tail_fills_identity`                                                                                                                                                                                                                            |
 | §3-I      | 多行语句（连续）                            | ✅            | `normalize_body` 产出多条 `StoreSpec`                                                                                                      | `test_multi_store`、`test_multistore_with_unit_trailing_dim_is_contiguous`                                                                                                                                                                                            |
 | §3-I      | 多行语句（文档原型：末维固定 `[.., k]`）           | ✅            | 末维固定 → 沿唯一轴 STRIDED → `vscatter` 索引向量写                                                                                                 | `test_store_strided_on_the_only_axis_is_scattered`                                                                                                                                                                                                                   |
 | §3-II     | 复杂标量 + `if_then_else`（im2col）       | ⚠️           | 值算子 `FloorDiv/FloorMod` 已对 **2 的幂常量除数**做精确 strength-reduction（`vshrs`/`vand`）；最优（写连续）轴仍可能因**非 2 的幂常量除数**被拒，此时靠**轴回退**（§3.4）退到另一根轴照常向量化 | `test_floordiv_value_operator_strength_reduced`、`test_floormod_value_operator_strength_reduced`、`test_floordiv_by_non_power_of_two_is_rejected`                                                                                                                      |
@@ -623,11 +637,11 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 
 共 **36** 个场景：**31 OK**、**5 REJ**（嵌套循环 / 跨迭代 stencil / 并列段含不干净 serial / GM 操作数 / `TRUE_RANDOM`），REJ 用例统一置于列表尾部。每个用例的每根轴分类与打分都通过 `plan.diagnostics`（成功）或 `Unsupported.diagnostics`（失败）打印。
 
-> 上表对应脚本中**基线 36 例**；其后的 `d1`–`d12`（12 例）为下节固化的**已知缺陷复现**，不改变上表结论（其输出顶部打印 `[OK ]` / `[REJ]` / `[ERR]`，与基线 OK/REJ 分列统计）。
+> 上表对应脚本中**基线 36 例**；其后的 `d1`–`d15`（21 例）为下节固化的**已知缺陷复现**，不改变上表结论（其输出顶部打印 `[OK ]` / `[REJ]` / `[ERR]`，与基线 OK/REJ 分列统计）。
 
-### 4.2 已知缺陷回归基线（D1/D2/D3/D4/D5/D6/D7/D13 已修，其余待跟进）
+### 4.2 已知缺陷回归基线（D1–D13 与 A0 均已修，D12 为特征化边界）
 
-`tmp/drive_plan.py` 尾部与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾「已知缺陷回归基线（探针 A–M）」小节**成对固化**了下列用例。测试每个都断言**正确契约**并挂 `xfail(strict=True)`：缺陷修复后测试会 `XPASS` 直接报错，**强制顺手摘掉 `xfail` 标记**；若缺陷被「以另一种合理方式」修复（如从静默错发改为明确拒绝），用例里已把**拒绝**当作可接受结果一并接受。
+`tmp/drive_plan.py` 尾部与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾「已知缺陷回归基线（探针 A–M）」小节**成对固化**了下列用例。测试每个都断言**正确契约**：缺陷修复前用 `xfail(strict=True)` 标注（修复后 `XPASS` 强制摘标记），或以「拒绝也接受」的容错形式固化；现在全部转为正常 `pass`。
 
 | 缺陷 | 用例（`drive_plan.py` / pytest） | 现象（修复前） | 类别 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -638,12 +652,17 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 | D7 | `d7_uniform_store_mixed` / `test_defect_d7_build_success_implies_emit_success_for_mixed_stores` | `[OK ]` build → `[REJ]` `cannot scalarize vector value 'vload_strided'` | build/emit 契约不一致 | ✅ **已修**（`is_uniform` 挡掉无 args 叶子，现 build+emit 均 `[OK ]`） |
 | D4/D5 | `d4_uniform_addend` / `test_defect_d4_uniform_addend_inside_reduction_is_not_dropped` | `[OK ]`，`1.0` 被丢弃 | 静默错误结果 | ✅ **已修**（`_strip_reduce` 沿脊递归，均匀加数保留在 `varying`） |
 | D6 | `d6_two_reduces`、`d6b_sum_max_reduce` / `test_defect_d6_two_reductions_in_one_nest_are_both_emitted`、`test_defect_d6b_mixed_reductions_keep_their_own_recipe` | `[OK ]`，只发射第一条归约 | 静默丢写 | ✅ **已修**（逐 store `ReduceInfo`，各自发射累加链 + 一次 `ONEPT vsts`） |
-| D8 | `d8_negative_stride` / `test_defect_d8_negative_stride_below_minus_one` | `[OK ]`，`vmuls(<uint32 ramp>, -2)` | 静默错误结果 | ⏳ 待修 |
-| D9 | `d9_symbolic_extent` / `test_defect_d9_symbolic_extent_is_not_silently_truncated` | `[OK ]`，`chunks=None` → `range(1)` | 静默少算 | ⏳ 待修 |
-| D10 | `d10_non_reduction_tail_overread` / `test_defect_d10_non_reduction_tail_load_is_bounded` | `[OK ]`，`vld(access_ptr(a[i,0],64))` 越界（基线 L1322） | 越界读 | ⏳ 待修 |
-| D11 | `d11_indirect_pre` / `test_defect_d11_build_success_implies_emit_success_for_sibling_statement` | `[OK ]` build → `[REJ]` 「outside the serial loop must be uniform … (got indirect)」 | build/emit 契约不一致 | ⏳ 待修 |
+| D8 | `d8_negative_stride`、`d8b_negative_stride_store` / `test_defect_d8_negative_stride_below_minus_one`、`test_defect_d8_negative_stride_store_is_scattered` | `[OK ]`，`vmuls(<uint32 ramp>, -2)` | 静默错误结果 | ✅ **已修**（负步长 → 索引向量 `vgather2`/`vscatter`；读+写两侧） |
+| D9 | `d9_symbolic_extent`、`d9b_symbolic_extent_reduce` / `test_defect_d9_symbolic_extent_is_not_silently_truncated`、`test_symbolic_extent_reduction_is_rejected` | `[OK ]`，`chunks=None` → `range(1)` | 静默少算 | ✅ **已修**（非归约发运行时 `ceildiv` chunk 循环；归约 build 期拒绝） |
+| D10 | `d10_non_reduction_tail_overread` / `test_defect_d10_non_reduction_tail_load_is_bounded`、`test_defect_d10_one_dimensional_tail_load_is_bounded` | `[OK ]`，`vld(access_ptr(a[i,0],64))` 越界（基线 L1322） | 越界读 | ✅ **已修**（尾块拆块 + 装载带谓词，三条 load 通道 + 归约尾块全覆盖） |
+| D11 | `d11_indirect_pre`、`d11b_lane_invariant_indirect_load` / `test_defect_d11_build_success_implies_emit_success_for_sibling_statement`、`test_lane_invariant_indirect_load_is_uniform`、`test_bool_store_is_rejected_at_build_time` | `[REJ]` 「outside the serial loop must be uniform … (got indirect)」（每 lane 索引向量通道）；`bool` store → `ValueError` | build/emit 契约不一致 + 能力缺失 | ✅ **已修**：间接下标只在**沿轴变化**时归 `INDIRECT`；`Δ==0`（如 `c[b[0]]`）归 `UNIFORM`，pre/post 发一次 `ONEPT`，serial 主体照常向量化（部分向量化）。不支持的 store 元素类型在 build 期转 `Unsupported` |
+| A0 | `d14_partial_reduce`、`d14b_partial_reduce_fallback` / `test_partial_reduction_on_absorbed_serial_axis_is_rejected`、`test_partial_reduction_falls_back_to_the_parallel_axis` | `[OK ]`，`s` 只累加 2/128 项（`ONEPT` 只留 lane 0） | 静默错误结果 | ✅ **已修**（吸收 serial 轴上的部分归约 build 期拒绝；单段路径回退到并行轴） |
 | D12 | `d12_masked_branch` / `test_masked_branch_merging_is_rejected` | `[REJ] masked branch merging is not supported` | 未声明路径（特征化） | 已文档化（非缺陷） |
 | D13 | 见 D2（判据口径不一致） | — | 设计一致性 | ✅ **已修**（单一判据 `_is_reduce_axis` + `_plan_reduce`，`_detect_reduce`/`_is_accumulate`/`_varying_operand` 已删） |
+
+> **A5（随 D10 一并修）**：尾块车道数原先直接用 `extent - chunk*lanes`，整 chunk 上会超过向量宽度
+> （如 `update_mask(100)` / 64 lane）。现在常量尾块只在尾块块里出现，符号路径用
+> `min(extent - chunk*lanes, lanes)` 夹紧。
 
 > **D13 附带新增**：`test_defect_d13_stencil_shifted_read_is_not_an_accumulation`（`s[i] = s[i-1] + a[i,j]`
 > 的跨位读与写入地址不同址 → 拒绝）、`test_reduce_segment_with_uniform_broadcast_sibling`（归约段内
@@ -652,9 +671,9 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 复现命令：
 
 ```bash
-python tmp/drive_plan.py --tir &> log_poly.log     # d* 用例输出见日志 L1651–L2182
+python tmp/drive_plan.py --tir &> log_poly.log     # 45 OK / 11 REJ / 0 ERR
 python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py -q
-# 期望：76 passed, 4 xfailed（4 = D8、D9、D10、D11；D12 为正常 pass 的特征化用例）
+# 期望：87 passed（0 xfailed；D12 为正常 pass 的特征化用例）
 ```
 
 ***
@@ -682,7 +701,7 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 
 ### 5.3 换发射目标 / 新增硬件指令
 
-因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_tail_mask` / `_store_mask` 里的指令名。分析层（§2–§6 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
+因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_Emitter.tail_mask` / `_store_mask` 里的指令名。分析层（§2–§6 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
 
 **成本**：与目标指令集规模成正比，与场景数量无关。
 
@@ -718,21 +737,22 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 
 | 类别  | 局限                                         | 说明 / 潜在改进                                                                          |
 | --- | ------------------------------------------ | ---------------------------------------------------------------------------------- |
-| 归约  | 展开式需整 chunk，尾块已用单位元填充                      | `tail != 0` 已支持（改进 6）；仍无通用 masked-load                                             |
+| 归约  | 展开式需整 chunk；尾块带谓词装载 + 单位元填充                      | `tail != 0` 已支持；归约的 chunk 循环仍要求编译期常量 extent（D9 归约分支拒绝）                                             |
 | 诊断  | 已有结构化 `diagnostics`（改进 7）                  | 成功/失败都收集全部卡点；尚无机器可读的 error code                                                    |
 | 内存域 | GM 操作数拒绝                                   | 需 UB staging（§5.4(c)）                                                              |
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)）                        |
 | 地址  | 仅 `TRUE_RANDOM` 拒绝                         | `PERMUTE`/`PIECEWISE`/`INDIRECT` 已走索引向量通道（`vgather2`/`vscatter`）；不可构造的索引明确报错，不静默降级 |
 | 语句  | 发散分支、atomic 拒绝；serial 支持面有限                | 直接内嵌、链式嵌套、或「一个/多个并列干净 serial 循环夹在语句序列中」可吸收（§6 第一/二/三步）；含循环携带状态、并列段中有一段不干净、非直接内嵌者拒绝。**双臂 `if` 的臂内再嵌 `if`** 走未声明路径 `masked branch merging is not supported`（D12） |
-| 缺陷  | **已知设计/实现缺陷（D1–D13）**                  | 逐条现象、触发条件与复现用例见 **§4.2**。**已修**：D1（非 Add/Max/Min 归约显式拒绝）、D2/D13（归约判据统一为「lane 均匀地址 + 同址累加形式」）、D3（单位元按 dtype 派生）、D4/D5（归约脊上递归剥离旧值、保留均匀加数）、D6（多归约逐 store 发射）、D7（`is_uniform` 挡掉无 args 叶子）。**待修**：D8（负步长）、D9（符号 extent 少算）、D10（非归约尾块越界读）、D11（build/emit 契约不一致） |
+| 缺陷  | **已知设计/实现缺陷（D1–D13 / A0）**                  | 逐条现象、触发条件与复现用例见 **§4.2**，现已全部修复：D1（非 Add/Max/Min 归约显式拒绝）、D2/D13（归约判据统一为「lane 均匀地址 + 同址累加形式」）、D3（单位元按 dtype 派生）、D4/D5（归约脊上递归剥离旧值、保留均匀加数）、D6（多归约逐 store 发射）、D7（`is_uniform` 挡掉无 args 叶子）、D8（负步长走索引向量）、D9（符号 extent 运行时 chunk 循环 / 归约拒绝）、D10（尾块装载带谓词）、D11（间接地址沿轴不变 → `UNIFORM`，支持部分向量化）、A0（部分归约拒绝） |
 | 代码  | ~~`vload.is_uniform` 分支等价于 `False`~~       | ✅ 已随 D7 一并删除（该分支与为它服务的 `AccessInfo._uniform` 动态属性均已移除）                                    |
 | 代码  | ~~`AccessInfo._uniform` 动态挂属性~~             | ✅ 已删除（`vload` 特判移除后无引用者）                                                                 |
-| 代码  | `_buffer_elem_dtype` 与 `_elem_dtype` 重复       | ✅ 已合并（前者删除，改调 `_elem_dtype(buffer.dtype)`）                                                 |
-| 代码  | `_is_scalar_dtype` 无任何调用者                    | ✅ 已删除                                                                                 |
-| 代码  | `vectorize_parallel_nests` 内注释掉的调试打印       | ✅ 已删除                                                                                 |
-| 代码  | `_const_int` 只认编译期可证常量                     | 符号 extent 时 `chunks/tail=None` → 静默单 chunk（D9）；传 `analyzer` 时用 `simplify` + `const_int_bound`（上下界相等即常数） |
-| 代码  | `_emit_store`（CONTIGUOUS/UNIFORM 分支）与 `_emit_outer_store` 主体近似重复 | 掩码语义不同（后者不含尾块掩码、且发在 chunk 循环外），合并需先统一掩码来源；低优先 |
-| 代码  | `_build` 长 if-chain 中 `mask = self.all_mask(_mask_bits(...))` 重复出现 | 风格一致、分支独立，抽取收益有限；低优先 |
+| 代码  | ~~`_buffer_elem_dtype` 与 `_elem_dtype` 重复~~       | ✅ 已合并（前者删除，改调 `_elem_dtype(buffer.dtype)`）                                                 |
+| 代码  | ~~`_is_scalar_dtype` 无任何调用者~~                    | ✅ 已删除                                                                                 |
+| 代码  | ~~`vectorize_parallel_nests` 内注释掉的调试打印~~       | ✅ 已删除                                                                                 |
+| 代码  | ~~`_const_int` 在取 extent 时未传 `analyzer`~~                     | ✅ 已补（`_build_plan_for_axis`）；影响仍有限：TIR 构造期已折叠常量表达式，严格符号 extent 走 D9 的运行时 chunk 循环 |
+| 代码  | ~~`_emit_store`（CONTIGUOUS/UNIFORM 分支）与 `_emit_outer_store` 主体重复~~ | ✅ 已抽 `_emit_vector_write(store, emitter, bits, mask)`；掩码来源仍由调用方区分（chunk 内用 `_store_mask`，pre/post 只用用户谓词） |
+| 代码  | ~~`_build` 中 `mask = self.all_mask(_mask_bits(...))` 重复~~ | ✅ 已收敛为 `_Emitter.data_mask(dtype)`（按宽度缓存；`vcvt` 的取小宽度仍特殊处理） |
+| 代码  | `Unsupported` 无机器可读 error code | 暂不做：当前没有消费者，加 `code` 要改 20+ 处 `raise` 站点；等接入生产管线、driver 需要区分「回退 / 硬失败」时再加 |
 | 模型  | 只做连续性判定，无完整依赖分析/调度                         | 迭代域已建模，可扩展到依赖/调度                                                                   |
 
 ***
@@ -740,8 +760,8 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 ## 7. 测试策略
 
 - **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan`（恒返回 `VectorProgram`）/ `emit_plan`，检查 `program.segments[*]`（单段用例取 `segments[0]`）与发射出的 `tl.simd.*` 调用序列。不涉及 PTOAS / Bisheng / 设备执行。
-- **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例；另有 **§4.2 已知缺陷回归基线** 17 个用例（D1/D2/D3×2/D4/D6×2/D7/D13×2/广播兄弟/无符号同址等修好后由 `xfail` 转为 `pass`，余 4 个仍 `xfail(strict=True)`，1 个特征化 `pass`），合计 **80** 个。
-- **已知缺陷基线**：缺陷用例断言**正确契约**并挂 `xfail(strict=True)`——修复后会 `XPASS` 报错，从而强制同步摘除标记；对「改为明确拒绝也算修复」的缺陷，用例已把 `Unsupported` 纳入可接受路径。运行预期 `76 passed, 4 xfailed`。
+- **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例；另有 **§4.2 已知缺陷回归基线** 24 个用例（D1/D2/D3×2/D4/D6×2/D7/D8×2/D9×2/D10×2/D11×3/D13×2/A0×2/广播兄弟/一维尾块等，全部为正常 `pass`，1 个特征化 `pass`），合计 **87** 个。
+- **已知缺陷基线**：缺陷用例断言**正确契约**（`xfail(strict=True)` 在修复后 `XPASS` 报错，强制同步摘标记；现全部已摘）；对「改为明确拒绝也算修复」的缺陷，用例已把 `Unsupported` 纳入可接受路径。运行预期 `87 passed`。
 - **辅助**：
   - `_first_parallel`：取**最外层** `T.Parallel`（`post_order_visit` 先出最内层，故取最后一个）。
   - `_single_segment`：断言 `build_plan` 恒返回 `VectorProgram` 且恰 1 段，取回 `program.segments[0]`（单段用例经它访问段级字段）。
