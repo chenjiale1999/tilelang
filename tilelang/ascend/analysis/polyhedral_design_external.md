@@ -3,7 +3,7 @@
 >
 > 本文说明一套把 `T.Parallel` 标量循环**统一向量化**的编译分析与发射方案。为了让没有代码仓库访问权限的同事也能完整读懂，本文**自包含**：所有关键算法都附上**伪代码**或**真实实现片段**，无需打开任何源文件。
 >
-> 对应实现是一个约 1670 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 43 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
+> 对应实现是一个约 2060 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 59 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
 
 ---
 
@@ -69,20 +69,22 @@ d[i,j] = g[i] - g[j]   →  g[i] 沿 j 的 Δ = 0（维度不一致 → 广播�
    P1 输出 (数组 IR)
         │
         ▼
-  ┌──────────────────────────────┐
-  │  build_plan   ─── 分析 = P2  │   T.Parallel 嵌套 ─▶ VectorPlan
-  └──────────────────────────────┘
+  ┌──────────────────────────────────────┐
+  │  build_plan   ─── 分析 = P2           │   T.Parallel 嵌套 ─▶ VectorProgram（1..N 段）
+  └──────────────────────────────────────┘
         │
         ▼
-  ┌──────────────────────────────┐
-  │  emit_plan    ─── 发射 = P3  │   VectorPlan ─▶ T.simd.* TIR
-  └──────────────────────────────┘
+  ┌──────────────────────────────────────┐
+  │  emit_plan    ─── 发射 = P3           │   VectorPlan / VectorProgram ─▶ T.simd.* TIR
+  └──────────────────────────────────────┘
         │
         ▼
   vectorize_parallel_nests(...)   把整棵语句树里的 Parallel 嵌套整段替换
 ```
 
-关键点：`VectorPlan`（中间计划）里**没有任何硬件指令名**——只有轴、lane 数、chunk、每个 store 的值 DAG。**指令选择推迟到 `emit_plan`**。这条「硬件无关中间表示」的设计，使得更换发射目标（例如从某套自定义内建改为 `T.simd.*`）只需改发射层，分析层完全不动。
+关键点：`VectorPlan` / `VectorProgram`（中间计划）里**没有任何硬件指令名**——只有轴、lane 数、chunk、每个 store 的值 DAG。**指令选择推迟到 `emit_plan`**。这条「硬件无关中间表示」的设计，使得更换发射目标（例如从某套自定义内建改为 `T.simd.*`）只需改发射层，分析层完全不动。
+
+`build_plan` **恒返回** `VectorProgram`：单段（一个主体 + 可选 `pre`/`post`）时它是「1 段 program」（`program.axes` 只含提到最外层包一次的**并行轴前缀**，其余轴由该段自己包裹）；`T.Parallel` 体内出现**多个并列的干净 `T.serial` 循环**时含多段（每段一个 `VectorPlan`，见 §3.11）。`VectorPlan` 因此是**段级**中间表示。
 
 ### 2.2 模块分层
 
@@ -95,7 +97,7 @@ polyhedral.py
 ├─ 3. 访问分类           AccessInfo, classify_access
 ├─ 4. body 规范化        StoreSpec, normalize_body, _collect_aliases/_apply_aliases
 ├─ 5. 值 DAG             ValueNode, build_value, broadcast, load_node, _build_call
-├─ 6. 规划               StorePlan, ReduceInfo, VectorPlan, rank_vector_axes, build_plan
+├─ 6. 规划               StorePlan, ReduceInfo, VectorPlan, VectorProgram, rank_vector_axes, build_plan
 ├─ 7. 发射               _Emitter, emit_plan, _emit_reduce, render_plan
 └─ 8. 语句树变换         vectorize_parallel_nests
 ```
@@ -109,9 +111,10 @@ polyhedral.py
 | `AccessInfo` | 一次访存 + 逐轴分类 | `buffer, indices, offset, is_store, per_axis, indirect, in_global, reason` | `classify_access` |
 | `StoreSpec` | 一条写 | `buffer, indices, value, mask` | `normalize_body` |
 | `ValueNode` | 值 DAG 节点 | `recipe, dtype, args, access, scalar, detail` | `build_value` |
-| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind, index` | `build_plan` |
+| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind, index` | `_build_plan_for_axis` |
 | `ReduceInfo` | 归约信息 | `axis, op, recipe` | `_detect_reduce` |
-| `VectorPlan` | 最终硬件无关计划 | `axes, vector_axis, lanes, chunks, tail, stores, reduce, diagnostics` | `build_plan` |
+| `VectorPlan` | **段级**硬件无关计划（段 = 主体 + 可选 `pre`/`post`） | `axes, vector_axis, lanes, chunks, tail, stores, pre_stores, post_stores, reduce, diagnostics` | `_build_plan_for_axis`（每段一个） |
+| `VectorProgram` | 统一计划（1..N 段，`build_plan` 的返回类型） | `axes`（提层的并行轴前缀）, `segments`, `diagnostics` | `build_plan` |
 
 其中 `AccessClass` 分两层判定：Δ 层给常数形态，非常数再做**结构细化**（改进 4）：
 
@@ -131,7 +134,9 @@ polyhedral.py
 
 ```text
 build_plan(stmt)
-  ├─ _split_nest    ▶ axes[], body                    # SCoP 迭代域
+  ├─ _try_build_program(stmt, notes) ▶ VectorProgram? # 多个并列 serial 段（§6 第三步）
+  │     任一段构造失败 → 段级原因写入 notes 并 return None（缺陷 B：不吞掉）
+  ├─ _split_nest    ▶ axes[], body                    # SCoP 迭代域（单段路径，回落）
   ├─ _collect_aliases(body)          ▶ {var: expr}    # 标量中间量
   ├─ normalize_body(body, aliases)   ▶ StoreSpec[]    # 控制流 → 线性写列表
   ├─ rank_vector_axes(axes, stores, store_infos, load_infos) ▶ 轴排行（联合可行性 + 读写加权）
@@ -140,9 +145,10 @@ build_plan(stmt)
   │           for each store: build_value(spec.value) ▶ ValueNode
   │           ▶ VectorPlan
   │     except Unsupported: continue
-  ▶ VectorPlan
+  ▶ VectorProgram(axes=_outer_axes(...), segments=[plan])   # 单段包成 1 段 program
 
 emit_plan(plan)
+  ├─ VectorProgram → 逐段 _emit_segment_stmts（源序），program.axes 统一包一次
   ├─ reduce is None → _Emitter 逐 store 发射；重建 chunk 循环 + 外层 serial 循环
   └─ reduce != None → _emit_reduce：编译期展开 chunk，SSA 串累加器
   ▶ TIR (SeqStmt / For)
@@ -257,7 +263,7 @@ def classify_access(buffer, indices, axes, analyzer, *, is_store) -> AccessInfo:
 | `IfThenElse` 双臂、异址写 | `Unsupported`（发散分支） |
 | 裸 `BufferLoad` | 丢弃（无副作用） |
 | `Evaluate(atomic_*)` | `Unsupported` |
-| 内层 `For` | `Unsupported` |
+| 内层 `For` | `Unsupported`（见 §3.11 / §6 场景） |
 | `Bind`（标量别名） | 丢弃（已内联） |
 
 **实现（节选）**
@@ -316,6 +322,8 @@ def normalize_body(stmt, aliases, out=None, mask=None) -> list[StoreSpec]:
 ```
 
 配套**标量别名内联**：`_collect_aliases` 收集 `Bind` 引入的真值绑定（排除 buffer 声明用的 Bind），`_apply_aliases` 迭代替换（**限定 8 次**防别名环），把 `k = k_iter*BK + j` 这类中间量折叠进最终表达式。这是「多行语句」收敛成单表达式再向量化的关键。
+
+> 注意：`normalize_body` 遇到内层 `For` 才拒绝——但**直接内嵌、链式嵌套、以及并列的干净 `T.serial` 循环，在进入 `normalize_body` 之前就已被吸收成迭代轴**（见 §3.11）。因此「含 serial 的并行体」大多根本走不到这条拒绝分支。
 
 ### 3.4 向量轴选择
 
@@ -611,6 +619,8 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
 
 `emit_plan`：先把 chunk 体包成 `for chunk in serial(ceil(E/L))`，再**逆序**把非向量轴包成 serial 循环（跳过向量轴本身）。于是 `T.Parallel(M,K)` → `for i in serial(M): for chunk in serial(K/L): ...`。
 
+对 `VectorProgram`（多个并列 serial 段，§3.11），`emit_plan` 逐段发射（每段一个 `chunk_s<k>` 循环 + 该段自身的非向量 serial 轴），**共享外层并行轴只在最外层包一次**，各段掩码 prologue 提到最前，语句顺序即源码顺序。
+
 `vectorize_parallel_nests`：**自顶向下（pre-order）**遍历语句树，命中 `T.Parallel` 就整体 `emit_plan(build_plan(...))` 替换（`_split_nest` 会一路吃到非 Parallel，故整个 nest 被一次性下降）；整体规划失败才返回 `None` 继续下探子节点。
 
 **实现**
@@ -651,6 +661,62 @@ for vector_axis in ranked:                                       # 轴回退
 raise Unsupported("no vectorizable axis: ...", diagnostics=diagnostics)
 ```
 
+### 3.11 循环吸收与多段规划（§6：`T.Parallel` 体内的 serial 循环）
+
+`T.Parallel` 体内嵌套 `T.serial` 是常见写法（归约、softmax、分块搬运等）。这类场景在**进入 §3.3 的 `normalize_body` 之前**先被吸收成迭代轴。按复杂度分三步：
+
+| 步骤 | 形态 | 处理 |
+|---|---|---|
+| 第一步 | 并行体**直接是一个**（或链式嵌套的）干净 `T.serial` 循环 | 该 serial 轴吸收为候选项量轴（S1 连续 copy → `vld/vsts`；S3 归约 → `vcadd`） |
+| 第二步 | 并行体是 `SeqStmt`，其中**恰好一个**干净 serial 循环，前后还有兄弟语句 | 吸收该 serial 轴；前置兄弟语句作 `pre`、后置作 `post`，在 chunk 循环**之外**按 `pre → 主体 → post` 每迭代一次 |
+| 第三步 | 并行体是 `SeqStmt`，含**多个并列的干净 serial 循环** | 走**多段**路径，产出 `VectorProgram`（`N` 段，源序发射） |
+
+「干净」= `_serial_is_clean`：体内不跨迭代读写（无循环携带标量状态、无 stencil `a[j-1]`）。
+
+**第三步：多段（`VectorProgram`）**
+
+为什么不「融合成一段」：多段之间常带**顺序语义**（如 softmax 的 `max → sum → 归一化`），融合后第一段必须整段算完才能进第二段，跨段的 store→load forwarding 又需要新的值通道规则。而**逐段独立向量化 + 源序发射**天然保持「段 k 完全先于段 k+1」，不需要新语义，也不动既有发射层。
+
+```python
+# build_plan 先试多段；不适用/失败则返回 None，回落到 §3.3–§3.10 的单段路径
+def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | None:
+    parallel_axes = 连续吸收的 T.Parallel 轴
+    if not parallel_axes or body 不是 SeqStmt:
+        return None                       # 单段路径
+    for child in body:                    # 按源序切分
+        if child 是 For:
+            chain = _absorb_serial_chain(child)   # 连续吸收干净 SERIAL
+            if chain is None: return None         # 不干净/最内层仍循环 → 回落单段
+            items.append(("seg", chain))
+        else:
+            items.append(("stmt", child))
+    if serial 链少于 2: return None        # 只有 ≥2 段才走多段
+    # 语句组按源序归属：段前 → 该段 pre；末尾剩余 → 末段 post
+    segments = [_build_segment([*parallel_axes, *serial_axes], pre, body, post) for 每个 seg]
+    # 任一段构造失败 → 段级原因写入 notes 并 return None（缺陷 B：不吞掉）
+    return VectorProgram(axes=parallel_axes, segments=segments)
+```
+
+每段的规划（`_build_segment`）与单段**完全同构**：`axes = [*并行轴, *该段 serial 轴]`，向量轴强制取该段最内层 serial 轴；每段各自产出 `VectorPlan`（带自己的 `reduce` / `pre_stores` / `post_stores`）。
+
+发射（`_emit_program`）：逐段生成 `chunk_s<k>` 循环，**共享外层并行轴只包一次**，各段掩码 prologue 提到最前，顺序 = 源码顺序。
+
+**正确性前提**：段间依赖必须**沿各段向量轴均匀**（Δ=0）——此时每个并行迭代内的段间次序与标量程序一致：
+
+| 形态 | 段间依赖 | 结果 |
+|---|---|---|
+| 两个互不相关的 serial（各自 element-wise） | 无 | 支持 |
+| 归约段 → 广播使用段（`s[i] += …` 后 `c[i,l] = s[i]*2`） | `s[i]` 沿第二段向量轴 l 均匀 | 支持 |
+| element-wise 组合（`c[i,j]=a*2` 后 `d[i,l]=c[i,l]+1`） | 同址、沿向量轴等值 | 支持 |
+| 跨地址真依赖（`c[i,l] = c[i,l-1] + …`，stencil） | 沿向量轴非均匀 | 拒绝 |
+| 并列段中**任一段**不干净 | — | 整体回落单段路径，按「nested serial loop」拒绝 |
+
+> **低风险不变式**：多段路径**只新增**接受面。`_try_build_program` 一旦返回 `None`，`build_plan` 走的是与多段支持之前**逐字节相同**的单段代码；因此既有测试（含各拒绝用例）零改动，单段被接受场景的发射结果也不变。`render_plan` / `emit_plan` 同时接受两种计划类型。
+>
+> **统一返回契约（级别 1）**：无论走哪条路径，`build_plan` 都返回 `VectorProgram`——单段路径把结果包成 1 段（`axes=_outer_axes(...)`，仅含提到最外层包一次的并行轴前缀），调用方只需处理一种计划类型。该包装不改变发射结果：单独发射一个 `VectorPlan`（自己包全部非向量轴）与发射「1 段 program」产出的 TIR **逐节点结构等价**，由护栏测试 `test_single_segment_program_emits_identically_to_single_plan` 覆盖（含「向量轴就是外层并行轴」的关键用例）。
+>
+> **诊断不吞（缺陷 A/B）**：program 与每段都带 `diagnostics`（段级含逐轴分类与「强制向量轴」说明，program 级含段数摘要）；某段构造失败时，段级原因经 `notes` 合并进最终 `Unsupported.diagnostics`，不会只剩回落单段路径后那句泛化的「nested serial loop」。
+
 ---
 
 ## 4. 场景支持矩阵
@@ -679,7 +745,10 @@ raise Unsupported("no vectorizable axis: ...", diagnostics=diagnostics)
 | §4-gather | 间接下标 `A[B[i]]` | 支持 | data-dependent 下标 → `INDIRECT` → `vgather2`（索引来自寄存器） |
 | §4-gather | 无结构下标（`a[i//3]`，非 2 的幂） | 拒绝 | `TRUE_RANDOM` → `not a power of two` |
 | §5 | `T.atomic_add` | 拒绝 | 无「向量+标量」原子配方 |
-| §6 | 嵌套 serial / 跨迭代标量状态 | 拒绝 | `nested ... loop ... is not affine-vectorizable` |
+| §6 第一步 | 直接内嵌、干净的 serial 循环（S1 copy / S3 归约） | 支持 | serial 轴被吸收为候选轴；S1 → 连续 `vld/vsts`，S3 → `vcadd` |
+| §6 第二步 | 多条语句夹一个 serial（M1/M2/M3/夹心、S2 私有标量） | 支持 | body 恰好含一个干净 serial 循环时，其前后兄弟语句作为 `pre`/`post` 段，在 chunk 循环外每迭代一次（`pre → 主体 → post`） |
+| §6 第三步 | 多个**并列**的干净 serial 循环（≥2 段） | 支持 | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间依赖须沿向量轴均匀 |
+| §6 | 嵌套 serial / 跨迭代标量状态 / 并列段中有一段不干净 | 拒绝 | `nested ... loop ... is not affine-vectorizable` |
 | — | 数学核心 Δ 分类 | 支持 | 6 个直接单测 |
 | — | 语句树变换（整段下降） | 支持 | 自顶向下替换 |
 | — | 诊断（改进 7） | 支持 | 成败都收集全部卡点 |
@@ -694,12 +763,19 @@ raise Unsupported("no vectorizable axis: ...", diagnostics=diagnostics)
 [OK ] c3_multi  c3_scalars  c3_value_pow2（改进3: vshrs+vand）  c3_topk（改进1: vscatter）
 [OK ] c4_flat  c4_strided  c4_reverse（PERMUTE → vgather2）  c4_tiled（PIECEWISE → vgather2）
 [OK ] c_gather（INDIRECT → vgather2）  c3_im2col（改进2: 最优轴 kk 被拒 → 回退到 m）
+[OK ] s1_serial_copy  s1_serial_predicated  s3_serial_reduce               （§6 第一步）
+[OK ] s2_serial_scalar  m_serial_after_init  m_serial_before_post          （§6 第二步）
+[OK ] m_serial_middle  m_serial_indep_group                               （§6 第二步）
+[OK ] p_two_serial_independent（program: 2 段）  p_serial_reduce_then_use     （§6 第三步）
+[OK ] p_serial_compose  p_serial_leading_stmt                             （§6 第三步）
 [REJ] c6_complex      nested serial loop inside T.Parallel is not affine-vectorizable
+[REJ] s_serial_stencil  nested serial loop inside T.Parallel is not affine-vectorizable
+[REJ] p_serial_one_unclean  nested serial loop inside T.Parallel is not affine-vectorizable
 [REJ] c_gm            global-memory operand inside T.Parallel ...
 [REJ] c4_true_random  ... FloorDiv by 3 is not a power of two
 ```
 
-共 **22** 个场景：**19 OK**、**3 拒绝**（嵌套循环 / GM 操作数 / `TRUE_RANDOM`），拒绝用例统一置于列表尾部。
+共 **36** 个场景：**31 OK**、**5 拒绝**（嵌套循环 / 跨迭代 stencil / 并列段含不干净 serial / GM 操作数 / `TRUE_RANDOM`），拒绝用例统一置于列表尾部。
 
 ---
 
@@ -726,7 +802,7 @@ raise Unsupported("no vectorizable axis: ...", diagnostics=diagnostics)
 
 ### 5.3 换发射目标 / 新增硬件指令
 
-因为 `VectorPlan` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_tail_mask` / `_store_mask` 里的指令名。分析层（§3 的规划部分）完全不动。
+因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_tail_mask` / `_store_mask` 里的指令名。分析层（§3 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
 
 **成本**：与目标指令集规模成正比，与场景数量无关。
 
@@ -767,7 +843,7 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 | 内存域 | GM 操作数拒绝 | 需 UB staging（§5.4(c)） |
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)） |
 | 地址 | 仅 `TRUE_RANDOM` 拒绝 | `PERMUTE`/`PIECEWISE`/`INDIRECT` 已走索引向量通道（`vgather2`/`vscatter`）；不可构造的索引明确报错，不静默降级 |
-| 语句 | 发散分支、嵌套 For、atomic 拒绝 | 见 §3.3 |
+| 语句 | 发散分支、atomic 拒绝；serial 支持面有限 | 直接内嵌、链式嵌套、或「一个/多个并列干净 serial 循环夹在语句序列中」可吸收；含循环携带状态、并列段中有一段不干净、非直接内嵌者拒绝（见 §3.3 / §6） |
 | 代码 | `vload.is_uniform` 分支等价于 `False` | `all([])` 坑的防御性写法，可简化 |
 | 代码 | `AccessInfo._uniform` 动态挂属性 | 可提升为 dataclass 字段 |
 | 判定 | `_const_int` 已支持符号常量证明 | 传 `analyzer` 时用 `simplify` + `const_int_bound`（上下界相等即常数）；更复杂的可证常量仍受化简器 / 区间分析能力限制 |
@@ -777,10 +853,11 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 ## 7. 测试策略
 
-* **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan` / `emit_plan`，检查 `VectorPlan` 与发射出的 `tl.simd.*` 调用序列。不涉及设备执行。
-* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换，共 **43** 个用例。
+* **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan`（恒返回 `VectorProgram`）/ `emit_plan`，检查 `program.segments[*]`（单段用例取 `segments[0]`）与发射出的 `tl.simd.*` 调用序列。不涉及设备执行。
+* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换 + 统一契约/等价性护栏，共 **63** 个用例。
 * **辅助工具**：
   * `_first_parallel`：取**最外层** `T.Parallel`（后序遍历先出最内层，故取最后一个）。
+  * `_single_segment`：断言 `build_plan` 恒返回 `VectorProgram` 且恰 1 段，取回 `program.segments[0]`（单段用例经它访问段级字段）。
   * `_emitted_ops`：抽取有序的 `tl.simd.*` op 名。
   * `_recipes`：把 `ValueNode` DAG 展平成 recipe 名列表。
   * `_for_kinds`：统计变换后的循环种类（验证 `PARALLEL` 是否消除）。
@@ -796,6 +873,7 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 | 有限差分 Δ | `Δ_v(off) = off(v+1) - off(v)`，连续性的唯一判据 |
 | `AccessClass` | 沿某轴的访存形态（连续/均匀/步长/逆序/分片/间接/无结构） |
 | 轴回退 | 按打分排序候选轴后**逐个尝试**发射，某个轴发不出时自动退到次优轴（§3.4） |
+| 段 / `VectorProgram` | `T.Parallel` 体内一个干净 serial 链 + 其 `pre`/`post`（一个 `VectorPlan`）；多个并列 serial 时按源码顺序组成 `VectorProgram`，逐段独立向量化 + 源序发射（§3.11） |
 | 每 lane 索引向量 | 元素偏移 `offset(..., v=lane)` 的整数向量，供 `vgather2`/`vscatter` 使用（改进 1） |
 | `recipe` | 值 DAG 节点的原语名（`vload`/`vmuls`/`vsel` ...），发射时查表成 `T.simd.*` |
 | `is_uniform` | 子表达式是否 lane 内均匀（决定标量-向量特化与 `vdup`） |

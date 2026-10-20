@@ -2,8 +2,10 @@
 
 Hardware independent and compiler independent: each case builds TileLang IR,
 runs the polyhedral analysis (:func:`build_plan`) / codegen (:func:`emit_plan`)
-directly, and inspects the resulting :class:`VectorPlan` plus the emitted
-``T.simd.*`` call sequence.  No PTOAS / Bisheng / device execution is involved.
+directly, and inspects ``program.segments`` (the returned :class:`VectorProgram`;
+single-segment cases go through :func:`_single_segment` to take ``segments[0]``)
+plus the emitted ``T.simd.*`` call sequence.  No PTOAS / Bisheng / device
+execution is involved.
 
 Covered contract (one test per catalogued case):
 
@@ -33,11 +35,25 @@ Covered contract (one test per catalogued case):
 * §5          ``T.atomic_add`` is rejected (no vector+scalar atomic recipe);
 * §6 第一步   a *directly-nested, clean* ``T.serial`` loop is absorbed as an extra
   candidate axis (S1 copy / predicated, S3 ``s[i] += a[i,j]`` reduction); a serial
-  body with loop-carried state (private scalar accumulator S2, shared scalar S4,
-  stencil cross-iteration read) is *not* absorbed and the whole nest is rejected
-  with "nested serial loop" (no silent downgrade).
+  body with loop-carried state (shared scalar S4, stencil cross-iteration read) is
+  *not* absorbed and the whole nest is rejected with "nested serial loop" (no
+  silent downgrade).
+* §6 第二步   a ``T.Parallel`` body that is a ``SeqStmt`` holding *exactly one*
+  clean serial loop is also absorbed: the sibling statements before/after it
+  become the ``pre`` / ``post`` segments, emitted *outside* the chunk loop once
+  per parallel iteration (order ``pre → main → post``).  Covers M2 (init + serial),
+  M3 (serial + post-processing), the sandwich (pre + serial + post) and M1 (an
+  independent store group + serial), plus the private scalar accumulator S2.
 * 改进 7      ``VectorPlan.diagnostics`` records every axis on success;
   ``Unsupported.diagnostics`` carries the per-axis notes on rejection.
+* 统一契约    ``build_plan`` always returns a :class:`VectorProgram` (1..N segments),
+  and ``program.axes`` holds only the hoisted ``T.Parallel`` axis prefix.  A
+  1-segment program emits a TIR tree structurally identical (free variable names
+  aside) to emitting its bare ``VectorPlan`` -- the equivalence guard for the
+  §3.9 axis-hoisting order reasoning.
+* 诊断不吞    a multi-segment program/segment carries diagnostics, and a segment
+  build failure is merged into the final ``Unsupported.diagnostics`` instead of
+  being swallowed by the single-segment fallback.
 * transform   ``vectorize_parallel_nests`` lowers a whole multi-axis nest
   (outer axes → serial, vector axis → strip-mined chunks).
 
@@ -51,11 +67,13 @@ from __future__ import annotations
 import pytest
 
 import tilelang.ascend.language as T
+import tvm
 from tvm import arith, tirx
 
 from tilelang.ascend.analysis.polyhedral import (
     AccessClass,
     Unsupported,
+    VectorProgram,
     build_plan,
     classify_delta,
     emit_plan,
@@ -101,6 +119,16 @@ def _for_kinds(stmt) -> list:
 
 def _plan(func):
     return build_plan(_first_parallel(func))
+
+
+def _single_segment(func):
+    """``build_plan`` 的契约是**恒返回** :class:`VectorProgram`（级别 1）。单段用例想拿回
+    那唯一一段的 :class:`VectorPlan` 时经这个 helper，顺带断言契约本身：恰好一段、
+    ``program.axes`` 只含提层的并行轴前缀（详见 :func:`_outer_axes`）。"""
+    program = build_plan(_first_parallel(func))
+    assert isinstance(program, VectorProgram), "build_plan must always return a VectorProgram"
+    assert len(program.segments) == 1, f"expected a single segment, got {len(program.segments)}"
+    return program.segments[0]
 
 
 def _emitted_ops(stmt) -> list:
@@ -198,7 +226,7 @@ def test_copy():
             for i in T.Parallel(N):
                 c[i] = a[i]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "i"
     assert plan.chunks == 2 and plan.tail == 0  # float32 -> 64 lanes, N=128
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
@@ -219,7 +247,7 @@ def test_scalar_broadcast():
             for i in T.Parallel(N):
                 c[i] = a[0]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.stores[0].value.recipe == "uniform_load"
     assert "tl.simd.vdup" in _emitted_ops(emit_plan(plan))
 
@@ -258,7 +286,7 @@ def test_if_else_merges_into_select():
                 else:
                     c[i] = T.exp(b[i])
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.stores[0].mask is None  # both arms write the same location
     assert plan.stores[0].value.recipe == "vsel"
     ops = _emitted_ops(emit_plan(plan))
@@ -276,7 +304,7 @@ def test_if_single_arm_is_predicated_store():
                 if i < j:
                     c[i, j] = 0.0
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     store = plan.stores[0]
     assert store.mask is not None
@@ -299,7 +327,7 @@ def test_ternary():
             for i in T.Parallel(N):
                 c[i] = T.if_then_else(a[i] > b[i], a[i], b[i])
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.stores[0].value.recipe == "vsel"
     ops = _emitted_ops(emit_plan(plan))
     # a lane-varying condition compares per lane (vcmp); it is *not* broadcast.
@@ -323,7 +351,7 @@ def test_ternary_with_loop_invariant_condition_broadcasts_predicate():
             for i_s2, i_v in T.Parallel(S, DV):
                 dv[i_s2, i_v] = T.if_then_else(10.0 - g[i_s2] <= 0, dv[i_s2, i_v] * g[i_s2], 0.0)
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "vsel" and value.detail == "uniform-cond select"
     assert value.args[0].is_uniform
@@ -346,7 +374,7 @@ def test_select_node_with_loop_invariant_condition_broadcasts_predicate():
             for i in T.Parallel(N):
                 c[i] = tirx.Select(a[0] > 0.0, a[i], b[i])
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "vsel" and value.detail == "uniform-cond select"
     ops = _emitted_ops(emit_plan(plan))
@@ -368,7 +396,7 @@ def test_loop_invariant_condition_with_uniform_arm_broadcasts_and_dedups():
             for i in T.Parallel(N):
                 c[i] = T.if_then_else(a[0] > 0.0, b[i], 0.0)
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "vsel" and value.args[2].is_uniform
     ops = _emitted_ops(emit_plan(plan))
@@ -389,7 +417,7 @@ def test_select_that_is_uniform_everywhere_stays_scalar():
             for i in T.Parallel(N):
                 c[i] = T.if_then_else(a[0] > 0.0, b[0], 2.0)
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.stores[0].value.is_uniform
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vsel" not in ops
@@ -412,7 +440,7 @@ def test_operand_rank_mismatch_broadcasts_outer_load():
             for i, j in T.Parallel(M, K):
                 d[i, j] = g[i] - g[j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     value = plan.stores[0].value
     assert value.recipe == "vsub"
@@ -434,7 +462,7 @@ def test_reduction_detected():
             for i, j in T.Parallel(M, K):
                 acc[i] = acc[i] + a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.reduce is not None
     assert plan.reduce.op == "vadd" and plan.reduce.recipe == "vcadd"
     assert plan.vector_axis.name == "j"
@@ -455,7 +483,7 @@ def test_reduction_max_maps_to_vcmax():
             for i, j in T.Parallel(M, K):
                 acc[i] = T.max(acc[i], a[i, j])
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.reduce is not None and plan.reduce.recipe == "vcmax"
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vcmax" in ops
@@ -477,7 +505,7 @@ def test_reduction_with_tail_fills_identity():
             for i, j in T.Parallel(M, K):
                 acc[i] = acc[i] + a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.reduce is not None and plan.tail == 32
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.update_mask" in ops  # 尾块谓词
@@ -504,7 +532,7 @@ def test_multi_store():
                 c[i] = a[i]
                 d[i] = a[i] * 2.0
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert len(plan.stores) == 2
     assert plan.stores[0].value.recipe == "vload"
     assert plan.stores[1].value.recipe == "vmuls"
@@ -526,7 +554,7 @@ def test_store_strided_on_the_only_axis_is_scattered():
             for i in T.Parallel(BM):
                 g[i, 0] = mv[i]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "i"
     assert plan.stores[0].kind == AccessClass.STRIDED
     ops = _emitted_ops(emit_plan(plan))
@@ -550,7 +578,7 @@ def test_multistore_with_unit_trailing_dim_is_contiguous():
                 g[i, 0] = mv[i]
                 i2[i, 0] = mi[i]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "i"
     assert [s.kind for s in plan.stores] == [AccessClass.CONTIGUOUS, AccessClass.CONTIGUOUS]
     assert _emitted_ops(emit_plan(plan)).count("tl.simd.vsts") == 2
@@ -568,7 +596,7 @@ def test_scalar_alias_folds_into_value():
                 acc: T.float32 = a[i, j] * 2.0
                 c[i, j] = acc + 1.0
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     # ``acc`` is inlined: vadds(vmuls(vload, 2.0), 1.0)
     recipes = _recipes(plan.stores[0].value)
     assert recipes[0] == "vadds" and recipes[1] == "vmuls"
@@ -589,7 +617,7 @@ def test_floordiv_value_operator_strength_reduced():
             for i in T.Parallel(N):
                 c[i] = a[i] + i // 4
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     recipes = _recipes(plan.stores[0].value)
     assert "vshrs" in recipes and "vcvt" in recipes
     ops = _emitted_ops(emit_plan(plan))
@@ -610,7 +638,7 @@ def test_floormod_value_operator_strength_reduced():
             for i in T.Parallel(N):
                 c[i] = a[i] + i % 8
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     recipes = _recipes(plan.stores[0].value)
     assert "vand" in recipes and "vbrc" in recipes
     ops = _emitted_ops(emit_plan(plan))
@@ -651,7 +679,7 @@ def test_expression_subscript():
             for b0, i_t in T.Parallel(B0, LEN):
                 d[b0, i_t] = g[b0, PAD + i_t]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "i_t"
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
     assert plan.stores[0].value.recipe == "vload"
@@ -689,7 +717,7 @@ def test_expression_subscript_reads_shared_operand_as_uniform():
             for i_s, i_k in T.Parallel(S, DK):
                 gs[i_s, i_k] = gb[0, 0 * S + i_s, 0]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "i_k"
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
     assert plan.stores[0].value.recipe == "uniform_load"
@@ -708,7 +736,7 @@ def test_highdim_flatten():
             for i_kv, _ in T.Parallel(M, LEN):
                 c[i_kv, _] = h[i_kv, _ // 16, _ % 16] * d[i_kv, _ // 16, _ % 16]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     # The 3D index flattens to ``i_kv*128 + _`` → Δ == 1 without a template match.
     assert plan.vector_axis.name == "_"
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
@@ -733,7 +761,7 @@ def test_block_tiled_fragment_layout_is_piecewise_gather():
             for i, j in T.Parallel(BM, BN):
                 c[i, j] = cs[i // MX, j // MY, i % MX, j % MY]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
     value = plan.stores[0].value
     assert value.recipe == "gather" and value.detail == AccessClass.PIECEWISE.value
@@ -752,7 +780,7 @@ def test_strided_access():
             for i in T.Parallel(N):
                 c[i] = a[2 * i]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "vload_strided" and value.detail == "stride=2"
     ops = _emitted_ops(emit_plan(plan))
@@ -775,7 +803,7 @@ def test_indirect_gather_is_expressed():
             for i in T.Parallel(N):
                 c[i] = a[b[i]]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "gather" and value.detail == AccessClass.INDIRECT.value
     assert "tl.simd.vgather2" in _emitted_ops(emit_plan(plan))
@@ -795,7 +823,7 @@ def test_reversal_is_permute_gather():
             for i in T.Parallel(N):
                 c[i] = a[N - 1 - i]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "gather" and value.detail == AccessClass.PERMUTE.value
     assert "tl.simd.vgather2" in _emitted_ops(emit_plan(plan))
@@ -837,7 +865,7 @@ def test_diagnostics_list_every_candidate_axis_on_success():
             for i, j in T.Parallel(N, N):
                 c[i, j] = a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert any(line.startswith("axis 'i'") for line in plan.diagnostics)
     assert any(line.startswith("axis 'j'") for line in plan.diagnostics)
     assert any(line.startswith("selected vector axis") for line in plan.diagnostics)
@@ -923,7 +951,7 @@ def test_direct_serial_copy_absorbed():
                 for j in T.serial(KS):
                     c[i, j] = a[i, j] * 2.0
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     assert [ax.name for ax in plan.axes] == ["i", "j"]
     assert all(not ax.is_parallel for ax in plan.axes if ax.name == "j")
@@ -947,7 +975,7 @@ def test_direct_serial_predicated_absorbed():
                     if a[i, j] != 0.0:
                         c[i, j] = a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     assert plan.stores[0].mask is not None
     assert "tl.simd.vcmps" in _emitted_ops(emit_plan(plan))
@@ -967,17 +995,17 @@ def test_direct_serial_reduction_absorbed():
                 for j in T.serial(KS):
                     s[i] += a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
 
 
-def test_serial_private_scalar_rejected():
-    """S2 边界：迭代私有**标量**累加器。``acc``(local.var) 的 init/store 把 serial 循环
-    夹在中间，不是"直接内嵌"；且从 SCoP 看 acc[0] 是 lane 均匀的共享标量（与 S4 同形）。
-    → 拒绝吸收，退回 "nested serial loop" 明确拒绝。"""
+def test_direct_serial_private_scalar_absorbed():
+    """S2（§6 第二步）：迭代私有**标量**累加器。``acc``(local.var) 的 init/store 把 serial
+    循环夹在中间 —— init 作为 ``pre`` 段、写回 ``c[i]`` 作为 ``post`` 段，二者在 chunk
+    循环**之外**每个并行迭代各执行一次；主体沿 serial 轴 j 走 vcadd 归约。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -992,8 +1020,16 @@ def test_serial_private_scalar_rejected():
                     acc += a[i, j]
                 c[i] = acc
 
-    with pytest.raises(Unsupported, match="nested serial loop"):
-        _plan(k)
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    # pre = acc[0] = 0.0，post = c[i] = acc[0]，均沿向量轴均匀。
+    assert [s.spec.buffer.name for s in plan.pre_stores] == ["acc"]
+    assert [s.kind for s in plan.pre_stores] == [AccessClass.UNIFORM]
+    assert [s.spec.buffer.name for s in plan.post_stores] == ["c"]
+    assert [s.kind for s in plan.post_stores] == [AccessClass.UNIFORM]
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
 
 
 def test_serial_shared_scalar_rejected():
@@ -1032,6 +1068,393 @@ def test_serial_stencil_rejected():
 
     with pytest.raises(Unsupported, match="nested serial loop"):
         _plan(k)
+
+
+# ---------------------------------------------------------------------------
+# §6 第二步：T.Parallel 体内多条语句，其中夹着一个干净的 T.serial（pre/post 段）
+# ---------------------------------------------------------------------------
+
+
+def test_serial_pre_statement_absorbed():
+    """M2 前置语句 + serial：``s[i]=0.0; for j in serial: s[i]+=a[i,j]``。
+    init 给出归约初值 → 作为 ``pre`` 段在 chunk 循环外执行一次，主体走 vcadd。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                s[i] = 0.0
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert [s.spec.buffer.name for s in plan.pre_stores] == ["s"]
+    assert plan.post_stores == []
+    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(plan))
+
+
+def test_serial_post_statement_absorbed():
+    """M3 serial + 后置语句：``for j in serial: s[i]+=a[i,j]; s[i]=s[i]*2``。
+    归约后处理 → 作为 ``post`` 段在 chunk 循环外执行一次。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+                s[i] = s[i] * 2.0
+
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert plan.pre_stores == []
+    assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
+    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(plan))
+
+
+def test_serial_sandwiched_statements_absorbed():
+    """前置 + serial + 后置（夹心）：``s[i]=0.0; for j: s[i]+=a[i,j]; s[i]=s[i]*2``。
+    pre 与 post 同时存在，发射顺序保持 pre → 主体 → post。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                s[i] = 0.0
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+                s[i] = s[i] * 2.0
+
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert [s.spec.buffer.name for s in plan.pre_stores] == ["s"]
+    assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
+    # pre 写、归约写、post 写各一次，共 3 个 vsts；顺序 pre → 主体 → post。
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vcadd" in ops
+    assert ops.count("tl.simd.vsts") >= 3
+
+
+def test_serial_independent_store_group_absorbed():
+    """M1 独立 store 组 + serial：``c[i,0]=1.0; for j: c[i,j]=a[i,j]*2``。
+    两组写互不相关（一组沿轴 uniform，一组沿轴连续）；uniform 的 pre 写必须在 chunk
+    循环外发射，否则 chunks>1 时会重复覆盖。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                c[i, 0] = 1.0
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is None
+    assert [s.spec.buffer.name for s in plan.pre_stores] == ["c"]
+    assert [s.kind for s in plan.pre_stores] == [AccessClass.UNIFORM]
+    assert [s.kind for s in plan.stores] == [AccessClass.CONTIGUOUS]
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vmuls" in ops and "tl.simd.vld" in ops
+
+
+# ---------------------------------------------------------------------------
+# §6 第三步：T.Parallel 体内**多个并列**的干净 T.serial 循环 → VectorProgram
+# ---------------------------------------------------------------------------
+
+
+def test_multi_serial_independent_segments():
+    """两个并列的干净 serial 循环（互不相关）→ 每段独立向量化，共享外层并行轴 i
+    （只在最外层包裹一次），两段按源码顺序发射。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((MS, KS), "float32"),
+        C: T.Tensor((MS, KS), "float32"),
+        D: T.Tensor((MS, KS), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    d[i, l] = b[i, l] + 1.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert [axis.name for axis in program.axes] == ["i"]
+    assert [seg.vector_axis.name for seg in program.segments] == ["j", "l"]
+    assert [seg.stores[0].spec.buffer.name for seg in program.segments] == ["c", "d"]
+    assert all(seg.stores[0].kind == AccessClass.CONTIGUOUS for seg in program.segments)
+
+    stmt = emit_plan(program)
+    kinds = _for_kinds(stmt)
+    assert tirx.ForKind.PARALLEL not in kinds
+    assert kinds.count(tirx.ForKind.SERIAL) == 3  # 共享并行轴 i + 两个 chunk 循环
+
+
+def test_multi_serial_reduce_then_use():
+    """归约段 + 广播使用段：段间依赖 ``s[i]`` 沿第二段的向量轴 l 均匀 →
+    逐段向量化 + 源序发射保持语义。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+                for l in T.serial(KS):
+                    c[i, l] = s[i] * 2.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert len(program.segments) == 2
+    assert program.segments[0].reduce is not None and program.segments[0].reduce.recipe == "vcadd"
+    assert program.segments[1].reduce is None
+    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(program))
+
+
+def test_multi_serial_compose_keeps_source_order():
+    """element-wise 组合：后段读前段写的 ``c[i,l]``。源序发射保证「先算 c 再算 d」，
+    因此发射指令里 ``c`` 的算术前于 ``d`` 的算术。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32"), D: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    d[i, l] = c[i, l] + 1.0
+
+    ops = _emitted_ops(emit_plan(_plan(k)))
+    assert "tl.simd.vmuls" in ops and "tl.simd.vadds" in ops
+    assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
+
+
+def test_multi_serial_leading_statement_is_first_segment_pre():
+    """首段之前的语句组归属首段的 ``pre``（在 chunk 循环之外每个并行迭代执行一次）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                s[i] = 0.0
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+                for l in T.serial(KS):
+                    c[i, l] = s[i] * 2.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert [store.spec.buffer.name for store in program.segments[0].pre_stores] == ["s"]
+    assert program.segments[1].pre_stores == []
+
+
+def test_multi_serial_one_unclean_is_rejected():
+    """并列 serial 中有一段跨迭代读（stencil ``c[i,l-1]``）→ 不能吸收该段，整体回落到
+    既有单段路径并按「nested serial loop」拒绝（不做静默降级）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    c[i, l] = c[i, l - 1] + a[i, l]
+
+    with pytest.raises(Unsupported, match="nested serial loop"):
+        _plan(k)
+
+
+# ---------------------------------------------------------------------------
+# 级别 0/1：统一返回契约、等价性护栏、诊断补齐（缺陷 A/B）
+# ---------------------------------------------------------------------------
+
+
+def test_build_plan_always_returns_vector_program():
+    """级别 1：``build_plan`` **恒**返回 :class:`VectorProgram`（1..N 段），调用方不再需要
+    分支处理两种类型。单段用例里 ``program.axes`` 就是「并行且非向量轴」的提层前缀
+    （此处只有外层 ``i``），向量轴 ``j`` 留在该段内 strip-mine。"""
+    M, K = 16, 128
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), C: T.Tensor((M, K), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            c = T.alloc_shared((M, K), "float32")
+            for i, j in T.Parallel(M, K):
+                c[i, j] = a[i, j]
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert len(program.segments) == 1
+    assert [axis.name for axis in program.axes] == ["i"]
+    assert all(axis.is_parallel for axis in program.axes)
+    assert program.segments[0].vector_axis.name == "j"
+    # program 级诊断对单段/多段**恒非空**（与多段路径对称）。
+    assert any("single-segment program" in note for note in program.diagnostics)
+    # 1 段 program 的人类可读文本与「单段 plan」逐字同形（只是多一行 program 级摘要）。
+    assert render_plan(program) == render_plan(program.segments[0]) + ("\n  single-segment program: 1 segment, vector axis 'j'")
+    assert not render_plan(program).startswith("program:")
+
+
+def test_single_segment_program_emits_identically_to_single_plan():
+    """等价性护栏（步骤 2）：同一份 IR 分别走「单段路径」（``emit_plan(VectorPlan)``：
+    该段自己包全部非向量轴）与「1 段 program 的统一路径」（``emit_plan(VectorProgram)``：
+    ``program.axes`` 提到最外层包一次 + 段内按变量身份跳过），断言两棵发射出的 TIR
+    **逐节点结构等价**（``map_free_vars=True`` 即只按首现位置对应自由变量，变量名除外）。
+
+    覆盖三类轴形状；第三类「向量轴就是外层并行轴」是 ``hoisted`` 必须按**变量身份**跳过
+    （而非笼统跳过所有并行轴）才能保持等价的关键用例——否则段内的 ``j`` 会被漏包。
+    """
+    M, K = 64, 128
+
+    @T.prim_func
+    def multi_axis_copy(A: T.Tensor((M, K), "float32"), C: T.Tensor((M, K), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            c = T.alloc_shared((M, K), "float32")
+            for i, j in T.Parallel(M, K):
+                c[i, j] = a[i, j]
+
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def serial_absorbed(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    MD = 64
+
+    @T.prim_func
+    def outer_parallel_vector_axis(A: T.Tensor((MD, MD), "float32"), C: T.Tensor((MD, MD), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MD, MD), "float32")
+            c = T.alloc_shared((MD, MD), "float32")
+            for i, j in T.Parallel(MD, MD):
+                c[j, i] = a[i, j]  # 联合打分选外层轴 i（让写连续）
+
+    cases = [
+        ("multi-axis copy", multi_axis_copy, "j", ["i"]),
+        ("serial absorbed", serial_absorbed, "j", ["i"]),
+        ("outer parallel vector axis", outer_parallel_vector_axis, "i", []),
+    ]
+    for name, func, vector_axis, outer_axes in cases:
+        program = _plan(func)
+        assert isinstance(program, VectorProgram), name
+        assert len(program.segments) == 1, name
+        assert program.segments[0].vector_axis.name == vector_axis, name
+        assert [axis.name for axis in program.axes] == outer_axes, name
+
+        direct = emit_plan(program.segments[0])  # 单段路径：该段包全部轴
+        unified = emit_plan(program)  # 统一路径：program.axes 提到最外层包一次
+        assert tvm.ir.structural_equal(direct, unified, map_free_vars=True), name
+        # 发射出的模板序列与循环种类也逐项一致（更强的行为信号）。
+        assert _emitted_ops(direct) == _emitted_ops(unified), name
+        assert _for_kinds(direct) == _for_kinds(unified), name
+
+
+def test_multi_segment_program_diagnostics_are_populated():
+    """缺陷 A：多段路径不再产生「diagnostics 恒空」的计划——program 层有摘要，每段也有
+    自己的逐轴分类与「强制向量轴」说明，与单段路径的 ``plan.diagnostics`` 同构。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((MS, KS), "float32"),
+        C: T.Tensor((MS, KS), "float32"),
+        D: T.Tensor((MS, KS), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    d[i, l] = b[i, l] + 1.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert len(program.segments) == 2
+    assert any("multi-segment program" in note for note in program.diagnostics)
+    for segment in program.segments:
+        assert any("axis 'i'" in note for note in segment.diagnostics)
+        assert any(f"axis '{segment.vector_axis.name}'" in note for note in segment.diagnostics)
+        assert any("forced vector axis" in note for note in segment.diagnostics)
+
+
+def test_multi_segment_failure_reason_is_preserved():
+    """缺陷 B：某一段构造失败时**不再被吞掉**——段级原因经 ``notes`` 合并进最终
+    ``Unsupported.diagnostics``，而不是只剩回落单段路径后那句泛化的「nested serial loop」。
+
+    第二段读 GM 张量 ``A``（未先 staging 到 UB）→ 该段在取值 DAG 构造时抛 Unsupported；
+    整体仍按既有行为拒绝，但原因随诊断一并可见。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    c[i, l] = A[i, l]
+
+    with pytest.raises(Unsupported, match="nested serial loop") as excinfo:
+        _plan(k)
+    notes = excinfo.value.diagnostics
+    assert any(note.startswith("segment 1") for note in notes)
+    assert any("global-memory operand" in note for note in notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1096,6 +1519,33 @@ def test_multidim_nest_keeps_every_axis():
             for i, j in T.Parallel(M, K):
                 c[i, j] = a[i, j]
 
-    plan = _plan(k)
+    plan = _single_segment(k)
     assert [a.name for a in plan.axes] == ["i", "j"]
     assert plan.vector_axis.name == "j"
+
+
+def test_vectorize_parallel_nests_lowers_multi_serial_program():
+    """Top-down lowering also consumes a multi-serial ``T.Parallel`` body: the shared
+    parallel axis becomes one serial loop, each segment contributes its own chunk loop,
+    and source order (``c`` before ``d``) is preserved."""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32"), D: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    d[i, l] = c[i, l] + 1.0
+
+    transformed = vectorize_parallel_nests(k.body)
+
+    kinds = _for_kinds(transformed)
+    assert tirx.ForKind.PARALLEL not in kinds
+    assert kinds.count(tirx.ForKind.SERIAL) == 3  # 共享并行轴 i + 两个 chunk 循环
+    ops = _emitted_ops(transformed)
+    assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")

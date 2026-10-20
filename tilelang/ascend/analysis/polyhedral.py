@@ -81,6 +81,7 @@ __all__ = [
     "StorePlan",
     "ReduceInfo",
     "VectorPlan",
+    "VectorProgram",
     "Unsupported",
     "finite_difference",
     "classify_delta",
@@ -441,13 +442,16 @@ class AccessInfo:
     indices: tuple
     offset: tirx.PrimExpr
     is_store: bool
-    per_axis: dict = field(default_factory=dict)  # var.name -> (AccessClass, stride)
+    per_axis: dict = field(default_factory=dict)  # axis.index -> (AccessClass, stride)
     indirect: bool = False
     in_global: bool = False
     reason: str = ""  # 非常数 Δ 无法构造索引向量时的诊断原因（改进 4）
 
     def axis_class(self, axis: Axis) -> tuple[AccessClass, int | None]:
-        return self.per_axis.get(axis.name, (AccessClass.TRUE_RANDOM, None))
+        # 以 ``axis.index``（轴在本次迭代域中的位置）为键：同一 nest 内恒唯一，且不依赖
+        # ``axis.var`` 的名字——两个不同 serial 循环重名（或在多段 program 的不同段里重名）
+        # 时不会互相串味。
+        return self.per_axis.get(axis.index, (AccessClass.TRUE_RANDOM, None))
 
 
 def classify_access(
@@ -485,7 +489,7 @@ def classify_access(
     piecewise_reason = None if indirect else index_vector_reason(offset, analyzer)
     for axis in axes:
         if indirect:
-            info.per_axis[axis.name] = (AccessClass.INDIRECT, None)
+            info.per_axis[axis.index] = (AccessClass.INDIRECT, None)
             continue
         delta = finite_difference(offset, axis.var, analyzer)
         kind, stride = classify_delta(delta, analyzer)
@@ -493,7 +497,7 @@ def classify_access(
             # Δ 非常数，但索引向量通道构造不出来 → 真正的"无结构"访问。
             kind, stride = AccessClass.TRUE_RANDOM, None
             info.reason = piecewise_reason
-        info.per_axis[axis.name] = (kind, stride)
+        info.per_axis[axis.index] = (kind, stride)
     return info
 
 
@@ -628,7 +632,18 @@ def normalize_body(
 
 
 def _same_indices(lhs: tuple, rhs: tuple) -> bool:
-    return len(lhs) == len(rhs) and all(a.same_as(b) for a, b in zip(lhs, rhs))
+    # 结构相等：``same_as`` 是指针身份比较，对 ``IntImm(0)`` 之类的常量下标会
+    # 因对象不同而误判为不等（``acc[0] = acc[0] + x`` 的自读判定因此失效）。
+    return len(lhs) == len(rhs) and all(tirx.analysis.expr_deep_equal(a, b) for a, b in zip(lhs, rhs))
+
+
+def _seq(stmts: list) -> tirx.Stmt | None:
+    """把语句列表折成 ``SeqStmt``（空 → ``None``，单元素 → 元素本身）。"""
+    if not stmts:
+        return None
+    if len(stmts) == 1:
+        return stmts[0]
+    return tirx.SeqStmt(stmts)
 
 
 def _extern_name(arg) -> str | None:
@@ -987,7 +1002,12 @@ _REDUCE_ELEMENT = {recipe: op for op, recipe in _REDUCE_RECIPE.items()}
 
 @dataclass
 class VectorPlan:
-    """与硬件无关的向量执行计划（≈ 方案里的中间层 2 的分析部分）。"""
+    """**段级**硬件无关向量执行计划（≈ 方案里的中间层 2 的分析部分）。
+
+    一个「段」= 一个主体 + 可选 ``pre``/``post``（方案 §6 第二步）。:func:`build_plan`
+    **恒**把它包成 :class:`VectorProgram` 的一段返回；只有等价性护栏 / 外部调用方才会
+    直接持有它。
+    """
 
     axes: list[Axis]
     vector_axis: Axis
@@ -995,19 +1015,58 @@ class VectorPlan:
     chunks: int
     tail: int
     stores: list[StorePlan] = field(default_factory=list)
+    # 方案 §6 第二步：与 serial 循环**同级**的前置/后置语句（沿向量轴均匀），
+    # 每个外层迭代各执行一次，发射在 chunk 循环**之外**（顺序：pre → 主体 → post）。
+    pre_stores: list[StorePlan] = field(default_factory=list)
+    post_stores: list[StorePlan] = field(default_factory=list)
     reduce: ReduceInfo | None = None
     diagnostics: list[str] = field(default_factory=list)
 
 
-def _split_nest(stmt: tirx.Stmt, analyzer: arith.Analyzer) -> tuple[list[Axis], tirx.Stmt]:
-    """收集迭代域：连续的 ``T.Parallel`` 轴 + **直接内嵌且干净**的 ``T.serial`` 轴。
+@dataclass
+class VectorProgram:
+    """``build_plan`` 的**统一返回类型**（恒返回，1..N 段）。
 
-    serial 轴只有在 :func:`_serial_is_clean` 通过时才被吸收（S1/S3，见方案 §6）；
-    否则在此处**停下**，把该 serial 循环留在 body 里，由 :func:`normalize_body`
-    以「nested serial loop」明确拒绝——吸收是纯增量，不改变任何既有拒绝行为。
+    单段（``T.Parallel`` 体只有一个主体，或一个主体 + 可选 ``pre``/``post``）时是
+    「1 段 program」：``axes`` 只含提到最外层包一次的**并行轴前缀**（:func:`_outer_axes`），
+    向量轴与其余轴仍由 ``segments[0]`` 自己包裹，因此调用方只需处理一种计划类型。
+
+    体内出现**多个并列干净 ``T.serial`` 循环**时按源码顺序切成若干段，每段是一个
+    :class:`VectorPlan`（各有自己的 serial 轴、向量轴、``pre``/``post`` 与归约）；各段
+    共享 ``axes`` 里的外层并行轴（只在最外层包裹一次），段内发射保持源码顺序
+    （``pre`` → 主体 → ``post``）。
+
+    这是一个「逐段独立向量化 + 源序发射」模型：段间若存在依赖，该依赖必须沿各段向量轴
+    均匀（如 ``m[i]``、``s[i]``），于是逐段向量化 + 顺序执行即可保持语义；段间出现跨地址
+    真依赖（shift / stencil）时应写成单段（一个 serial 体），而不是并列两段。
+    """
+
+    axes: list[Axis]
+    segments: list[VectorPlan] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+
+def _split_nest(stmt: tirx.Stmt, analyzer: arith.Analyzer) -> tuple[list[Axis], Axis | None, list[tirx.Stmt], tirx.Stmt, list[tirx.Stmt]]:
+    """收集迭代域，并把 body 拆成 ``(pre, main, post)`` 三段。
+
+    迭代域 = 连续的 ``T.Parallel`` 轴 + **直接的、干净的** ``T.serial`` 轴：
+
+    * **直接内嵌链**（``for i in P: for j in serial: body``）—— 一路下行即可吸收；
+    * **语句列表分段**（方案 §6 第二步）：当平行链结束后是一个 ``SeqStmt``，其中
+      **唯一一个**干净的 ``T.serial`` 循环也可被吸收——它之前的兄弟语句是 ``pre``、
+      之后的是 ``post``（都在 serial 轴**外层**、每个并行迭代执行一次），循环体则是
+      被向量化的 ``main``。``pre``/``post`` 天然不含 serial 变量，故沿该轴 ``Δ==0``。
+
+    serial 轴只有在 :func:`_serial_is_clean` 通过时才被吸收；否则保持原样，由
+    :func:`normalize_body` 以「nested serial loop」明确拒绝——吸收是纯增量，不改变
+    任何既有拒绝行为。
+
+    返回 ``(axes, serial_axis, pre_stmts, main_stmt, post_stmts)``；
+    ``serial_axis`` 是被吸收的那根 serial 轴（没有则为 ``None``）。
     """
     axes: list[Axis] = []
-    current = stmt
+    serial_axis: Axis | None = None
+    current: tirx.Stmt = stmt
     while isinstance(current, tirx.For):
         kind = current.kind
         if kind == tirx.ForKind.SERIAL:
@@ -1015,11 +1074,222 @@ def _split_nest(stmt: tirx.Stmt, analyzer: arith.Analyzer) -> tuple[list[Axis], 
                 break
         elif kind != tirx.ForKind.PARALLEL:
             break
-        axes.append(Axis(current.loop_var, current.extent, len(axes), kind))
+        axis = Axis(current.loop_var, current.extent, len(axes), kind)
+        axes.append(axis)
+        if kind == tirx.ForKind.SERIAL:
+            serial_axis = axis
         current = current.body
+
+    pre: list[tirx.Stmt] = []
+    post: list[tirx.Stmt] = []
+    if isinstance(current, tirx.SeqStmt):
+        loop_positions = [k for k, child in enumerate(current) if isinstance(child, tirx.For)]
+        # 仅当恰好有一个「干净的 serial 循环」时才分段；否则原样保留，交给
+        # normalize_body 以「nested serial loop」拒绝（保持既有行为不变）。
+        if len(loop_positions) == 1:
+            pos = loop_positions[0]
+            loop = current[pos]
+            if loop.kind == tirx.ForKind.SERIAL and _serial_is_clean(loop, analyzer)[0]:
+                serial_axis = Axis(loop.loop_var, loop.extent, len(axes), tirx.ForKind.SERIAL)
+                axes.append(serial_axis)
+                pre = list(current[:pos])
+                post = list(current[pos + 1 :])
+                current = loop.body
+
     if not any(axis.is_parallel for axis in axes):
         raise Unsupported("no T.Parallel axis found")
+    return axes, serial_axis, pre, current, post
+
+
+def _absorb_serial_chain(loop: tirx.For, analyzer: arith.Analyzer, base_index: int) -> tuple[list[Axis], tirx.Stmt] | None:
+    """把 ``for j in serial: for l in serial: ...`` 这条**纯 serial 链**吸收成迭代轴。
+
+    返回 ``(serial_axes, innermost_body)``；若链上任何一层不干净（:func:`_serial_is_clean`），
+    或最内层仍是循环（含 ``T.Parallel``）则返回 ``None``——此时交给既有单段路径按原样处理，
+    保持「nested serial loop」等既有拒绝行为不变。
+    """
+    if not (isinstance(loop, tirx.For) and loop.kind == tirx.ForKind.SERIAL):
+        return None
+    axes: list[Axis] = []
+    current: tirx.Stmt = loop
+    while isinstance(current, tirx.For) and current.kind == tirx.ForKind.SERIAL:
+        if not _serial_is_clean(current, analyzer)[0]:
+            return None
+        axes.append(Axis(current.loop_var, current.extent, base_index + len(axes), tirx.ForKind.SERIAL))
+        current = current.body
+    if isinstance(current, tirx.For):
+        return None
     return axes, current
+
+
+@dataclass
+class _SegmentSpecs:
+    """一段（serial 链 + 其 ``pre``/``post``）**规范化后**的分析输入。
+
+    单段路径（:func:`build_plan`）与多段路径（:func:`_build_segment`）共用这份
+    样板（:func:`_prepare_segment`）：规范化 body → 定 lanes → 逐轴分类，之后各自
+    决定向量轴。这样两条路径不会各自维护一份「elem/lanes/infos」推导。
+    """
+
+    axes: list[Axis]
+    serial_axis: Axis | None
+    pre_specs: list[StoreSpec]
+    pre_infos: list[AccessInfo]
+    main_specs: list[StoreSpec]
+    main_infos: list[AccessInfo]
+    post_specs: list[StoreSpec]
+    post_infos: list[AccessInfo]
+    elem: str
+    lanes: int
+
+    @property
+    def all_infos(self) -> list[AccessInfo]:
+        return [*self.pre_infos, *self.main_infos, *self.post_infos]
+
+    @property
+    def all_specs(self) -> list[StoreSpec]:
+        return [*self.pre_specs, *self.main_specs, *self.post_specs]
+
+    def plan_for(self, vector_axis: Axis, analyzer: arith.Analyzer) -> VectorPlan:
+        return _build_plan_for_axis(
+            self.axes,
+            self.serial_axis,
+            self.pre_specs,
+            self.pre_infos,
+            self.main_specs,
+            self.main_infos,
+            self.post_specs,
+            self.post_infos,
+            vector_axis,
+            self.lanes,
+            self.elem,
+            analyzer,
+        )
+
+
+def _prepare_segment(
+    axes: list[Axis],
+    serial_axis: Axis | None,
+    pre_stmts: list[tirx.Stmt],
+    main_stmt: tirx.Stmt,
+    post_stmts: list[tirx.Stmt],
+    aliases: dict,
+    analyzer: arith.Analyzer,
+    lanes: int | None,
+) -> _SegmentSpecs:
+    """把一段的语句规范化成 :class:`_SegmentSpecs`（单段 / 多段路径共用）。
+
+    ``lanes`` 只在调用方未指定时按元素位宽推导；``main`` 没有任何写语句时抛
+    ``Unsupported``（与两条路径原先各自的检查同一处、同一消息）。
+    """
+    pre_specs = normalize_body(_seq(pre_stmts), aliases) if pre_stmts else []
+    main_specs = normalize_body(main_stmt, aliases)
+    post_specs = normalize_body(_seq(post_stmts), aliases) if post_stmts else []
+    if not main_specs:
+        raise Unsupported("T.Parallel body has no store to vectorize")
+
+    elem = _buffer_elem_dtype(main_specs[0].buffer)
+    if lanes is None:
+        lanes = _vreg_lanes(elem)
+
+    def _infos(specs):
+        return [classify_access(spec.buffer, spec.indices, axes, analyzer, is_store=True) for spec in specs]
+
+    return _SegmentSpecs(
+        axes=axes,
+        serial_axis=serial_axis,
+        pre_specs=pre_specs,
+        pre_infos=_infos(pre_specs),
+        main_specs=main_specs,
+        main_infos=_infos(main_specs),
+        post_specs=post_specs,
+        post_infos=_infos(post_specs),
+        elem=elem,
+        lanes=lanes,
+    )
+
+
+def _build_segment(
+    axes: list[Axis],
+    serial_axis: Axis,
+    pre_stmts: list[tirx.Stmt],
+    main_stmt: tirx.Stmt,
+    post_stmts: list[tirx.Stmt],
+    aliases: dict,
+    analyzer: arith.Analyzer,
+    lanes: int | None,
+) -> VectorPlan:
+    """为一段（一个 serial 链 + 其 ``pre``/``post``）规划出单段 :class:`VectorPlan`。
+
+    向量轴固定为该段的**最内层 serial 轴**（外层并行轴的向量化尚未支持），因此
+    :func:`_build_plan_for_axis` 里「``pre``/``post`` 只能沿 serial 轴向量化」的门禁天然满足。
+    该段同样携带自己的诊断（改进 7），与单段路径的 ``plan.diagnostics`` 同构。
+    """
+    specs = _prepare_segment(axes, serial_axis, pre_stmts, main_stmt, post_stmts, aliases, analyzer, lanes)
+    diagnostics = _axis_diagnostics(axes, specs.all_infos, _load_infos(axes, specs.all_specs, analyzer))
+    plan = specs.plan_for(serial_axis, analyzer)
+    diagnostics.append(f"segment on serial axis '{serial_axis.name}': forced vector axis (方案 §6 第三步)")
+    plan.diagnostics = diagnostics
+    return plan
+
+
+def _try_build_program(
+    stmt: tirx.Stmt,
+    analyzer: arith.Analyzer,
+    lanes: int | None,
+    notes: list[str] | None = None,
+) -> VectorProgram | None:
+    """尝试把「多个并列干净 ``T.serial`` 循环」的并行体规划成 :class:`VectorProgram`。
+
+    仅当并行链结束后是一个 ``SeqStmt``、其中含 **≥2 个**可吸收的 serial 链时才接手；
+    否则返回 ``None``，让既有单段路径（:func:`_split_nest` / :func:`normalize_body`）原样
+    处理——因此不改变任何既有拒绝行为（如「nested serial loop」）。段间语句组按源码顺序
+    归属：段前语句组 → 该段的 ``pre``；末尾剩余语句组 → 末段的 ``post``。
+
+    ``notes`` 是**段级失败原因**的出口（缺陷 B）：某一段构造失败时不能只 ``return None``
+    把原因丢掉，而要记下来交给 :func:`build_plan` 合并进最终 ``Unsupported.diagnostics``
+    ——否则用户只能看到回落单段路径后那句泛化的「nested serial loop」。
+    """
+    notes = notes if notes is not None else []
+    parallel_axes: list[Axis] = []
+    current: tirx.Stmt = stmt
+    while isinstance(current, tirx.For) and current.kind == tirx.ForKind.PARALLEL:
+        parallel_axes.append(Axis(current.loop_var, current.extent, len(parallel_axes), tirx.ForKind.PARALLEL))
+        current = current.body
+    if not parallel_axes or not isinstance(current, tirx.SeqStmt):
+        return None
+
+    items: list[tuple[str, object]] = []
+    for child in current:
+        if isinstance(child, tirx.For):
+            chain = _absorb_serial_chain(child, analyzer, len(parallel_axes))
+            if chain is None:
+                return None  # 不可吸收：保留既有「nested serial loop」拒绝
+            items.append(("seg", chain))
+        else:
+            items.append(("stmt", child))
+
+    seg_positions = [k for k, (kind, _) in enumerate(items) if kind == "seg"]
+    if len(seg_positions) < 2:
+        return None
+
+    aliases = _collect_aliases(current)
+    segments: list[VectorPlan] = []
+    previous = -1
+    for order, pos in enumerate(seg_positions):
+        pre = [items[k][1] for k in range(previous + 1, pos)]
+        serial_axes, body = items[pos][1]
+        post = [items[k][1] for k in range(pos + 1, len(items))] if order == len(seg_positions) - 1 else []
+        try:
+            segments.append(_build_segment([*parallel_axes, *serial_axes], serial_axes[-1], pre, body, post, aliases, analyzer, lanes))
+        except Unsupported as err:
+            notes.append(f"segment {order} (T.serial '{serial_axes[-1].name}'): {err}")
+            notes.extend(f"  {note}" for note in err.diagnostics)
+            return None
+        previous = pos
+    program = VectorProgram(axes=parallel_axes, segments=segments)
+    program.diagnostics = [f"multi-segment program: {len(segments)} segments, source order preserved"]
+    return program
 
 
 def _is_cumulative_write(store: tirx.BufferStore) -> bool:
@@ -1108,6 +1378,11 @@ def _collect_load_exprs(stores: list[StoreSpec]) -> list:
         if spec.mask is not None:
             tirx.stmt_functor.post_order_visit(spec.mask, visit)
     return found
+
+
+def _load_infos(axes: list[Axis], specs: list[StoreSpec], analyzer: arith.Analyzer) -> list[AccessInfo]:
+    """写语句取值 / 谓词里所有读侧访存的逐轴分类（联合打分与诊断共用）。"""
+    return [classify_access(load.buffer, tuple(load.indices), axes, analyzer, is_store=False) for load in _collect_load_exprs(specs)]
 
 
 def rank_vector_axes(
@@ -1206,37 +1481,50 @@ def _reduce_op(stores: list[StoreSpec]) -> str:
     return "vadd"
 
 
-def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorPlan:
-    """主入口：``T.Parallel`` 嵌套 → :class:`VectorPlan`。
+def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorProgram:
+    """主入口：``T.Parallel`` 嵌套 → :class:`VectorProgram`（1..N 段）。
 
     伪代码（完整版见模块 docstring）::
 
-        axes, body       = split_nest(stmt)                # SCoP 迭代域
-        aliases          = collect_aliases(body)           # 标量中间量内联
-        stores           = normalize_body(body, aliases)   # 多语句 / 分支规范化
-        ranked           = rank_vector_axes(axes, stores)  # 联合可行性 + 读写加权
-        for v in ranked:                                   # 轴回退：逐个尝试
-            try:    return build_plan_for_axis(v)          # Δ 分类的递归
+        axes, serial_axis, pre, main, post = _split_nest(stmt)     # SCoP 迭代域 + 分段
+        specs  = _prepare_segment(axes, ..., pre, main, post, ...) # 规范化 body + 逐轴分类
+        ranked = rank_vector_axes(axes, specs.main_specs, specs.all_infos, load_infos, a)
+        for v in ranked:                                           # 轴回退：逐个尝试
+            try:    return specs.plan_for(v, analyzer)             # Δ 分类的递归
             except Unsupported: continue
+
+    当并行体内出现**多个并列干净 ``T.serial`` 循环**时，先用 :func:`_try_build_program`
+    走「逐段独立向量化」的多段路径；不适用时回落到上面的单段路径。
+
+    **返回类型统一为** :class:`VectorProgram`：单段路径的结果会被包成「1 段 program」，
+    其中 ``program.axes`` 只含**提到最外层的并行轴前缀**（向量轴与其余轴仍由该段自己
+    包裹，见 :func:`_outer_axes`）。这样调用方只需处理一种计划类型，而「哪些轴在最外层
+    包一次」这条信息与多段路径完全一致。
 
     ``lanes`` 默认由元素位宽唯一决定（``2048 / elem_bits``，与 ``T.simd`` 的
     ``vreg`` 宽度一致），因此一般不需要显式传入。
     """
     analyzer = arith.Analyzer()
-    axes, body = _split_nest(stmt, analyzer)
-    aliases = _collect_aliases(body)
-    stores = normalize_body(body, aliases)
-    if not stores:
-        raise Unsupported("T.Parallel body has no store to vectorize")
-
-    elem = _buffer_elem_dtype(stores[0].buffer)
-    if lanes is None:
-        lanes = _vreg_lanes(elem)
-
-    store_infos = [classify_access(spec.buffer, spec.indices, axes, analyzer, is_store=True) for spec in stores]
-    load_infos = [classify_access(load.buffer, tuple(load.indices), axes, analyzer, is_store=False) for load in _collect_load_exprs(stores)]
-    ranked = rank_vector_axes(axes, stores, store_infos, load_infos, analyzer)
-    diagnostics = _axis_diagnostics(axes, store_infos, load_infos)  # 改进 7：先记录每根轴的分类
+    notes: list[str] = []  # 多段路径的段级失败原因（缺陷 B：不吞掉）
+    program = _try_build_program(stmt, analyzer, lanes, notes)
+    if program is not None:
+        return program
+    try:
+        axes, serial_axis, pre_stmts, main_stmt, post_stmts = _split_nest(stmt, analyzer)
+        pieces = [*pre_stmts, main_stmt, *post_stmts]
+        aliases = _collect_aliases(_seq(pieces))
+        specs = _prepare_segment(axes, serial_axis, pre_stmts, main_stmt, post_stmts, aliases, analyzer, lanes)
+    except Unsupported as err:
+        # 回落路径在这一步就拒绝（典型：并列多 serial 循环 → 「nested serial loop」）时，
+        # 也要把多段路径试过但失败的段级原因带上（缺陷 B），否则只剩一句泛化消息。
+        if notes:
+            raise Unsupported(str(err), diagnostics=[*notes, *(err.diagnostics or [])]) from err
+        raise
+    all_infos = specs.all_infos
+    load_infos = _load_infos(axes, specs.all_specs, analyzer)
+    ranked = rank_vector_axes(axes, specs.main_specs, all_infos, load_infos, analyzer)
+    # 改进 7：先记录每根轴的分类；多段路径试过但失败的原因一并带上（缺陷 B）。
+    diagnostics = [*notes, *_axis_diagnostics(axes, all_infos, load_infos)]
     if not ranked:
         raise Unsupported(
             "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
@@ -1246,27 +1534,59 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorPlan:
     errors: list[str] = []
     for vector_axis in ranked:
         try:
-            plan = _build_plan_for_axis(axes, stores, store_infos, vector_axis, lanes, elem, analyzer)
+            plan = specs.plan_for(vector_axis, analyzer)
         except Unsupported as err:
             note = f"axis '{vector_axis.name}': {err}"
             errors.append(note)
             diagnostics.append(note)
             continue
-        diagnostics.append(f"selected vector axis '{vector_axis.name}' (score={_axis_score(store_infos, load_infos, vector_axis)})")
+        diagnostics.append(f"selected vector axis '{vector_axis.name}' (score={_axis_score(all_infos, load_infos, vector_axis)})")
         plan.diagnostics = diagnostics
-        return plan
+        program = VectorProgram(axes=_outer_axes(plan.axes, plan.vector_axis), segments=[plan])
+        # program 级诊断对单段/多段**恒非空**（对称）：调用方无需区分两条路径，
+        # 也不会出现「多段有摘要、单段恒空」的口径裂缝。
+        program.diagnostics = [f"single-segment program: 1 segment, vector axis '{vector_axis.name}'"]
+        return program
     raise Unsupported("no vectorizable axis: " + "; ".join(errors), diagnostics=diagnostics)
+
+
+def _outer_axes(axes: list[Axis], vector_axis: Axis) -> list[Axis]:
+    """取出可以「提到 program 层只包一次」的轴。
+
+    这是 ``axes`` 的**前缀**：连续的「并行轴且不是向量轴」的轴。取前缀（而不是所有
+    这样的轴）是关键——:func:`_emit_segment_stmts` 会按 ``reversed(axes)`` 包裹剩余的
+    轴，前缀 + 剩余拼接后与「一次包完全部非向量轴」的顺序**逐位相同**；若取的是一组
+    与剩余轴交错的集合，嵌套顺序就会变，而顺序变了是非法的（见 §3.9）。
+    """
+    outer: list[Axis] = []
+    for axis in axes:
+        if axis.var.same_as(vector_axis.var) or not axis.is_parallel:
+            break
+        outer.append(axis)
+    return outer
 
 
 def _build_plan_for_axis(
     axes: list[Axis],
-    stores: list[StoreSpec],
-    store_infos: list[AccessInfo],
+    serial_axis: Axis | None,
+    pre_specs: list[StoreSpec],
+    pre_infos: list[AccessInfo],
+    main_specs: list[StoreSpec],
+    main_infos: list[AccessInfo],
+    post_specs: list[StoreSpec],
+    post_infos: list[AccessInfo],
     vector_axis: Axis,
     lanes: int,
     elem: str,
     analyzer: arith.Analyzer,
 ) -> VectorPlan:
+    # 方案 §6 第二步：当 serial 循环与兄弟语句（pre/post）共存时，只有沿**这根 serial 轴**
+    # 向量化才能把兄弟语句安全地放在 chunk 循环之外；沿外层并行轴向量化尚未支持。
+    if (pre_specs or post_specs) and (serial_axis is None or not vector_axis.var.same_as(serial_axis.var)):
+        raise Unsupported(
+            "a T.Parallel body with sibling statements around a serial loop can only be vectorized along that serial axis (方案 §6 第二步)"
+        )
+
     extent = _const_int(vector_axis.extent)
     chunks = None if extent is None else (extent + lanes - 1) // lanes
     tail = None if extent is None else extent % lanes
@@ -1285,15 +1605,22 @@ def _build_plan_for_axis(
         lanes=lanes,
         chunks=chunks,
         tail=tail,
-        reduce=_detect_reduce(stores, store_infos, vector_axis, analyzer),
+        reduce=_detect_reduce(main_specs, main_infos, vector_axis, analyzer),
     )
 
-    for spec, info in zip(stores, store_infos):
+    def _plan_store(spec, info):
         kind = info.axis_class(vector_axis)[0]
         value = build_value(spec.value, ctx)
         mask = build_value(spec.mask, ctx) if spec.mask is not None else None
         index = index_value(info, ctx) if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT) else None
-        plan.stores.append(StorePlan(spec=spec, access=info, value=value, mask=mask, kind=kind, index=index))
+        return StorePlan(spec=spec, access=info, value=value, mask=mask, kind=kind, index=index)
+
+    for spec, info in zip(main_specs, main_infos):
+        plan.stores.append(_plan_store(spec, info))
+    for spec, info in zip(pre_specs, pre_infos):
+        plan.pre_stores.append(_plan_store(spec, info))
+    for spec, info in zip(post_specs, post_infos):
+        plan.post_stores.append(_plan_store(spec, info))
     return plan
 
 
@@ -1400,9 +1727,10 @@ class _Emitter:
     重设（并清空 ``memo``，因为地址随 chunk 变化）。
     """
 
-    def __init__(self, plan: VectorPlan, chunk: tirx.Var):
+    def __init__(self, plan: VectorPlan, chunk: tirx.Var, prefix: str = ""):
         self.plan = plan
         self.chunk = chunk
+        self.prefix = prefix  # 多段路径下按段命名（``s0_``/``s1_``...），避免跨段重名
         self.lane_base: tirx.PrimExpr = chunk * _int(plan.lanes)
         self.memo: dict = {}
         self.lets: list = []  # chunk 体内的 Bind / Evaluate
@@ -1412,7 +1740,7 @@ class _Emitter:
 
     # -- SSA 绑定 -----------------------------------------------------------
     def bind(self, expr, target: list):
-        var = tirx.Var(f"v{self.counter}", expr.dtype)
+        var = tirx.Var(f"v{self.prefix}{self.counter}", expr.dtype)
         self.counter += 1
         target.append(tirx.Bind(var, expr))
         return var
@@ -1423,7 +1751,7 @@ class _Emitter:
         cached = self._mask_vars.get(bits)
         if cached is not None:
             return cached
-        var = tirx.Var(f"mask{bits}", _MASK_DTYPE)
+        var = tirx.Var(f"mask{self.prefix}{bits}", _MASK_DTYPE)
         self.prologue.append(tirx.Bind(var, simd.pset(bits, "PAT_ALL")))
         self._mask_vars[bits] = var
         return var
@@ -1603,34 +1931,109 @@ def _emit_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
     emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.index_addr(store.access), index, mask)))
 
 
-def emit_plan(plan: VectorPlan) -> tirx.Stmt:
-    """把 :class:`VectorPlan` 发射成 ``T.simd.*`` TIR。
+def _emit_outer_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
+    """发射一条与 serial 循环**同级**的语句（pre/post，方案 §6 第二步）。
+
+    这类语句不含 serial 变量，沿向量轴 ``Δ==0``，因此每个外层迭代只执行一次——
+    发射在 chunk 循环**之外**，用 ``ONEPT`` 单点写（值经 ``vdup`` 广播）。
+    """
+    if store.kind != AccessClass.UNIFORM:
+        raise Unsupported(f"a statement outside the serial loop must be uniform along the vector axis (got {store.kind.value})")
+    elem = _elem_dtype(store.spec.buffer.dtype)
+    bits = _mask_bits(elem)
+    value = emitter.vector_operand(store.value)
+    mask = emitter.value(store.mask) if store.mask is not None else emitter.all_mask(bits)
+    addr = emitter.addr(store.access, uniform=True)
+    emitter.lets.append(tirx.Evaluate(simd.vsts(addr, value, mask, f"ONEPT_B{bits}")))
+
+
+def emit_plan(plan: VectorPlan | VectorProgram) -> tirx.Stmt:
+    """把 :class:`VectorPlan` / :class:`VectorProgram` 发射成 ``T.simd.*`` TIR。
 
     外层非向量轴退化成 serial 循环，向量轴被 strip-mine 成 ``chunk``
     （``for chunk in serial(ceil(E/L))``）；chunk 体内的 SSA 用 ``Bind`` 表达。
     归约（§2 Case II）则把 chunk 循环在编译期展开（见函数级的方案说明）。
+
+    §6 第二步的 ``pre``/``post``（与 serial 循环同级的兄弟语句）沿向量轴均匀，
+    发射在 chunk 循环**之外**，顺序为 ``pre → 主体 → post``。
+
+    :class:`VectorProgram`（1..N 段）逐段发射并保持源码顺序：``program.axes`` 里的轴
+    在**最外层统一包一次**（``chunk`` 变量按段命名区分），各段只包自己剩下的轴。
+    单独发射一个 :class:`VectorPlan`（``hoisted`` 为空）等价于「该段自己包全部轴」，
+    与 :func:`build_plan` 恒返回 program 之前的发射结果**逐节点一致**。
     """
-    chunk = tirx.Var("chunk", "int32")
+    if isinstance(plan, VectorProgram):
+        return _emit_program(plan)
+    prologue, body = _emit_segment_stmts(plan, tirx.Var("chunk", "int32"), hoisted=[])
+    if prologue:
+        return tirx.SeqStmt([*prologue, body])
+    return body
+
+
+def _emit_segment_stmts(plan: VectorPlan, chunk: tirx.Var, *, hoisted: list[Axis], prefix: str = "") -> tuple[list, tirx.Stmt]:
+    """发射**一段** :class:`VectorPlan` 的语句体，返回 ``(prologue, body)``。
+
+    ``prologue`` 是 chunk 无关的掩码绑定（调用方负责提到最前）；``body`` 已按非向量轴
+    包裹成嵌套 serial 循环。``hoisted`` 是**已由调用方提到最外层**的轴（多段 program 的
+    共享并行轴前缀，见 :func:`_outer_axes`）：按**变量身份**跳过它们，而不是笼统跳过所有
+    并行轴——否则当向量轴就是某根外层并行轴时，夹在其后的并行轴会被漏包。
+    """
+    emitter = _Emitter(plan, chunk, prefix)
+
+    for store in plan.pre_stores:  # 前置语句：chunk 循环之前，每个外层迭代一次
+        _emit_outer_store(plan, store, emitter)
+    pre_lets = emitter.lets
+    emitter.lets = []
+
     if plan.reduce is not None:
-        emitter = _emit_reduce(plan, chunk)
+        _emit_reduce(plan, emitter)  # 填 emitter.lets（编译期展开 chunk）
+        main_lets = emitter.lets
+        emitter.lets = []
     else:
-        emitter = _Emitter(plan, chunk)
         for store in plan.stores:
             _emit_store(plan, store, emitter)
-        inner = emitter.lets[0] if len(emitter.lets) == 1 else tirx.SeqStmt(emitter.lets)
-        body = tirx.For(chunk, 0, _int(plan.chunks or 1), tirx.ForKind.SERIAL, inner)
-        for axis in reversed(plan.axes):
-            if axis.var.same_as(plan.vector_axis.var):
-                continue
-            body = tirx.For(axis.var, 0, axis.extent, tirx.ForKind.SERIAL, body)
-        emitter.lets = [body]
+        inner = _seq(emitter.lets)
+        emitter.lets = []
+        main_lets = [tirx.For(chunk, 0, _int(plan.chunks or 1), tirx.ForKind.SERIAL, inner)]
 
-    if emitter.prologue:
-        return tirx.SeqStmt([*emitter.prologue, *emitter.lets])
-    return emitter.lets[0] if len(emitter.lets) == 1 else tirx.SeqStmt(emitter.lets)
+    for store in plan.post_stores:  # 后置语句：chunk 循环之后，每个外层迭代一次
+        _emit_outer_store(plan, store, emitter)
+    post_lets = emitter.lets
+
+    body = _seq([*pre_lets, *main_lets, *post_lets])
+    for axis in reversed(plan.axes):
+        if axis.var.same_as(plan.vector_axis.var):
+            continue
+        if any(axis.var.same_as(h.var) for h in hoisted):
+            continue
+        body = tirx.For(axis.var, 0, axis.extent, tirx.ForKind.SERIAL, body)
+    return emitter.prologue, body
 
 
-def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
+def _emit_program(program: VectorProgram) -> tirx.Stmt:
+    """发射 :class:`VectorProgram`：逐段（源序）发射，``program.axes`` 统一包裹一次。
+
+    ``program.axes`` 必须只是**并行轴的提层前缀**（:func:`_outer_axes` / 多段路径的
+    共享并行轴）：它们既被这里包一次，又被 :func:`_emit_segment_stmts` 按身份跳过；
+    若其中混入了非并行轴或某段的向量轴，就会出现重复包裹 / 漏包，属非法 IR。
+    """
+    assert all(axis.is_parallel for axis in program.axes), "program.axes may only hold hoisted T.Parallel axes"
+    prologue: list = []
+    bodies: list = []
+    for index, segment in enumerate(program.segments):
+        seg_chunk = tirx.Var(f"chunk_s{index}", "int32")
+        seg_prologue, body = _emit_segment_stmts(segment, seg_chunk, hoisted=program.axes, prefix=f"s{index}_")
+        prologue.extend(seg_prologue)
+        bodies.append(body)
+    body = _seq(bodies)
+    for axis in reversed(program.axes):
+        body = tirx.For(axis.var, 0, axis.extent, tirx.ForKind.SERIAL, body)
+    if prologue:
+        return tirx.SeqStmt([*prologue, body])
+    return body
+
+
+def _emit_reduce(plan: VectorPlan, emitter: _Emitter) -> None:
     """归约 store（§2 Case II）：展开 chunk、SSA 串累加器、``ONEPT`` 回写。
 
     先要 ``vcadd/vcmax/vcmin`` 把每个 chunk 压成 lane0 的部分结果，再用
@@ -1638,9 +2041,10 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
     里原有的值（``vld(..., BRC_B{bits})`` 广播）。``extent % lanes != 0`` 时最后
     一个 chunk 是尾块：``update_mask`` 造尾块谓词，``vsel`` 把无效车道填成归约
     单位元（改进 6），再按全 lane 掩码归约。
+
+    结果写回 ``emitter.lets``；外层轴与 ``pre``/``post`` 的包裹交给 :func:`emit_plan`。
     """
     store = next(s for s in plan.stores if s.kind == AccessClass.UNIFORM)
-    emitter = _Emitter(plan, chunk)
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
     mask = emitter.all_mask(bits)
@@ -1675,13 +2079,6 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
     dst = emitter.addr(store.access, uniform=True)
     emitter.lets.append(tirx.Evaluate(simd.vsts(dst, acc, mask, f"ONEPT_B{bits}")))
 
-    for axis in reversed(plan.axes):
-        if axis.var.same_as(plan.vector_axis.var):
-            continue
-        body = emitter.lets[0] if len(emitter.lets) == 1 else tirx.SeqStmt(emitter.lets)
-        emitter.lets = [tirx.For(axis.var, 0, axis.extent, tirx.ForKind.SERIAL, body)]
-    return emitter
-
 
 def _is_accumulate(store: StorePlan) -> bool:
     """``dst = dst op x``（累加写）：存在一个读同一目标 buffer 的 lane 均匀操作数。"""
@@ -1706,20 +2103,42 @@ def _varying_operand(node: ValueNode) -> ValueNode:
     return node
 
 
-def render_plan(plan: VectorPlan) -> str:
-    """人类可读的计划文本（诊断 / 测试断言用）。"""
+def render_plan(plan: VectorPlan | VectorProgram) -> str:
+    """人类可读的计划文本（诊断 / 测试断言用）。
+
+    ``build_plan`` 恒返回 :class:`VectorProgram`，但**1 段 program 与「单段 plan」逐字同形**
+    （级别 1 只统一表示层，不改人类可读输出）：不打印 ``program:`` 头与段标记，program 级
+    摘要并入同一段 ``diagnostics:``。只有多段 program 才打印 ``program:`` 头与逐段标记。
+    """
+    if isinstance(plan, VectorPlan):
+        return _render_single_plan(plan)
+    if len(plan.segments) == 1:
+        return _render_single_plan(plan.segments[0], extra_diagnostics=plan.diagnostics)
+    lines = [f"program: axes={[axis.name for axis in plan.axes]} segments={len(plan.segments)}"]
+    for index, segment in enumerate(plan.segments):
+        lines.append(f"-- segment {index} --")
+        lines.extend(_render_single_plan(segment).splitlines())
+    if plan.diagnostics:
+        lines.append("diagnostics:")
+        lines.extend(f"  {note}" for note in plan.diagnostics)
+    return "\n".join(lines)
+
+
+def _render_single_plan(plan: VectorPlan, extra_diagnostics: tuple[str, ...] = ()) -> str:
     lines = [
         f"vector_axis={plan.vector_axis.name} lanes={plan.lanes} chunks={plan.chunks} tail={plan.tail}",
     ]
     if plan.reduce is not None:
         lines.append(f"reduce(axis={plan.reduce.axis.name}, op={plan.reduce.op} -> {plan.reduce.recipe})")
-    for store in plan.stores:
-        sink = f"{store.spec.buffer.name}{list(store.spec.indices)}"
-        lines.append(f"store {sink} [{store.kind.value}] mask={'yes' if store.mask else 'no'}")
-        _render_value(store.value, lines, 1)
-    if plan.diagnostics:
+    for tag, group in (("pre", plan.pre_stores), ("store", plan.stores), ("post", plan.post_stores)):
+        for store in group:
+            sink = f"{store.spec.buffer.name}{list(store.spec.indices)}"
+            lines.append(f"{tag} {sink} [{store.kind.value}] mask={'yes' if store.mask else 'no'}")
+            _render_value(store.value, lines, 1)
+    if plan.diagnostics or extra_diagnostics:
         lines.append("diagnostics:")
         lines.extend(f"  {note}" for note in plan.diagnostics)
+        lines.extend(f"  {note}" for note in extra_diagnostics)
     return "\n".join(lines)
 
 
@@ -1749,8 +2168,8 @@ def vectorize_parallel_nests(stmt: tirx.Stmt, *, lanes: int | None = None) -> ti
         if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL:
             try:
                 plan = build_plan(node, lanes=lanes)
-                plan_text = render_plan(plan)
-                print(plan_text, "*************************\n\n")
+                # plan_text = render_plan(plan)
+                # print(plan_text, "*************************\n\n")
                 return emit_plan(plan)
             except Unsupported:
                 return None
