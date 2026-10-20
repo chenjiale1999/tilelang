@@ -1,10 +1,9 @@
 # Ascend 统一多面体向量化 —— 设计说明
 
-> **文档定位（对外分享版）**
 >
 > 本文说明一套把 `T.Parallel` 标量循环**统一向量化**的编译分析与发射方案。为了让没有代码仓库访问权限的同事也能完整读懂，本文**自包含**：所有关键算法都附上**伪代码**或**真实实现片段**，无需打开任何源文件。
 >
-> 对应实现是一个约 1300 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 36 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
+> 对应实现是一个约 1670 行的独立 Python 分析模块（下称 `polyhedral.py`）与一组 43 个用例的离线测试。它目前是一个**离线分析原型**：只被自身的测试调用，尚未接入生产编译管线（接入路径见 §5.6）。
 
 ---
 
@@ -96,7 +95,7 @@ polyhedral.py
 ├─ 3. 访问分类           AccessInfo, classify_access
 ├─ 4. body 规范化        StoreSpec, normalize_body, _collect_aliases/_apply_aliases
 ├─ 5. 值 DAG             ValueNode, build_value, broadcast, load_node, _build_call
-├─ 6. 规划               StorePlan, ReduceInfo, VectorPlan, select_vector_axis, build_plan
+├─ 6. 规划               StorePlan, ReduceInfo, VectorPlan, rank_vector_axes, build_plan
 ├─ 7. 发射               _Emitter, emit_plan, _emit_reduce, render_plan
 └─ 8. 语句树变换         vectorize_parallel_nests
 ```
@@ -106,23 +105,25 @@ polyhedral.py
 | 结构 | 含义 | 关键字段 | 产出者 |
 |---|---|---|---|
 | `Axis` | 一根 `T.Parallel` 轴 `0<=var<extent` | `var, extent, index` | `_split_nest` |
-| `AccessClass` | 沿某轴的访存形态（枚举） | `CONTIGUOUS/UNIFORM/STRIDED/NON_AFFINE/INDIRECT` | `classify_delta` |
-| `AccessInfo` | 一次访存 + 逐轴分类 | `buffer, indices, offset, is_store, per_axis, indirect, in_global` | `classify_access` |
+| `AccessClass` | 沿某轴的访存形态（枚举） | `CONTIGUOUS/UNIFORM/STRIDED/PERMUTE/PIECEWISE/INDIRECT/TRUE_RANDOM` | `classify_delta` + `classify_access` |
+| `AccessInfo` | 一次访存 + 逐轴分类 | `buffer, indices, offset, is_store, per_axis, indirect, in_global, reason` | `classify_access` |
 | `StoreSpec` | 一条写 | `buffer, indices, value, mask` | `normalize_body` |
 | `ValueNode` | 值 DAG 节点 | `recipe, dtype, args, access, scalar, detail` | `build_value` |
-| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind` | `build_plan` |
-| `ReduceInfo` | 归约信息 | `axis, op, recipe` | `select_vector_axis` |
-| `VectorPlan` | 最终硬件无关计划 | `axes, vector_axis, lanes, chunks, tail, stores, reduce` | `build_plan` |
+| `StorePlan` | 一条写的完整计划 | `spec, access, value, mask, kind, index` | `build_plan` |
+| `ReduceInfo` | 归约信息 | `axis, op, recipe` | `_detect_reduce` |
+| `VectorPlan` | 最终硬件无关计划 | `axes, vector_axis, lanes, chunks, tail, stores, reduce, diagnostics` | `build_plan` |
 
-其中 `AccessClass` 由 Δ 唯一决定：
+其中 `AccessClass` 分两层判定：Δ 层给常数形态，非常数再做**结构细化**（改进 4）：
 
 | `Δ_v(off)` | `AccessClass` | 后续动作 |
 |---|---|---|
 | `1` | `CONTIGUOUS` | `vld` / `vsts`（NORM） |
 | `0` | `UNIFORM` | 标量读一次 + `vdup` 广播 |
-| `k != 0,1` | `STRIDED` | `vgather2` + 步长索引斜坡 |
-| 非常数 | `NON_AFFINE` | 明确拒绝 |
-| 下标含 `BufferLoad` | `INDIRECT` | 明确拒绝（gather） |
+| `k,\ \|k\|>1` | `STRIDED` | `vgather2` / `vscatter` + 步长索引斜坡 |
+| `-1` | `PERMUTE` | 每 lane 索引向量 → `vgather2` / `vscatter` |
+| 非常数且索引向量可构造 | `PIECEWISE` | 每 lane 索引向量 → `vgather2` / `vscatter` |
+| 下标含 `BufferLoad` | `INDIRECT` | 每 lane 索引向量（来自寄存器）→ `vgather2` / `vscatter` |
+| 非常数且不可构造 | `TRUE_RANDOM` | 明确拒绝 |
 
 ### 2.4 主数据流
 
@@ -133,9 +134,12 @@ build_plan(stmt)
   ├─ _split_nest    ▶ axes[], body                    # SCoP 迭代域
   ├─ _collect_aliases(body)          ▶ {var: expr}    # 标量中间量
   ├─ normalize_body(body, aliases)   ▶ StoreSpec[]    # 控制流 → 线性写列表
-  ├─ select_vector_axis(axes, stores)▶ (vector_axis, store_infos, reduce)
-  ├─ 构造 _ValueContext(axes, vector_axis, lanes, analyzer, vector_dtype)
-  └─ for each store: build_value(spec.value) ▶ ValueNode
+  ├─ rank_vector_axes(axes, stores, store_infos, load_infos) ▶ 轴排行（联合可行性 + 读写加权）
+  ├─ for vector_axis in ranked:                       # 轴回退：逐个尝试
+  │     try: 构造 _ValueContext(axes, vector_axis, lanes, analyzer, vector_dtype)
+  │           for each store: build_value(spec.value) ▶ ValueNode
+  │           ▶ VectorPlan
+  │     except Unsupported: continue
   ▶ VectorPlan
 
 emit_plan(plan)
@@ -199,20 +203,23 @@ def finite_difference(offset, var, analyzer: arith.Analyzer) -> tirx.PrimExpr:
     shifted = tirx.stmt_functor.substitute(offset, {var: var + 1})  # off(var+1)
     return analyzer.simplify(shifted - offset)                      # 再化简一次
 
-def classify_delta(delta) -> tuple[AccessClass, int | None]:
-    """把差分值映射成 AccessClass（唯一的分类规则）。"""
-    value = _const_int(delta)          # 能否求成常数？
-    if value is None: return AccessClass.NON_AFFINE, None   # 折不动 → 非仿射
+def classify_delta(delta, analyzer=None) -> tuple[AccessClass, int | None]:
+    """Δ 层：只分常数 / 非常数（非常数交结构细化层）。"""
+    value = _const_int(delta, analyzer)  # 能否（符号）证明成常数？
+    if value is None: return AccessClass.PIECEWISE, None   # 折不动 → 待结构细化
     if value == 0:    return AccessClass.UNIFORM, 0
     if value == 1:    return AccessClass.CONTIGUOUS, 1
+    if value == -1:   return AccessClass.PERMUTE, -1
     return AccessClass.STRIDED, value
 ```
 
 **差分之后必须再化简一次**：`off` 已化简，但 `off(v+1) - off(v)` 会重新产生 `(v+1)//m*m + (v+1)%m - v` 这类式子，只有再化简才能压回常数。
 
-> **设计精髓**：`_const_int(delta) is None` 把「非仿射」的判定**外包给符号化简器的能力边界**——化简器能折成常数就是仿射，折不动就是非仿射。这是「把语义问题转成符号计算问题」的典型手法，既优雅也有风险：**化简器的行为就是接口契约**（因此 `finite_difference` 前后各 `simplify` 一次）。
+> **设计精髓**：`_const_int(delta) is None` 把「非仿射」的判定**外包给符号化简器的能力边界**——化简器能折成常数就是仿射，折不动就是非常数。这是「把语义问题转成符号计算问题」的典型手法，既优雅也有风险：**化简器的行为就是接口契约**（因此 `finite_difference` 前后各 `simplify` 一次）。
+>
+> `_const_int` 本身也不只认字面量 `IntImm`：给了 `analyzer` 时先 `simplify`，再用 `const_int_bound`——区间是可靠的，因此**上下界相等即证明为常数**，这样「化简后仍是常量表达式」的 Δ 也会被判成常数。
 
-**INDIRECT 是单独的快速分支**：`classify_access` 先检查下标里有没有 `BufferLoad`，有则每根轴都标 `INDIRECT`。因为 `A[B[i]]` 的地址**依赖被装载的值**，写不成 `x` 的仿射函数——即使 `B[i]` 沿 `i` 的 `Δ=1` 也不行。这是多面体模型「表达不了 data-dependent 地址」的硬边界。
+**非常数 Δ 的结构细化（改进 4）**：下标含 `BufferLoad`（`A[B[i]]`）→ `INDIRECT`（索引向量来自被装载的寄存器）；否则用 `index_vector_reason(offset)` 检查元素偏移能否在索引向量通道构造（只允许整数算术；`FloorDiv`/`FloorMod` 除数须为**正的 2 的幂常量**）——可构造 → `PIECEWISE`，不可构造 → `TRUE_RANDOM`（带诊断原因）。`Δ == -1`（`A[N-1-i]`）单独标 `PERMUTE`。三类（`PERMUTE`/`PIECEWISE`/`INDIRECT`）共用同一个「每 lane 索引向量」通道，区别只在诊断标签。
 
 **实现**（访问分类的入口）
 
@@ -224,12 +231,16 @@ def classify_access(buffer, indices, axes, analyzer, *, is_store) -> AccessInfo:
     info = AccessInfo(buffer=buffer, indices=scales, offset=offset,
                       is_store=is_store, indirect=indirect,
                       in_global=buffer.scope() == "global")
+    reason = None if indirect else index_vector_reason(offset, analyzer)
     for axis in axes:
         if indirect:
             info.per_axis[axis.name] = (AccessClass.INDIRECT, None)
             continue
-        info.per_axis[axis.name] = classify_delta(
-            finite_difference(offset, axis.var, analyzer))
+        kind, stride = classify_delta(finite_difference(offset, axis.var, analyzer), analyzer)
+        if kind == AccessClass.PIECEWISE and reason is not None:
+            kind, stride = AccessClass.TRUE_RANDOM, None   # 索引向量构造不出来 → 拒绝
+            info.reason = reason
+        info.per_axis[axis.name] = (kind, stride)
     return info
 ```
 
@@ -308,48 +319,59 @@ def normalize_body(stmt, aliases, out=None, mask=None) -> list[StoreSpec]:
 
 ### 3.4 向量轴选择
 
-`select_vector_axis` 是**纯打分**，无一处匹配代码形状：
+`rank_vector_axes` 是**纯打分 + 轴回退**，无一处匹配代码形状：
 
-1. **候选过滤**：某轴上只要有 store 是 `NON_AFFINE/INDIRECT`，该轴出局。
-2. **打分**：`score = (该轴上 CONTIGUOUS 的访存数) * 10 + axis.index`
-   * `*10` 让「连续访存数」成为主序；
+1. **联合可行性**：某轴上只要有 store 是 `TRUE_RANDOM`，或**所有** store 都写不进去（无候选），该轴出局；`STRIDED`/`PERMUTE`/`PIECEWISE`/`INDIRECT` 的 store 都能进候选（靠 `vscatter`）。
+2. **读写加权**：`score = 100 * Σ store权重 + 10 * Σ load权重 + axis.index`，权重 `CONTIGUOUS=8 > PIECEWISE=4 > STRIDED=PERMUTE=3 > INDIRECT=2 > UNIFORM=1 > TRUE_RANDOM=0`。
+   * `*100 / *10` 让写侧成为主序、读侧次之（避免「写连续、读四处乱跳」的轴被误选）；
    * `+axis.index` 让同分取**更内层**（更内层通常更连续）。
-3. **兜底**：全轴无 store 连续时，若某轴所有 store 都 `UNIFORM`，选它（广播写）。
+3. **轴回退**：返回**排序后的整条轴列表**，`build_plan` 依次尝试；某轴发射失败时自动退到次优轴。
+4. **归约轴**（见 §3.5）始终排在最前。
+
+**为什么"打分"和"回退"分两阶段**：打分只能基于**分析期的形态**（Δ 的分类），但一个轴最终能否发射还取决于**发射期**才能确定的细节——元素偏移能否在「每 lane 索引向量」通道构造出来（如非 2 的幂常量除法就构造不出）、值算子是否有 strength-reduction 等。所以打分只作"优先级"，真正的可行性用 `try/except` 在发射期兜底。
+
+**例：一次真实的轴回退** —— nest 为 `for m in parallel(16): for kk in parallel(12)`，写 `data_shared[m, kk] = select(in_bound, data[m//64, access_h, access_w, kk%4], 0)`，其中 `access_h = m%64//8 + kk//12 - 1`：
+
+| 轴 | 写 `data_shared[m, kk]` | 读 `data[...]` | 打分 |
+|---|---|---|---|
+| `kk`（内） | Δ=1 → `CONTIGUOUS`(8) | 下标含 `kk//12`（÷12 非 2 的幂）→ `TRUE_RANDOM`(0) | 100·8 + 10·0 + 1 = **801** |
+| `m`（外） | Δ=12 → `STRIDED`(3) | `m//8`/`m%8` 可构造 → `STRIDED`(3) | 100·3 + 10·3 + 0 = **330** |
+
+`kk` 因"写连续"拿最高分、被优先尝试；但发射它的读侧需要构造每 lane 索引向量，`kk//12` 的除数 12 不是 2 的幂、构造不出，于是抛 `Unsupported`。规划器捕获后**回退到次优轴 `m`**：写侧 `vscatter`（步长 12 的绝对偏移索引向量）＋读侧步长 4 装载＋谓词 `vsel`＋尾块掩码 `update_mask(16)`，成功发射。诊断完整记录了"分析期排序 → 发射期回退 → 最终结果"：
+
+```text
+axis 'm'[0]:  store=['strided']  load=['strided']      -> candidate (score=330)
+axis 'kk'[1]: store=['contiguous'] load=['true_random'] -> candidate (score=801)
+axis 'kk': FloorDiv by non-power-of-two constant 12 is not strength-reduced yet (§5.4(a))
+selected vector axis 'm' (score=330)
+```
+
+> 这就是"不静默降级、也不轻易整体放弃"：最高分的轴发不出时退到次优轴，只有**所有**轴都发不出才整体拒绝。
 
 **实现**
 
 ```python
-def select_vector_axis(axes, stores, analyzer):
-    store_infos = [classify_access(s.buffer, s.indices, axes, analyzer, is_store=True)
-                   for s in stores]
-    best, best_score = None, -1
+def rank_vector_axes(axes, stores, store_infos, load_infos, analyzer):
+    for axis in axes:                                   # 归约轴优先
+        if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and \
+           any(_value_varies_along(s.value, axis, analyzer) for s in stores):
+            return [axis]
 
-    for axis in axes:                                   # 候选过滤 + 打分
-        if any(info.axis_class(axis)[0] in (AccessClass.NON_AFFINE, AccessClass.INDIRECT)
-               for info in store_infos):
-            continue
-        score = sum(1 for info in store_infos
-                    if info.axis_class(axis)[0] == AccessClass.CONTIGUOUS)
-        if score == 0:
-            continue
-        score = score * 10 + axis.index                 # 同分取更内层
-        if score > best_score:
-            best, best_score = axis, score
-
-    if best is None:                                    # 兜底：全均匀
-        for axis in axes:
-            if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos):
-                best = axis
-                break
-    if best is None:
-        raise Unsupported("no vectorizable axis: every store is non-affine or strided on all axes")
-
-    # 归约检测（见 §3.5），命中时用归约轴覆盖 best
-    ...
-    return best, store_infos, reduce_info
+    ranked = []
+    for axis in axes:
+        if any(info.axis_class(axis)[0] == AccessClass.TRUE_RANDOM for info in store_infos):
+            continue                                    # 写侧不可构造 → 出局
+        if not any(info.axis_class(axis)[0] != AccessClass.TRUE_RANDOM for info in store_infos):
+            continue                                    # 无候选 → 出局
+        score = 100 * sum(_AXIS_WEIGHT[info.axis_class(axis)[0]] for info in store_infos)
+        score += 10 * sum(_AXIS_WEIGHT[info.axis_class(axis)[0]] for info in load_infos)
+        score += axis.index                             # 同分取更内层
+        ranked.append((score, axis))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [axis for _, axis in ranked]                 # 整条列表 → 轴回退
 ```
 
-> 对比：C++ 参考实现里「识别归约」是专门逻辑；这里它只是打分表的一个正交维度——**先选轴，再问这个轴是不是归约轴**。
+> 对比：C++ 参考实现里「识别归约」是专门逻辑；这里它只是打分表的正交维度——**先选轴，再问这个轴是不是归约轴**。
 
 ### 3.5 归约识别
 
@@ -365,7 +387,7 @@ def select_vector_axis(axes, stores, analyzer):
 ```python
 _REDUCE_RECIPE = {"vadd": "vcadd", "vmax": "vcmax", "vmin": "vcmin"}
 
-# 在 select_vector_axis 内：
+# 在 rank_vector_axes 内（见 §3.4）：
 for axis in axes:
     if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
             _value_varies_along(spec.value, axis, analyzer) for spec in stores):
@@ -386,7 +408,8 @@ BufferLoad  → classify_access → load_node：
     Δ=1            → vload（连续装载）
     Δ=0            → uniform_load（标量读一次 + vdup）
     Δ=k            → vload_strided（发射成 vgather2）
-    INDIRECT/非常数 → 拒绝
+    PERMUTE/PIECEWISE/INDIRECT → gather（每 lane 索引向量 → vgather2）
+    TRUE_RANDOM    → 拒绝（带 index_vector_reason 诊断）
 Var         → 向量轴变量 ? lane_index(vci) : imm（外层轴变量 / capture）
 IntImm/FloatImm → imm
 Call        → _build_call（比较 / 布尔 / 二元 / 一元 / if_then_else）
@@ -449,6 +472,7 @@ def _select_node(args, ctx) -> ValueNode:
 | `lane_index` | `vci(lane_base, "int32")` | lane 序号（谓词比较用） |
 | `vload` | `vld(addr, "NORM")` | 连续装载 |
 | `vload_strided` | `vgather2(addr, vmuls(vci(0,u32), k, m), m)` | 步长装载（ramp 当索引） |
+| `gather` | `vgather2(base(BufferLoad 全 0), reinterpret(u32, idx), m)` | 每 lane 索引向量装载（`PERMUTE`/`PIECEWISE`/`INDIRECT`） |
 | `uniform_load`/`uniform_expr`/`vbrc` | `vdup(scalar, elem, mask, MODE_ZEROING)` | 广播 |
 | 数据二元 / 一元 | `vadd/vsub/vmul/... / vneg/vabs/...` | `(a, b, mask, mode)` |
 | 标量-向量 | `vadds/vmuls/vmaxs/vmins` | `(vec, scalar, mask, mode)` |
@@ -456,6 +480,8 @@ def _select_node(args, ctx) -> ValueNode:
 | `vsel` | `vsel(t, f, mask)` | mask 由 `predicate()` 给出 |
 | `pand`/`por`/`pnot` | `pand/por/pnot` | 谓词运算 |
 | `vcvt` | `vcvt(src, target, mask)` | mask bits = `min(src, target)` |
+
+**写入映射（`_emit_store`）**：`CONTIGUOUS`/`UNIFORM` → `vsts(addr, v, mask, "NORM_B{bits}"/"ONEPT_B{bits}")`；`STRIDED` → `vscatter(v, addr(chunk 基址), vmuls(vci(0,u32), k, m), m)`；`PERMUTE`/`PIECEWISE`/`INDIRECT` → `vscatter(v, index_addr（缓冲区起点）, reinterpret(u32, idx), m)`。
 
 **实现（`_Emitter._build` 的代表性分支）**
 
@@ -517,8 +543,12 @@ def _build(self, node: ValueNode):
 ```text
 mask = pset(bits, "PAT_ALL")
 acc  = vdup(identity, elem, mask)               # vadd→0, vmax→-inf, vmin→+inf
+fill = tail ? vdup(identity, elem, mask) : None # 尾块填充寄存器（改进 6）
 for ck in range(chunks):                        # 编译期展开，不是运行时 for！
-    red = vcadd(vld(src_addr(ck), "NORM"), mask) # 跨 lane 归约，结果只在 lane0
+    x = vld(src_addr(ck), "NORM")
+    if tail and ck == last:                                  # 尾块：越界车道填单位元
+        x = vsel(x, fill, update_mask(extent - ck*lanes, bits))
+    red = vcadd(x, mask)                        # 跨 lane 归约，结果只在 lane0
     acc = vadd(acc, red, mask)
 if 累加写: old = vld(dst_addr, "BRC_B{bits}"); acc = vadd(acc, old, mask)
 vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
@@ -526,34 +556,40 @@ vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
 
 **为什么必须编译期展开？**「跨迭代的寄存器值」在纯 SSA（`Bind`，无 PHI / 可变变量）里无法表达——不能写 `acc = acc ...` 引用上一轮。于是把 chunk 循环**在 Python 层展开**，用不同名字的 `vadd` 串起来。这与 C++ pass 的定型方案一致。
 
+**尾块（改进 6）**：`extent % lanes != 0` 时最后一个 chunk 只有 `tail` 个有效车道，其余车道的 `vld` 读到越界/脏数据；用 `update_mask(extent - ck*lanes, bits)` 造尾块谓词、`vsel(x, fill, tail_mask)` 把无效车道替换成**归约单位元**，再按全 lane 掩码归约（`vadd` 填 0、`vmax` 填 -inf、`vmin` 填 +inf 均不影响结果）。这样 `tail != 0` 也能正确发射，不再需要整除前提。
+
 **实现**
 
 ```python
 def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
     store = next(s for s in plan.stores if s.kind == AccessClass.UNIFORM)
-    if plan.tail:
-        raise Unsupported("reduction requires the vector axis extent to be a "
-                          "multiple of the vector width")
     emitter = _Emitter(plan, chunk)
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
     mask = emitter.all_mask(bits)
     recipe = plan.reduce.recipe
     element_op = _REDUCE_ELEMENT[recipe]
+    identity = _reduce_identity(recipe, elem)
 
-    acc = emitter.bind(simd.vdup(_reduce_identity(recipe, elem), elem, mask, _MODE),
-                       emitter.lets)
+    acc = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
+    fill = (emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
+            if plan.tail else None)                 # 尾块填充寄存器（改进 6）
     varying = _varying_operand(store.value)
+    last_chunk = (plan.chunks or 1) - 1
 
-    for ck in range(plan.chunks or 1):          # 编译期展开
-        emitter.lane_base = _int(ck * plan.lanes)
-        emitter.memo = {}                       # 地址随 chunk 变化，缓存按 chunk 失效
-        reduced = emitter.bind(getattr(simd, recipe)(emitter.value(varying), mask, _MODE),
-                               emitter.lets)
-        acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE),
-                           emitter.lets)
+    for ck in range(plan.chunks or 1):              # 编译期展开
+        lane_base = _int(ck * plan.lanes)
+        emitter.lane_base = lane_base
+        emitter.memo = {}                           # 地址随 chunk 变化，缓存按 chunk 失效
+        loaded = emitter.value(varying)
+        if fill is not None and ck == last_chunk:   # 尾块：无效车道填单位元
+            tail_mask = emitter.bind(
+                simd.update_mask(plan.vector_axis.extent - lane_base, bits), emitter.lets)
+            loaded = emitter.bind(simd.vsel(loaded, fill, tail_mask), emitter.lets)
+        reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
+        acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
 
-    if _is_accumulate(store):                   # dst = dst op x：并入目标旧值
+    if _is_accumulate(store):                       # dst = dst op x：并入目标旧值
         old = emitter.bind(simd.vld(emitter.addr(store.access, uniform=True),
                                     f"BRC_B{bits}"), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, old, mask, _MODE), emitter.lets)
@@ -569,7 +605,7 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
 * `_reduce_identity`：`vmax→-FLT_MAX`、`vmin→+FLT_MAX`、`vadd→0`。
 * `_is_accumulate`：DAG 里存在读**同一 buffer** 的 `uniform_load` → 判定为 `dst = dst op x`，末尾用 `BRC` 广播读并入旧值。
 * 归约路径逐 chunk 改 `lane_base` 并**清空 `memo`**（地址随 chunk 变，缓存必须失效）。
-* 归约要求 `tail == 0`（否则 `Unsupported`）。
+* 尾块（改进 6）：`tail != 0` 时用 `update_mask` + `vsel` 把无效车道填成归约单位元，无需整除前提。
 
 ### 3.9 循环重建与遍历策略
 
@@ -595,6 +631,26 @@ def vectorize_parallel_nests(stmt: tirx.Stmt, *, lanes: int | None = None) -> ti
 
 > 若自底向上替换，最内层会先被换成串行代码，外层 `T.Parallel` 反而再也规划不了（`normalize_body` 撞到已发射的 `For`），导致多维嵌套只下降一半、外层 `T.Parallel` 残留。
 
+### 3.10 诊断体系（改进 7）
+
+规划过程**无论成败都收集全部卡点**，而不是只抛第一个原因：
+
+* `_axis_diagnostics` 为每根轴生成一行分类摘要——候选轴给出 `store=/load=` 形态与联合打分；`TRUE_RANDOM` 轴给出 `rejected (true-random store)` 并附带原因（如「非 2 的幂常量除法」）。
+* 成功时这些行连同 `selected vector axis '<name>' (score=...)` 一起写入 `VectorPlan.diagnostics`（可用 `render_plan` 打印）；失败时把同样的行 + 每根轴的发射失败原因塞进 `Unsupported.diagnostics`，而 `str(err)` 仍是单行摘要。
+
+```python
+diagnostics = _axis_diagnostics(axes, store_infos, load_infos)   # 每根轴的分类
+for vector_axis in ranked:                                       # 轴回退
+    try:    plan = _build_plan_for_axis(...)
+    except Unsupported as err:
+        diagnostics.append(f"axis '{vector_axis.name}': {err}")
+        continue
+    diagnostics.append(f"selected vector axis '{vector_axis.name}' (score=...)")
+    plan.diagnostics = diagnostics
+    return plan
+raise Unsupported("no vectorizable axis: ...", diagnostics=diagnostics)
+```
+
 ---
 
 ## 4. 场景支持矩阵
@@ -611,32 +667,39 @@ def vectorize_parallel_nests(stmt: tirx.Stmt, *, lanes: int | None = None) -> ti
 | §1-II | 三元：逐 lane 条件 | 支持 | `vcmp` 逐 lane 谓词 |
 | §2-I | 操作数维度不一致 | 支持 | Δ=0 一侧广播（`vbrc`/`vdup`） |
 | §2-II | 规约（`+=` / `max`） | 支持 | `ReduceInfo` → `vcadd/vcmax/vcmin` |
-| §2-II | 规约 + 尾块（`extent % lanes != 0`） | 部分支持 | 分析通过，**发射**要求整除 |
+| §2-II | 规约 + 尾块（`extent % lanes != 0`） | 支持 | 尾块 `update_mask` + `vsel` 单位元填充（改进 6） |
 | §3-I | 多行语句（连续） | 支持 | `normalize_body` 产出多条 `StoreSpec` |
-| §3-I | 多行语句（末维固定 `[.., k]`） | 部分支持 | 末维固定 → 沿唯一轴 STRIDED → `no vectorizable axis` |
-| §3-II | 复杂标量 + `if_then_else`（im2col） | 拒绝 | 首卡点：值算子 `FloorDiv/FloorMod` 未支持；其次非仿射下标 / GM |
+| §3-I | 多行语句（末维固定 `[.., k]`） | 支持 | 末维固定 → 沿唯一轴 STRIDED → `vscatter` 索引向量写 |
+| §3-II | 复杂标量 + `if_then_else`（im2col） | 部分支持 | 值算子 `FloorDiv/FloorMod` 已对 **2 的幂常量除数**做精确 strength-reduction（`vshrs`/`vand`）；最优（写连续）轴仍可能因**非 2 的幂常量除数**被拒，此时靠**轴回退**（§3.4）退到另一根轴照常向量化 |
 | §4-I | 表达式下标 | 支持（UB）/ 拒绝（GM） | 线性化+化简后连续 / GM 需 staging |
 | §4-II-a | 高维摊平（一维化） | 支持 | 恒等式化简后 Δ=1 |
 | §4-II-a | 步长访问（`a[2*i]`） | 支持 | STRIDED → `vgather2` |
-| §4-II-b | 高维→低维（block-tiled 置换） | 拒绝 | Δ 非常数 → `non-affine access` |
-| §4-gather | 间接下标 `A[B[i]]` | 拒绝 | data-dependent 地址 → `indirect (gather)` |
+| §4-II-b | 高维→低维（block-tiled 置换） | 支持 | Δ 非常数且可构造 → `PIECEWISE` → `vgather2` 索引向量 |
+| §4-II-b | 逆序（`a[N-1-i]`） | 支持 | Δ=-1 → `PERMUTE` → `vgather2` |
+| §4-gather | 间接下标 `A[B[i]]` | 支持 | data-dependent 下标 → `INDIRECT` → `vgather2`（索引来自寄存器） |
+| §4-gather | 无结构下标（`a[i//3]`，非 2 的幂） | 拒绝 | `TRUE_RANDOM` → `not a power of two` |
 | §5 | `T.atomic_add` | 拒绝 | 无「向量+标量」原子配方 |
 | §6 | 嵌套 serial / 跨迭代标量状态 | 拒绝 | `nested ... loop ... is not affine-vectorizable` |
-| — | 数学核心 Δ 分类 | 支持 | 5 个直接单测 |
+| — | 数学核心 Δ 分类 | 支持 | 6 个直接单测 |
 | — | 语句树变换（整段下降） | 支持 | 自顶向下替换 |
+| — | 诊断（改进 7） | 支持 | 成败都收集全部卡点 |
 
 ### 4.1 可复现性
 
-一个场景扫描脚本逐条编码上述场景并打印 `OK/REJECT + 原因`（只做 `build_plan`，不发射）。实测输出（节选）：
+`tmp/drive_plan.py` 逐条编码上述场景并打印 `OK/REJECT + 原因`（`--tir` 时连带打印发射出的 TIR）。实测输出（改进 1+2+3+4+6+7 全部落地后）：
 
 ```text
-§1-II tern(unif)   OK   axes=['i_s2','i_v'] chunks=2 tail=0 vaxis=i_v kinds=['contiguous']
-§2-II reduce       OK   axes=['i','j'] chunks=4 tail=0 reduce=vcadd@j
-§3-I multi         REJECT no vectorizable axis: every store is non-affine or strided on all axes
-§3-II complex(GM)  REJECT unsupported value expression: FloorDiv (m % 16 // 4)
-§4-II-b tiled      REJECT non-affine access with respect to axis 'j': Δ(offset)=... is not a constant
-§6 nested          REJECT nested serial loop inside T.Parallel is not affine-vectorizable
+[OK ] c0_copy  c0_broadcast  c1_ifelse  c1_ternary  c1_single_arm  c2_rank
+[OK ] c2_reduce  c2_reduce_tail（改进6: update_mask+vsel）  c2_axis_pick（改进2: 选轴 i）
+[OK ] c3_multi  c3_scalars  c3_value_pow2（改进3: vshrs+vand）  c3_topk（改进1: vscatter）
+[OK ] c4_flat  c4_strided  c4_reverse（PERMUTE → vgather2）  c4_tiled（PIECEWISE → vgather2）
+[OK ] c_gather（INDIRECT → vgather2）  c3_im2col（改进2: 最优轴 kk 被拒 → 回退到 m）
+[REJ] c6_complex      nested serial loop inside T.Parallel is not affine-vectorizable
+[REJ] c_gm            global-memory operand inside T.Parallel ...
+[REJ] c4_true_random  ... FloorDiv by 3 is not a power of two
 ```
+
+共 **22** 个场景：**19 OK**、**3 拒绝**（嵌套循环 / GM 操作数 / `TRUE_RANDOM`），拒绝用例统一置于列表尾部。
 
 ---
 
@@ -658,7 +721,7 @@ def vectorize_parallel_nests(stmt: tirx.Stmt, *, lanes: int | None = None) -> ti
 
 只有两种情况需要动代码：
 
-1. **引入新的 `AccessClass`**（例如 stride 为负 / 分段仿射）→ 改 `classify_delta`（分类）+ `select_vector_axis`（候选/打分）+ `load_node`（建节点）+ `_build`（发射）。
+1. **引入新的 `AccessClass`**（例如 stride 为负 / 分段仿射）→ 改 `classify_delta`（分类）+ `rank_vector_axes`（候选/打分）+ `load_node`（建节点）+ `_build` / `_emit_store`（发射）。
 2. **引入新的语句形态** → 在 `normalize_body` 加一个分支。
 
 ### 5.3 换发射目标 / 新增硬件指令
@@ -673,11 +736,13 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 | 子特性 | 内容 | 落点 | 成本 / 风险 |
 |---|---|---|---|
-| (a) | `FloorDiv`/`FloorMod` 作**值算子** | `build_value` + `_build`；但 `simd.py` **无整型 `vdiv/vmod`**（`vdiv` 是浮点 SFU，`vcvt` 只有 `ROUND_F`），需新增内建或对常量除数做 strength-reduction（`vmull`+`vshr` 模拟） | 中；精度/边界敏感 |
-| (b) | 非仿射下标 → **gather** | `load_node` 新增 NON_AFFINE 分支 + 逐 lane 索引向量构造（依赖 (a)）。内建已有 `vgather2/vgatherb` | 中偏大 |
+| (a) | `FloorDiv`/`FloorMod` 作**值算子** | **已实现**（`build_value` + `_build`）：`simd.py` **无整型 `vdiv/vmod`**（`vdiv` 是浮点 SFU），故对 **2 的幂常量除数**做精确 strength-reduction——`x//2^k → vshrs(x,k)`、`x%2^k → vand(x, 2^k-1)`。仍缺：非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建） | 中；精度/边界敏感 |
+| (b) | 非仿射 / 间接下标 → **gather / scatter** | **已实现**（改进 1 + 4）：新增「每 lane 索引向量」通道——`index_value` 在整数上下文构造绝对元素偏移，`load_node` 建 `gather` 节点，`_build` 发 `vgather2`、`_emit_store` 发 `vscatter`；`PERMUTE` / `PIECEWISE` / `INDIRECT` 三类共用该通道 | 中；已落地测试 |
 | (c) | 非仿射下标的 **UB staging** | 需**新建一个 pass**：识别非仿射/GM 操作数 → 其前插入 staging copy（UB 分配）→ 改写 nest 内操作数读 staging。会牵动 buffer 分配 / 别名 / 同步 | 大；**接入管线后高风险** |
 
-> (a)(b) 仍在离线原型内，风险低；(c) 一旦接入生产管线风险高——且 im2col 是 **gather**（`vgather2` 成本高），建议先做收益评估。
+> (a) 的 2 的幂路径、(b) 的索引向量通道均已完成并落地测试（离线原型内，风险低）；仍缺 (a) 的 magic-number 分支（非 2 的幂常量除数，需 `vmull`）与 (c)。(c) 一旦接入生产管线风险高——且 im2col 是 **gather**（`vgather2` 成本高），建议先做收益评估。
+>
+> 注：im2col 现已能靠**轴回退**（§3.4）沿外层轴 `m` 向量化成功——上面 (a)/(c) 针对的是「沿写连续轴 `kk` 向量化」这条更优但更难的路径，(a) 的 magic-number 分支正是打通该路径的下一步。
 
 ### 5.5 新增 reduction 算子
 
@@ -697,14 +762,15 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 | 类别 | 局限 | 说明 / 潜在改进 |
 |---|---|---|
-| 归约 | `tail != 0` 不可发射 | 展开式需要整 chunk；尾块归约待支持 |
+| 归约 | 展开式需整 chunk，尾块已用单位元填充 | `tail != 0` 已支持（改进 6）；仍无通用 masked-load |
+| 诊断 | 已有结构化 `diagnostics`（改进 7） | 成功 / 失败都收集全部卡点；尚无机器可读的 error code |
 | 内存域 | GM 操作数拒绝 | 需 UB staging（§5.4(c)） |
-| 值算子 | `FloorDiv`/`FloorMod` 仅作下标 | 作值算子拒绝（§5.4(a)） |
-| 地址 | 非仿射 / 间接拒绝 | 明确不静默降级 |
+| 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)） |
+| 地址 | 仅 `TRUE_RANDOM` 拒绝 | `PERMUTE`/`PIECEWISE`/`INDIRECT` 已走索引向量通道（`vgather2`/`vscatter`）；不可构造的索引明确报错，不静默降级 |
 | 语句 | 发散分支、嵌套 For、atomic 拒绝 | 见 §3.3 |
 | 代码 | `vload.is_uniform` 分支等价于 `False` | `all([])` 坑的防御性写法，可简化 |
 | 代码 | `AccessInfo._uniform` 动态挂属性 | 可提升为 dataclass 字段 |
-| 判定 | `_const_int` 只认 `IntImm` | 不认「化简后仍是常量表达式」的多项式，限制更复杂仿射判定 |
+| 判定 | `_const_int` 已支持符号常量证明 | 传 `analyzer` 时用 `simplify` + `const_int_bound`（上下界相等即常数）；更复杂的可证常量仍受化简器 / 区间分析能力限制 |
 | 模型 | 只做连续性判定，无完整依赖分析 / 调度 | 迭代域已建模，可扩展到依赖 / 调度 |
 
 ---
@@ -712,7 +778,7 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 ## 7. 测试策略
 
 * **离线、与硬件/编译器无关**：每个用例构造 TileLang IR，直接跑 `build_plan` / `emit_plan`，检查 `VectorPlan` 与发射出的 `tl.simd.*` 调用序列。不涉及设备执行。
-* **分组**：数学核心 5 项 + §0–§6 场景 + 语句树变换，共 **36** 个用例。
+* **分组**：数学核心 6 项 + §0–§6 场景 + 诊断 + 语句树变换，共 **43** 个用例。
 * **辅助工具**：
   * `_first_parallel`：取**最外层** `T.Parallel`（后序遍历先出最内层，故取最后一个）。
   * `_emitted_ops`：抽取有序的 `tl.simd.*` op 名。
@@ -728,7 +794,9 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 |---|---|
 | SCoP | Static Control Part，多面体模型里的「静态控制域」（迭代域 + 访存函数） |
 | 有限差分 Δ | `Δ_v(off) = off(v+1) - off(v)`，连续性的唯一判据 |
-| `AccessClass` | 沿某轴的访存形态（连续/均匀/步长/非仿射/间接） |
+| `AccessClass` | 沿某轴的访存形态（连续/均匀/步长/逆序/分片/间接/无结构） |
+| 轴回退 | 按打分排序候选轴后**逐个尝试**发射，某个轴发不出时自动退到次优轴（§3.4） |
+| 每 lane 索引向量 | 元素偏移 `offset(..., v=lane)` 的整数向量，供 `vgather2`/`vscatter` 使用（改进 1） |
 | `recipe` | 值 DAG 节点的原语名（`vload`/`vmuls`/`vsel` ...），发射时查表成 `T.simd.*` |
 | `is_uniform` | 子表达式是否 lane 内均匀（决定标量-向量特化与 `vdup`） |
 | lane | 向量寄存器中的一个元素槽位 |

@@ -17,17 +17,27 @@ Covered contract (one test per catalogued case):
   lane (``vcmp``); a select that is uniform everywhere stays scalar;
 * §2 Case I   operand rank mismatch (``g[i] - g[j]``: broadcast one side);
 * §2 Case II  reduction (``acc[i] += a[i, j]``: dst rank < src), including the
-  ``max`` variant and the "extent % lanes != 0" codegen boundary;
+  ``max`` variant and the "extent % lanes != 0" tail (identity-filled via
+  ``update_mask`` + ``vsel``, 改进 6);
 * §3 Case I   multiple stores in one body; a store that is strided on the only
-  axis is *not* a vector-axis candidate;
+  axis is expressed through the per-lane index-vector channel (``vscatter``);
 * §3 Case II  scalar temporaries (`Bind` aliases) fold into the value DAG;
-  ``FloorDiv`` / ``FloorMod`` as a *value* operator is rejected;
+  ``FloorDiv`` / ``FloorMod`` as a *value* operator strength-reduces to
+  ``vshrs`` / ``vand`` for a power-of-two divisor (and is rejected otherwise);
 * §4 Case I   expression subscript: accepted on UB, rejected on a GM operand;
 * §4 Case II  high-dimensional flattening (``h[i//16, i%16]``), a strided load
-  (``a[2*i]``), and a block-tiled fragment layout (non-affine → rejected);
-* §4 gather   indirect access ``a[b[i]]`` is rejected on the hardware path;
+  (``a[2*i]``), a reversal (``a[N-1-i]`` → ``PERMUTE``), and a block-tiled
+  fragment layout (``PIECEWISE`` → a per-lane ``vgather2``);
+* §4 gather   indirect access ``a[b[i]]`` is expressed through the index-vector
+  channel; a truly structureless index (e.g. ``a[i//3]``) is rejected;
 * §5          ``T.atomic_add`` is rejected (no vector+scalar atomic recipe);
-* §6          a nested serial loop is rejected (no silent downgrade).
+* §6 第一步   a *directly-nested, clean* ``T.serial`` loop is absorbed as an extra
+  candidate axis (S1 copy / predicated, S3 ``s[i] += a[i,j]`` reduction); a serial
+  body with loop-carried state (private scalar accumulator S2, shared scalar S4,
+  stencil cross-iteration read) is *not* absorbed and the whole nest is rejected
+  with "nested serial loop" (no silent downgrade).
+* 改进 7      ``VectorPlan.diagnostics`` records every axis on success;
+  ``Unsupported.diagnostics`` carries the per-axis notes on rejection.
 * transform   ``vectorize_parallel_nests`` lowers a whole multi-axis nest
   (outer axes → serial, vector axis → strip-mined chunks).
 
@@ -50,6 +60,7 @@ from tilelang.ascend.analysis.polyhedral import (
     classify_delta,
     emit_plan,
     finite_difference,
+    render_plan,
     vectorize_parallel_nests,
 )
 
@@ -146,11 +157,29 @@ def test_finite_difference_absorbs_flatten_identity():
     assert classify_delta(finite_difference(flattened, i, analyzer)) == (AccessClass.CONTIGUOUS, 1)
 
 
-def test_finite_difference_rejects_non_affine():
-    """``i*i`` has Δ == 2i+1, not a constant → non-affine (cannot be vectorized)."""
+def test_finite_difference_classifies_non_constant_as_piecewise():
+    """``i*i`` has Δ == 2i+1, not a constant → ``PIECEWISE`` at the Δ layer.
+
+    The Δ layer only decides *constant vs non-constant*; the structural
+    refinement (constructible index vector → ``PIECEWISE`` / ``INDIRECT`` /
+    ``PERMUTE``, otherwise ``TRUE_RANDOM``) happens in
+    :func:`classify_access` (改进 4).
+    """
     analyzer = arith.Analyzer()
     i = tirx.Var("i", "int32")
-    assert classify_delta(finite_difference(i * i, i, analyzer))[0] == AccessClass.NON_AFFINE
+    assert classify_delta(finite_difference(i * i, i, analyzer))[0] == AccessClass.PIECEWISE
+
+
+def test_const_int_proves_constant_beyond_literals():
+    """``Δ`` need not already be a literal ``IntImm``: with an analyzer,
+    ``(i//4 - i//4) + 3`` is *proved* to be the constant 3, so it classifies as
+    ``STRIDED`` with stride 3 instead of falling into ``PIECEWISE``.  Without an
+    analyzer the literal-only path cannot fold it."""
+    analyzer = arith.Analyzer()
+    i = tirx.Var("i", "int32")
+    expr = (tirx.floordiv(i, 4) - tirx.floordiv(i, 4)) + 3
+    assert classify_delta(expr, analyzer) == (AccessClass.STRIDED, 3)
+    assert classify_delta(expr) == (AccessClass.PIECEWISE, None)
 
 
 # ---------------------------------------------------------------------------
@@ -434,9 +463,10 @@ def test_reduction_max_maps_to_vcmax():
     assert "tl.simd.vld" in ops
 
 
-def test_reduction_with_tail_is_a_codegen_boundary():
-    """Analysis accepts the nest, but the reduction expansion unrolls the chunk
-    loop in registers and therefore needs ``extent % lanes == 0``."""
+def test_reduction_with_tail_fills_identity():
+    """``extent % lanes != 0``: the last chunk is a partial tile.  Its inactive
+    lanes read out of range, so they must be replaced by the reduction identity
+    (``update_mask`` + ``vsel``) before the cross-lane reduction (改进 6)."""
     M, K = 4, 32  # K < 64 lanes -> tail != 0
 
     @T.prim_func
@@ -449,8 +479,11 @@ def test_reduction_with_tail_is_a_codegen_boundary():
 
     plan = _plan(k)
     assert plan.reduce is not None and plan.tail == 32
-    with pytest.raises(Unsupported, match="multiple of the vector width"):
-        emit_plan(plan)
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.update_mask" in ops  # 尾块谓词
+    assert "tl.simd.vsel" in ops  # 单位元填充
+    assert "tl.simd.vcadd" in ops  # 跨 lane 归约
+    assert "tl.simd.vsts" in ops  # ONEPT 回写
 
 
 # ---------------------------------------------------------------------------
@@ -478,11 +511,11 @@ def test_multi_store():
     assert _emitted_ops(emit_plan(plan)).count("tl.simd.vsts") == 2
 
 
-def test_store_strided_on_the_only_axis_is_rejected():
-    """§3 Case I as written in the catalogue: ``topk_gates[..., k]`` keeps the
-    trailing index fixed, so the store is *strided* on its single axis and is not
-    a vector-axis candidate.  A single-axis nest with no contiguous store has no
-    vector axis at all → rejected (it is not a broadcast write either)."""
+def test_store_strided_on_the_only_axis_is_scattered():
+    """§3 Case I as written in the catalogue: ``g[i, 0]`` (shape ``(BM, 2)``) keeps
+    the trailing index fixed, so Δ == 2 along the only axis → ``STRIDED``.  Since
+    strided stores are now first-class in the index-vector channel, the axis *is*
+    a candidate and the write is emitted as ``vscatter`` (改进 1)."""
     BM = 64
 
     @T.prim_func
@@ -493,8 +526,11 @@ def test_store_strided_on_the_only_axis_is_rejected():
             for i in T.Parallel(BM):
                 g[i, 0] = mv[i]
 
-    with pytest.raises(Unsupported, match="no vectorizable axis"):
-        _plan(k)
+    plan = _plan(k)
+    assert plan.vector_axis.name == "i"
+    assert plan.stores[0].kind == AccessClass.STRIDED
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vscatter" in ops and "tl.simd.vld" in ops
 
 
 def test_multistore_with_unit_trailing_dim_is_contiguous():
@@ -538,11 +574,11 @@ def test_scalar_alias_folds_into_value():
     assert recipes[0] == "vadds" and recipes[1] == "vmuls"
 
 
-def test_floordiv_value_operator_is_rejected():
-    """§3 Case II complex scalar: ``FloorDiv`` / ``FloorMod`` are handled as
-    *subscript* arithmetic (they flatten affine indices), but they are not in the
-    per-lane value table, so using one as a value operator is rejected rather
-    than mis-emitted."""
+def test_floordiv_value_operator_strength_reduced():
+    """§3 Case II complex scalar: ``FloorDiv`` / ``FloorMod`` used as a *value*
+    operator.  ``i // 4`` is division by ``2^k``, so it strength-reduces to an
+    arithmetic right shift (``vshrs``) and the float store then converts it
+    (``vcvt``) — no integer ``vdiv`` needed."""
     N = 128
 
     @T.prim_func
@@ -553,7 +589,49 @@ def test_floordiv_value_operator_is_rejected():
             for i in T.Parallel(N):
                 c[i] = a[i] + i // 4
 
-    with pytest.raises(Unsupported, match="unsupported value expression"):
+    plan = _plan(k)
+    recipes = _recipes(plan.stores[0].value)
+    assert "vshrs" in recipes and "vcvt" in recipes
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vshrs" in ops and "tl.simd.vcvt" in ops
+
+
+def test_floormod_value_operator_strength_reduced():
+    """``i % 8`` → ``vand(i, 7)``: the two's-complement bitwise-and is exactly
+    ``FloorMod`` for a power-of-two divisor, so a masked ``vdup`` constant feeds
+    the existing vector-vector ``vand``."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "int32"), C: T.Tensor((N,), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "int32")
+            c = T.alloc_shared((N,), "int32")
+            for i in T.Parallel(N):
+                c[i] = a[i] + i % 8
+
+    plan = _plan(k)
+    recipes = _recipes(plan.stores[0].value)
+    assert "vand" in recipes and "vbrc" in recipes
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vand" in ops and "tl.simd.vdup" in ops
+
+
+def test_floordiv_by_non_power_of_two_is_rejected():
+    """A non-power-of-two constant divisor has no exact 32-bit strength reduction
+    (it needs 64-bit ``vmull`` magic numbers), so it is rejected rather than
+    mis-emitted as a shift."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "int32"), C: T.Tensor((N,), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "int32")
+            c = T.alloc_shared((N,), "int32")
+            for i in T.Parallel(N):
+                c[i] = a[i] + i // 3
+
+    with pytest.raises(Unsupported, match="non-power-of-two constant 3"):
         _plan(k)
 
 
@@ -638,11 +716,13 @@ def test_highdim_flatten():
     assert _recipes(plan.stores[0].value).count("vload") == 2
 
 
-def test_block_tiled_fragment_layout_is_non_affine():
+def test_block_tiled_fragment_layout_is_piecewise_gather():
     """§4 Case II block-tiled/store-permute: ``cs[i//MX, j//MY, i%MX, j%MY]`` is
     a *block* permutation of the indices, so ``Δ(offset)`` is not constant even
-    after flattening → non-affine → rejected (it needs an explicit layout
-    transform, not a vectorization recipe)."""
+    after flattening.  MX=MY=4 are powers of two, so the per-lane element offset
+    *is* constructible → ``PIECEWISE`` → the load is emitted as ``vgather2`` with
+    the absolute offset vector (改进 1 + 4), while the contiguous store stays a
+    plain ``vsts``."""
     BM, BN, MX, MY = 16, 16, 4, 4
 
     @T.prim_func
@@ -653,8 +733,12 @@ def test_block_tiled_fragment_layout_is_non_affine():
             for i, j in T.Parallel(BM, BN):
                 c[i, j] = cs[i // MX, j // MY, i % MX, j % MY]
 
-    with pytest.raises(Unsupported, match="non-affine access"):
-        _plan(k)
+    plan = _plan(k)
+    assert plan.stores[0].kind == AccessClass.CONTIGUOUS
+    value = plan.stores[0].value
+    assert value.recipe == "gather" and value.detail == AccessClass.PIECEWISE.value
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vgather2" in ops and "tl.simd.vsts" in ops
 
 
 def test_strided_access():
@@ -675,7 +759,11 @@ def test_strided_access():
     assert "tl.simd.vgather2" in ops
 
 
-def test_gather_rejected():
+def test_indirect_gather_is_expressed():
+    """Indirect access ``a[b[i]]`` has a ``BufferLoad`` inside its index, so the
+    offset cannot be built from the loop axes alone.  It is classified
+    ``INDIRECT`` and emitted as ``vgather2`` whose index register is the loaded
+    per-lane ``b[i]`` vector (改进 1)."""
     N = 128
 
     @T.prim_func
@@ -687,8 +775,93 @@ def test_gather_rejected():
             for i in T.Parallel(N):
                 c[i] = a[b[i]]
 
-    with pytest.raises(Unsupported, match="indirect \\(gather\\)"):
+    plan = _plan(k)
+    value = plan.stores[0].value
+    assert value.recipe == "gather" and value.detail == AccessClass.INDIRECT.value
+    assert "tl.simd.vgather2" in _emitted_ops(emit_plan(plan))
+
+
+def test_reversal_is_permute_gather():
+    """``a[N - 1 - i]`` has Δ == -1 along ``i``: a bijective reversal, not a
+    stride.  It is classified ``PERMUTE`` and lowered through the same per-lane
+    index-vector channel (改进 1 + 4)."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[N - 1 - i]
+
+    plan = _plan(k)
+    value = plan.stores[0].value
+    assert value.recipe == "gather" and value.detail == AccessClass.PERMUTE.value
+    assert "tl.simd.vgather2" in _emitted_ops(emit_plan(plan))
+
+
+def test_true_random_access_is_rejected():
+    """``a[i // 3]`` has a non-constant Δ with a *non*-power-of-two divisor, so its
+    per-lane element offset cannot be built in the index-vector channel (改进 4:
+    ``TRUE_RANDOM``); the vectorizer must reject rather than silently degrade."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[i // 3]
+
+    with pytest.raises(Unsupported, match="not a power of two"):
         _plan(k)
+
+
+# ---------------------------------------------------------------------------
+# 改进 7: diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_list_every_candidate_axis_on_success():
+    """A successful plan still records *every* axis' classification plus which one
+    won, so a caller can see the full decision without re-deriving it (改进 7)."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N, N), "float32"), C: T.Tensor((N, N), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N, N), "float32")
+            c = T.alloc_shared((N, N), "float32")
+            for i, j in T.Parallel(N, N):
+                c[i, j] = a[i, j]
+
+    plan = _plan(k)
+    assert any(line.startswith("axis 'i'") for line in plan.diagnostics)
+    assert any(line.startswith("axis 'j'") for line in plan.diagnostics)
+    assert any(line.startswith("selected vector axis") for line in plan.diagnostics)
+    assert "diagnostics:" in render_plan(plan)
+
+
+def test_diagnostics_are_attached_to_a_rejection():
+    """When no axis works, the raised ``Unsupported`` carries the per-axis notes
+    (改进 7), not just a single flattened reason."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i // 3] = a[i]  # the *store* index is not constructible
+
+    with pytest.raises(Unsupported) as excinfo:
+        _plan(k)
+    notes = excinfo.value.diagnostics
+    assert any("true-random store" in note for note in notes)
+    assert any("not a power of two" in note for note in notes)
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +899,136 @@ def test_nested_loop_rejected():
                     if a[tm, g_i] != 0.0:
                         cnt[0] += 1
                         c[tm, g_i] = a[tm, g_i]
+
+    with pytest.raises(Unsupported, match="nested serial loop"):
+        _plan(k)
+
+
+# ---------------------------------------------------------------------------
+# §6 第一步：直接内嵌、干净的 T.serial 循环被吸收成额外候选轴（S1 / S3）
+# ---------------------------------------------------------------------------
+
+
+def test_direct_serial_copy_absorbed():
+    """S1：``for i in P: for j in serial: c[i,j] = a[i,j]*2``。serial 体无循环携带
+    依赖 → j 被吸收为候选轴；写沿 j 连续 → 选 j 向量化（连续 vld/vmuls/vsts）。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    plan = _plan(k)
+    assert plan.vector_axis.name == "j"
+    assert [ax.name for ax in plan.axes] == ["i", "j"]
+    assert all(not ax.is_parallel for ax in plan.axes if ax.name == "j")
+    assert plan.stores[0].kind.value == "contiguous"
+    assert plan.reduce is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
+
+
+def test_direct_serial_predicated_absorbed():
+    """S1 + 谓词：serial 体内的 ``if`` 降成谓词化 store，掩码沿 serial 向量轴逐 lane 变化。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    if a[i, j] != 0.0:
+                        c[i, j] = a[i, j]
+
+    plan = _plan(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.stores[0].mask is not None
+    assert "tl.simd.vcmps" in _emitted_ops(emit_plan(plan))
+
+
+def test_direct_serial_reduction_absorbed():
+    """S3：``for i in P: for j in serial: s[i] += a[i,j]``。沿 j 的累积归约是合法的
+    循环携带依赖（同址自读）→ j 被吸收并选为向量轴，走 vcadd 跨 lane 归约。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] += a[i, j]
+
+    plan = _plan(k)
+    assert plan.vector_axis.name == "j"
+    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
+
+
+def test_serial_private_scalar_rejected():
+    """S2 边界：迭代私有**标量**累加器。``acc``(local.var) 的 init/store 把 serial 循环
+    夹在中间，不是"直接内嵌"；且从 SCoP 看 acc[0] 是 lane 均匀的共享标量（与 S4 同形）。
+    → 拒绝吸收，退回 "nested serial loop" 明确拒绝。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                acc = T.alloc_var("float32")
+                acc = 0.0
+                for j in T.serial(KS):
+                    acc += a[i, j]
+                c[i] = acc
+
+    with pytest.raises(Unsupported, match="nested serial loop"):
+        _plan(k)
+
+
+def test_serial_shared_scalar_rejected():
+    """S4 边界：归约到**共享标量** ``cnt[0] += 1``。目的地址沿 serial 轴不变、且取值
+    不随轴变化（不是合法归约）→ 拒绝吸收。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            cnt = T.alloc_shared((1,), "int32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    if a[i, j] != 0.0:
+                        cnt[0] += 1
+                        c[i, j] = a[i, j]
+
+    with pytest.raises(Unsupported, match="nested serial loop"):
+        _plan(k)
+
+
+def test_serial_stencil_rejected():
+    """边界：serial 体内的跨迭代读（stencil ``c[i,j-1]``）不是累积自读 → 拒绝吸收。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = c[i, j - 1] + a[i, j]
 
     with pytest.raises(Unsupported, match="nested serial loop"):
         _plan(k)

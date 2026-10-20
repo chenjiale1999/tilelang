@@ -22,14 +22,16 @@ by ``vectorize_parallel_to_pto.cc`` with a single mathematical analysis:
   **有限差分** ``Δ_v(off) = off(..., x_v + 1, ...) - off(...)``
   （:func:`finite_difference`）。符号化简后：
 
-  ============ ==================================================
-  ``Δ_v(off)`` 含义 / 后续动作
-  ============ ==================================================
-  ``1``        连续 → ``vld`` / ``vsts``（NORM）
-  ``0``        lane 内均匀 → 标量读一次 + ``vdup`` 广播
-  ``k != 0,1`` 带步长 → ``vgather2`` + 步长索引斜坡
-  非常数       非仿射 → 明确拒绝（间接下标同理）
-  ============ ==================================================
+  ================ ==================================================
+  ``Δ_v(off)``     含义 / 后续动作
+  ================ ==================================================
+  ``1``            连续 → ``vld`` / ``vsts``（NORM）
+  ``0``            lane 内均匀 → 标量读一次 + ``vdup`` 广播
+  ``k, |k| > 1``   常量步长 → ``vgather2`` / ``vscatter``（步长斜坡）
+  ``-1``           逆序置换（PERMUTE）→ 每 lane 索引向量
+  非常数           PIECEWISE / INDIRECT → 每 lane 索引向量（gather/scatter）
+  非常数且不可构造   TRUE_RANDOM → 明确拒绝
+  ================ ==================================================
 
   这条规则同时吃掉了几何上完全不同的场景，无需分别写分支：
 
@@ -37,7 +39,8 @@ by ``vectorize_parallel_to_pto.cc`` with a single mathematical analysis:
   * ``g[1, 8+i_s, 3]``（§4 表达式下标）
   * ``h[i//16, i%16]``（§4 高维摊平——化简后 ``Δ == 1``）
   * ``d[i,j] = g[i] - g[j]``（§2 维度不一致：``g[i]`` 沿 j 是 ``Δ == 0``）
-  * ``a[b[i]]``（下标含 ``BufferLoad`` → 非常数 → gather）
+  * ``cs[i//4, j//4, i%4, j%4]``（§4 分块置换：非常数 Δ → ``PIECEWISE`` 索引向量）
+  * ``a[b[i]]``（下标含 ``BufferLoad`` → ``INDIRECT`` → 索引向量来自寄存器）
 
   推导见 ``finite_difference`` 与 ``classify_delta`` 的注释。
 
@@ -170,7 +173,16 @@ def _for_kind_name(kind) -> str:
 
 
 class Unsupported(Exception):
-    """Raised when a nest cannot be vectorized; carries the diagnostic reason."""
+    """Raised when a nest cannot be vectorized; carries the diagnostic reason(s).
+
+    ``diagnostics`` 收集本次规划过程中**全部卡点**（每根候选轴的分类摘要与失败
+    原因），这样上层能一次性看到所有阻碍，而不是只拿到第一个失败原因（改进 7）。
+    :func:`build_plan` 会填充它；直接 ``str(err)`` 仍然是单行摘要。
+    """
+
+    def __init__(self, message: str, *, diagnostics: list[str] | None = None):
+        super().__init__(message)
+        self.diagnostics: list[str] = list(diagnostics or [])
 
 
 # ---------------------------------------------------------------------------
@@ -180,25 +192,60 @@ class Unsupported(Exception):
 
 @dataclass(frozen=True)
 class Axis:
-    """一根 ``T.Parallel`` 轴：``0 <= var < extent``。"""
+    """一根迭代轴：``0 <= var < extent``。
+
+    ``kind`` 区分 ``T.Parallel`` 轴与 ``T.serial`` 轴：**直接内嵌且干净**的 serial
+    循环也会被吸收进迭代域（见 :func:`_split_nest` / :func:`_serial_is_clean`），
+    因此它同样是一根候选向量轴。
+    """
 
     var: tirx.Var
     extent: tirx.PrimExpr
     index: int = 0  # 轴在嵌套中的位置，0 为最外层
+    kind: tirx.ForKind = tirx.ForKind.PARALLEL  # PARALLEL 轴 / 被吸收的 SERIAL 轴
 
     @property
     def name(self) -> str:
         return self.var.name
 
+    @property
+    def is_parallel(self) -> bool:
+        return self.kind == tirx.ForKind.PARALLEL
+
 
 class AccessClass(str, enum.Enum):
-    """沿某根轴的访存形态，由 :func:`classify_delta` 唯一决定。"""
+    """沿某根轴的访存形态。
+
+    常数 Δ 的形态由 :func:`classify_delta` 唯一决定；**非常数 Δ** 再经
+    :func:`classify_access` 做结构细化（改进 4），把原先含糊的 ``NON_AFFINE``
+    拆成三个可区分的标签：
+
+    * :attr:`PIECEWISE` —— Δ 非常数，但元素偏移可以在「每 lane 索引向量」通道里
+      构造出来（仿射 + 2 的幂 ``FloorDiv`` / ``FloorMod`` + 整数算术）→ 走
+      ``vgather2`` / ``vscatter``；
+    * :attr:`PERMUTE` —— Δ == -1，即沿该轴的**双射逆序**（置换而非步长访问）→ 同样
+      走索引向量通道；
+    * :attr:`TRUE_RANDOM` —— Δ 非常数且索引向量**构造不出来**（如非 2 的幂常量除法、
+      数据相关的下标）→ 明确拒绝，不做静默降级。
+    """
 
     CONTIGUOUS = "contiguous"  # Δ == 1
     UNIFORM = "uniform"  # Δ == 0
-    STRIDED = "strided"  # Δ == k, k != 0, 1
-    NON_AFFINE = "non_affine"  # Δ 不是常数（含间接下标）
+    STRIDED = "strided"  # Δ == k, |k| > 1（常量步长访问）
+    PERMUTE = "permute"  # Δ == -1（双射逆序，置换）
+    PIECEWISE = "piecewise"  # Δ 非常数，但可在索引向量通道构造
     INDIRECT = "indirect"  # 下标本身含 BufferLoad（gather/scatter）
+    TRUE_RANDOM = "true_random"  # Δ 非常数且不可构造 → 拒绝
+
+    @property
+    def is_index_vector(self) -> bool:
+        """是否必须由「每 lane 索引向量」通道发射（gather/scatter）。"""
+        return self in (
+            AccessClass.STRIDED,
+            AccessClass.PERMUTE,
+            AccessClass.PIECEWISE,
+            AccessClass.INDIRECT,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +253,25 @@ class AccessClass(str, enum.Enum):
 # ---------------------------------------------------------------------------
 
 
-def _const_int(expr) -> int | None:
+def _const_int(expr, analyzer: arith.Analyzer | None = None) -> int | None:
+    """把表达式识别成整型常数。
+
+    先吃显式常量（``IntImm`` / Python ``int``）。给了 ``analyzer`` 时再退到
+    符号判定：先 ``simplify`` 折叠（能折成 ``IntImm`` 即可），否则用
+    ``const_int_bound`` —— 它的区间是可靠的，因此**上下界相等即证明为常数**。
+    这就把「化简后仍是常量表达式」的输入也认成常数，而不只认字面量。
+    """
     if isinstance(expr, tirx.IntImm):
         return int(expr.value)
     if isinstance(expr, int) and not isinstance(expr, bool):
         return int(expr)
+    if analyzer is not None:
+        simplified = analyzer.simplify(expr)
+        if isinstance(simplified, tirx.IntImm):
+            return int(simplified.value)
+        bound = analyzer.const_int_bound(simplified)
+        if bound.min_value == bound.max_value:
+            return int(bound.min_value)
     return None
 
 
@@ -269,16 +330,80 @@ def finite_difference(offset: tirx.PrimExpr, var: tirx.Var, analyzer: arith.Anal
     return analyzer.simplify(shifted - offset)
 
 
-def classify_delta(delta: tirx.PrimExpr) -> tuple[AccessClass, int | None]:
-    """把差分值映射成 :class:`AccessClass`（唯一的分类规则）。"""
-    value = _const_int(delta)
+def classify_delta(delta: tirx.PrimExpr, analyzer: arith.Analyzer | None = None) -> tuple[AccessClass, int | None]:
+    """把差分值映射成 :class:`AccessClass`（Δ 层的分类规则）。
+
+    传入 ``analyzer`` 时，"是否常数" 的判定交给 :func:`_const_int` 做符号证明，
+    而不再只认字面量 ``IntImm``。
+
+    Δ 层只能给出常数情形（``UNIFORM`` / ``CONTIGUOUS`` / ``STRIDED`` / ``PERMUTE``）；
+    **非常数** Δ 在这里统一落到 :attr:`AccessClass.PIECEWISE`（"待结构细化"），
+    真正的 ``PIECEWISE`` / ``INDIRECT`` / ``TRUE_RANDOM`` 三选一由
+    :func:`classify_access` 依据元素偏移能否在索引向量通道构造来定（改进 4）。
+    """
+    value = _const_int(delta, analyzer)
     if value is None:
-        return AccessClass.NON_AFFINE, None
+        return AccessClass.PIECEWISE, None
     if value == 0:
         return AccessClass.UNIFORM, 0
     if value == 1:
         return AccessClass.CONTIGUOUS, 1
+    if value == -1:
+        return AccessClass.PERMUTE, -1
     return AccessClass.STRIDED, value
+
+
+# 索引向量通道允许的整数算子（``FloorDiv`` / ``FloorMod`` 另有「2 的幂」约束）。
+_INDEX_VALUE_OPS = {
+    "Var",
+    "IntImm",
+    "Add",
+    "Sub",
+    "Mul",
+    "FloorDiv",
+    "FloorMod",
+    "Cast",
+    "Min",
+    "Max",
+    "Neg",
+    "BitwiseAnd",
+    "BitwiseOr",
+    "BitwiseXor",
+    "ShiftLeft",
+    "ShiftRight",
+}
+
+
+def index_vector_reason(expr, analyzer: arith.Analyzer | None = None) -> str | None:
+    """判断元素偏移 ``expr`` 能否在「每 lane 索引向量」通道里构造出来。
+
+    能构造则返回 ``None``；否则返回一句诊断原因（改进 4 的 ``TRUE_RANDOM`` 依据）。
+    通道的构造能力 = 索引值 DAG 的构造能力（:func:`build_value` 的整数子集）：
+
+    * 只允许整数算术（仿射 + ``Min`` / ``Max`` / 位运算）；
+    * ``FloorDiv`` / ``FloorMod`` 只允许 **正的 2 的幂常量** 除数（与值算子
+      strength-reduction 一致，见 :func:`_floordiv_mod`）；
+    * 不允许任何 ``BufferLoad``（那是 :attr:`AccessClass.INDIRECT`，另走一条路）。
+    """
+    reason = []
+
+    def visit(node):
+        name = type(node).__name__
+        if isinstance(node, tirx.BufferLoad):
+            reason.append("index contains a BufferLoad")
+            return
+        if name in ("FloorDiv", "FloorMod"):
+            divisor = _const_int(node.b, analyzer)
+            if divisor is None:
+                reason.append(f"{name} needs a compile-time constant divisor (got {node.b})")
+            elif divisor <= 0 or (divisor & (divisor - 1)):
+                reason.append(f"{name} by {divisor} is not a power of two")
+            return
+        if name not in _INDEX_VALUE_OPS:
+            reason.append(f"unsupported index operator {name}")
+
+    tirx.stmt_functor.post_order_visit(expr, visit)
+    return reason[0] if reason else None
 
 
 def _contains_buffer_load(expr) -> bool:
@@ -319,9 +444,10 @@ class AccessInfo:
     per_axis: dict = field(default_factory=dict)  # var.name -> (AccessClass, stride)
     indirect: bool = False
     in_global: bool = False
+    reason: str = ""  # 非常数 Δ 无法构造索引向量时的诊断原因（改进 4）
 
     def axis_class(self, axis: Axis) -> tuple[AccessClass, int | None]:
-        return self.per_axis.get(axis.name, (AccessClass.NON_AFFINE, None))
+        return self.per_axis.get(axis.name, (AccessClass.TRUE_RANDOM, None))
 
 
 def classify_access(
@@ -332,12 +458,18 @@ def classify_access(
     *,
     is_store: bool,
 ) -> AccessInfo:
-    """构造访问的仿射模型并逐轴分类。
+    """构造访问的仿射模型并逐轴分类（改进 1 + 4）。
 
-    分歧点只有一个：``Δ_v`` 的取值。间接下标（``A[B[i]]``）在下标含
-    ``BufferLoad`` 时直接判为 INDIRECT —— 它的地址依赖「被装载的值」，
-    多面体模型无法表达成 ``x`` 的仿射函数（见方案 §8.2：数组层可表达、
-    硬件层明确拒绝）。
+    Δ 层给出常数形态；非常数 Δ 再做一次**结构判定**：
+
+    * 下标含 ``BufferLoad``（``A[B[i]]``）→ :attr:`AccessClass.INDIRECT`，
+      索引向量来自被装载的寄存器；
+    * 否则尝试在索引向量通道构造元素偏移（:func:`index_vector_reason`）：
+      可构造 → :attr:`AccessClass.PIECEWISE`（分块置换/高维摊平等）；不可构造 →
+      :attr:`AccessClass.TRUE_RANDOM`（如非 2 的幂常量除法、数据相关下标）。
+
+    三类都由同一个「每 lane 索引向量」通道发射成 ``vgather2`` / ``vscatter``，
+    区别只在诊断标签。
     """
     scales = tuple(indices)
     indirect = any(_contains_buffer_load(index) for index in scales)
@@ -350,11 +482,18 @@ def classify_access(
         indirect=indirect,
         in_global=buffer.scope() == "global",
     )
+    piecewise_reason = None if indirect else index_vector_reason(offset, analyzer)
     for axis in axes:
         if indirect:
             info.per_axis[axis.name] = (AccessClass.INDIRECT, None)
             continue
-        info.per_axis[axis.name] = classify_delta(finite_difference(offset, axis.var, analyzer))
+        delta = finite_difference(offset, axis.var, analyzer)
+        kind, stride = classify_delta(delta, analyzer)
+        if kind == AccessClass.PIECEWISE and piecewise_reason is not None:
+            # Δ 非常数，但索引向量通道构造不出来 → 真正的"无结构"访问。
+            kind, stride = AccessClass.TRUE_RANDOM, None
+            info.reason = piecewise_reason
+        info.per_axis[axis.name] = (kind, stride)
     return info
 
 
@@ -423,7 +562,8 @@ def normalize_body(
     * ``BufferStore`` → 一条写；
     * ``IfThenElse`` 单臂 → 谓词化写（``mask &= cond``）；
     * ``IfThenElse`` 双臂且两臂写同一位置 → 合并成 ``select(cond, a, b)``；
-    * 其它（内层 serial loop、原子调用、跨迭代标量状态）→ 明确拒绝。
+    * 其它（**非直接内嵌 / 不干净**的内层 serial loop、原子调用、跨迭代标量状态）
+      → 明确拒绝（干净的 serial 循环已在 :func:`_split_nest` 里被吸收成轴）。
     """
     result: list[StoreSpec] = [] if out is None else out
 
@@ -476,7 +616,10 @@ def normalize_body(
         raise Unsupported("divergent branch arms: an if/else whose arms write different locations cannot be vectorized (方案 §8.1)")
 
     if isinstance(stmt, tirx.For):
-        raise Unsupported(f"nested {_for_kind_name(stmt.kind)} loop inside T.Parallel is not affine-vectorizable (方案 §6)")
+        raise Unsupported(
+            f"nested {_for_kind_name(stmt.kind)} loop inside T.Parallel is not affine-vectorizable "
+            "(方案 §6): only directly-nested, dependence-free serial loops are absorbed as axes"
+        )
 
     if type(stmt).__name__ == "Bind":
         return result
@@ -587,6 +730,8 @@ def build_value(expr, ctx: _ValueContext, is_global_ok: bool = False) -> ValueNo
 
     node_name = type(expr).__name__
     name_l = node_name.lower()
+    if node_name in ("FloorDiv", "FloorMod") and _arity(expr) == 2:
+        return _floordiv_mod(node_name, expr, ctx, is_global_ok)
     if name_l in _COMPARE_PRED and _arity(expr) == 2:
         args = [build_value(expr.a, ctx, is_global_ok), build_value(expr.b, ctx, is_global_ok)]
         return _compare(args, _COMPARE_PRED[name_l], ctx, expr)
@@ -691,8 +836,74 @@ def broadcast(node: ValueNode, ctx: _ValueContext) -> ValueNode:
     return ValueNode("vbrc", ctx.vector_dtype, [node], detail="broadcast uniform")
 
 
+def _floordiv_mod(node_name: str, expr, ctx: _ValueContext, is_global_ok: bool) -> ValueNode:
+    """``FloorDiv`` / ``FloorMod`` 作*值*算子（方案 §5.4(a)）。
+
+    SIMD 层没有整型 ``vdiv`` / ``vmod``（``vdiv`` 是浮点 SFU），所以对**2 的幂**
+    常量除数做精确的 strength-reduction：
+
+    * ``x // 2^k`` → ``vshrs(x, k)``：算术右移对负数即向下取整，与 ``FloorDiv`` 同义；
+    * ``x % 2^k`` → ``vand(x, 2^k - 1)``：补码按位与正好给出非负余数，与 ``FloorMod`` 同义。
+
+    非 2 的幂常量除数尚未做 magic-number 化简（需 64 位中间量 ``vmull``），
+    非常量除数需要硬件整型除法内建——两者都**明确拒绝**而不静默降级。
+    两侧都 lane 均匀时整式退化成一个标量，不产生向量指令。
+    """
+    numer = build_value(expr.a, ctx, is_global_ok)
+    denom = build_value(expr.b, ctx, is_global_ok)
+    if numer.is_uniform and denom.is_uniform:
+        return _uniform(expr)
+
+    divisor = _const_int(expr.b, ctx.analyzer)
+    if divisor is None or divisor <= 0 or not denom.is_uniform:
+        raise Unsupported(f"{node_name} as a value operator needs a positive compile-time constant divisor (got {expr.b})")
+    if divisor & (divisor - 1):
+        raise Unsupported(
+            f"{node_name} by non-power-of-two constant {divisor} is not strength-reduced yet: "
+            "the SIMD layer has no integer vdiv/vmod (方案 §5.4(a))"
+        )
+
+    elem = _elem_dtype(numer.dtype)
+    if divisor == 1:
+        if node_name == "FloorDiv":
+            return numer
+        return ValueNode("imm", elem, scalar=tirx.IntImm(elem, 0))
+    if node_name == "FloorDiv":
+        shift = divisor.bit_length() - 1
+        return ValueNode("vshrs", _vec_dtype(elem), [numer], scalar=tirx.IntImm("int32", shift), detail=f"//{divisor}")
+    remainder = ValueNode("imm", elem, scalar=tirx.IntImm(elem, divisor - 1))
+    mask_vec = ValueNode("vbrc", _vec_dtype(elem), [remainder], detail="broadcast uniform")
+    return ValueNode("vand", _vec_dtype(elem), [numer, mask_vec], detail=f"%{divisor}")
+
+
+def index_value(info: AccessInfo, ctx: _ValueContext) -> ValueNode:
+    """把一次访存的**绝对元素偏移**构造成整数索引向量（改进 1 的通道）。
+
+    直接在整数上下文里对 ``info.offset`` 做 :func:`build_value`：向量轴变量会落到
+    ``lane_index``（``vci(lane_base)`` = 该 chunk 的 lane 绝对值），外层轴变量落到
+    lane 内均匀的 ``imm``。于是得到的向量就是 ``offset(..., v = lane_base + lane, ...)``，
+    即每 lane 的元素偏移——正好是 ``vgather2`` / ``vscatter`` 需要的索引寄存器。
+
+    ``info.offset`` 已经过 :func:`index_vector_reason` 校验（非常数 Δ 且可构造），
+    因此这里不会撞上非 2 的幂除法或数据相关下标。
+    """
+    index_ctx = _ValueContext(
+        axes=ctx.axes,
+        vector_axis=ctx.vector_axis,
+        lanes=ctx.lanes,
+        analyzer=ctx.analyzer,
+        vector_dtype=_vec_dtype("int32"),
+    )
+    return build_value(info.offset, index_ctx)
+
+
 def load_node(info: AccessInfo, ctx: _ValueContext, is_global_ok: bool) -> ValueNode:
-    """把一次已分类的访问变成值节点（连续/广播/步长/间接）。"""
+    """把一次已分类的访问变成值节点（连续/广播/步长/置换/分片/间接）。
+
+    常数 Δ 走连续 / 广播 / 步长；非常数 Δ 与间接下标统一走**每 lane 索引向量**
+    通道（:attr:`AccessClass.is_index_vector`），发射成 ``vgather2``。真正无结构的
+    ``TRUE_RANDOM`` 明确拒绝并带上 :func:`index_vector_reason` 的诊断。
+    """
     if info.in_global and not is_global_ok:
         raise Unsupported(
             "global-memory operand inside T.Parallel (方案 §0 Case II): needs an explicit UB staging copy before the parallel nest"
@@ -705,14 +916,11 @@ def load_node(info: AccessInfo, ctx: _ValueContext, is_global_ok: bool) -> Value
         return ValueNode("uniform_load", _dtype_of_scalar(info), access=info, detail="lane-uniform")
     if kind == AccessClass.STRIDED:
         return ValueNode("vload_strided", ctx.vector_dtype, access=info, detail=f"stride={stride}")
-    if kind == AccessClass.INDIRECT:
-        raise Unsupported(
-            "indirect (gather) access A[B[i]] (方案 §8.2): expressed in the array IR but "
-            "rejected on the hardware path — no gather recipe at this stage"
-        )
+    if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT):
+        return ValueNode("gather", ctx.vector_dtype, [index_value(info, ctx)], access=info, detail=kind.value)
     raise Unsupported(
         f"non-affine access with respect to axis '{ctx.vector_axis.name}': "
-        f"Δ(offset)={finite_difference(info.offset, ctx.vector_axis.var, ctx.analyzer)} is not a constant"
+        f"the per-lane index vector is not constructible ({info.reason or 'unknown reason'})"
     )
 
 
@@ -759,6 +967,7 @@ class StorePlan:
     value: ValueNode
     mask: ValueNode | None = None
     kind: AccessClass = AccessClass.CONTIGUOUS
+    index: ValueNode | None = None  # 分片/置换/间接写的每 lane 索引向量（scatter）
 
 
 @dataclass
@@ -790,68 +999,185 @@ class VectorPlan:
     diagnostics: list[str] = field(default_factory=list)
 
 
-def _split_nest(stmt: tirx.Stmt) -> tuple[list[Axis], tirx.Stmt]:
+def _split_nest(stmt: tirx.Stmt, analyzer: arith.Analyzer) -> tuple[list[Axis], tirx.Stmt]:
+    """收集迭代域：连续的 ``T.Parallel`` 轴 + **直接内嵌且干净**的 ``T.serial`` 轴。
+
+    serial 轴只有在 :func:`_serial_is_clean` 通过时才被吸收（S1/S3，见方案 §6）；
+    否则在此处**停下**，把该 serial 循环留在 body 里，由 :func:`normalize_body`
+    以「nested serial loop」明确拒绝——吸收是纯增量，不改变任何既有拒绝行为。
+    """
     axes: list[Axis] = []
     current = stmt
-    while isinstance(current, tirx.For) and current.kind == tirx.ForKind.PARALLEL:
-        axes.append(Axis(current.loop_var, current.extent, len(axes)))
+    while isinstance(current, tirx.For):
+        kind = current.kind
+        if kind == tirx.ForKind.SERIAL:
+            if not _serial_is_clean(current, analyzer)[0]:
+                break
+        elif kind != tirx.ForKind.PARALLEL:
+            break
+        axes.append(Axis(current.loop_var, current.extent, len(axes), kind))
         current = current.body
-    if not axes:
+    if not any(axis.is_parallel for axis in axes):
         raise Unsupported("no T.Parallel axis found")
     return axes, current
 
 
-def select_vector_axis(
-    axes: list[Axis], stores: list[StoreSpec], analyzer: arith.Analyzer
-) -> tuple[Axis, list[AccessInfo], ReduceInfo | None]:
-    """选向量轴：在 store 可行的轴里，优先「能读出连续性」的、最内层的轴。
+def _is_cumulative_write(store: tirx.BufferStore) -> bool:
+    """``dst = dst op x``（累积写）：取值里读到了**同址**的同一个 buffer。"""
+    found = []
 
-    * 候选轴：所有 store 在该轴上都不是 NON_AFFINE/INDIRECT；
-    * 打分：该轴上 CONTIGUOUS 的访存数量（含读），越高越好；同分取更内层。
+    def visit(node):
+        if (
+            isinstance(node, tirx.BufferLoad)
+            and _same_buffer(node.buffer, store.buffer)
+            and _same_indices(tuple(node.indices), tuple(store.indices))
+        ):
+            found.append(True)
 
-    这里**没有**「按代码形状分支」——打分完全来自 Δ 的统计。
+    tirx.stmt_functor.post_order_visit(store.value, visit)
+    return bool(found)
+
+
+def _serial_is_clean(loop: tirx.For, analyzer: arith.Analyzer) -> tuple[bool, str]:
+    """一个直接内嵌的 ``T.serial`` 循环能否安全吸收进迭代域（方案 §6 第一步）。
+
+    吸收意味着把它的迭代当成一根候选轴（可被整体向量化），所以**必须排除循环携带
+    依赖**。判据（保守但可靠，宁拒绝勿错发）：
+
+    * **沿循环变量不变的写**（目的地址 ``Δ_var == 0``）：只有当它是**累积归约**
+      （``s[i] = s[i] + a[i,j]``，取值同址回读）**且取值确实沿该轴变化**时才算合法；
+      否则是 last-write-wins（``cnt[0] = a[i,j]`` / ``cnt[0] += 1``）→ 拒绝；
+    * **跨迭代读**：循环体内某 buffer 被写又被读，且该读不是「与某条写同址」的
+      累积自读（stencil ``t[i,j] = t[i,j-1] + ...``）→ 拒绝。
+
+    S1（``c[i,j] = a[i,j]``）与 S3（``s[i] += a[i,j]``）都通过；S4/S5（共享标量、
+    数据相关控制流）被挡在门外。
     """
-    store_infos: list[AccessInfo] = []
+    var = loop.loop_var
+    stores: list = []
+    loads: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferStore):
+            stores.append(node)
+        elif isinstance(node, tirx.BufferLoad):
+            loads.append(node)
+
+    tirx.stmt_functor.post_order_visit(loop.body, visit)
+
+    axis = Axis(var, loop.extent, 0, tirx.ForKind.SERIAL)
+    for store in stores:
+        offset = linear_element_offset(store.buffer, tuple(store.indices), analyzer)
+        if _const_int(finite_difference(offset, var, analyzer), analyzer) == 0:
+            if not _is_cumulative_write(store):
+                return False, f"write to {store.buffer.name} is invariant along '{var.name}' but not a reduction"
+            if not _value_varies_along(store.value, axis, analyzer):
+                return False, f"reduction into {store.buffer.name} does not vary along '{var.name}'"
+
+    write_sites = [(store.buffer, tuple(store.indices)) for store in stores]
+    for load in loads:
+        if not any(_same_buffer(load.buffer, buf) for buf, _ in write_sites):
+            continue
+        if not any(_same_buffer(load.buffer, buf) and _same_indices(tuple(load.indices), idx) for buf, idx in write_sites):
+            return False, f"cross-iteration read of {load.buffer.name} along '{var.name}'"
+    return True, ""
+
+
+# 访问形态 → 轴打分权重（改进 2）：写侧权重高于读侧，连续优于分片，分片优于广播。
+_AXIS_WEIGHT = {
+    AccessClass.CONTIGUOUS: 8,
+    AccessClass.PIECEWISE: 4,
+    AccessClass.STRIDED: 3,
+    AccessClass.PERMUTE: 3,
+    AccessClass.INDIRECT: 2,
+    AccessClass.UNIFORM: 1,
+    AccessClass.TRUE_RANDOM: 0,
+}
+
+
+def _collect_load_exprs(stores: list[StoreSpec]) -> list:
+    """收集所有写语句的取值 / 谓词里出现的 ``BufferLoad``（读侧，用于联合打分）。"""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferLoad):
+            found.append(node)
+
     for spec in stores:
-        store_infos.append(classify_access(spec.buffer, spec.indices, axes, analyzer, is_store=True))
+        tirx.stmt_functor.post_order_visit(spec.value, visit)
+        if spec.mask is not None:
+            tirx.stmt_functor.post_order_visit(spec.mask, visit)
+    return found
 
-    best: Axis | None = None
-    best_score = -1
-    reduce_info: ReduceInfo | None = None
-    best_reduce_axis: Axis | None = None
 
-    for axis in axes:
-        if any(info.axis_class(axis)[0] in (AccessClass.NON_AFFINE, AccessClass.INDIRECT) for info in store_infos):
-            continue
-        score = sum(1 for info in store_infos if info.axis_class(axis)[0] == AccessClass.CONTIGUOUS)
-        if score == 0:
-            continue
-        score = score * 10 + axis.index  # 同分取更内层
-        if score > best_score:
-            best, best_score = axis, score
+def rank_vector_axes(
+    axes: list[Axis],
+    stores: list[StoreSpec],
+    store_infos: list[AccessInfo],
+    load_infos: list[AccessInfo],
+    analyzer: arith.Analyzer,
+) -> list[Axis]:
+    """按「联合可行性 + 读写加权」给候选向量轴排序（改进 2）。
 
-    if best is None:
-        # 没有 store 沿任何轴连续：可能全是 lane 内均匀写（§0 广播写）或归约。
-        for axis in axes:
-            if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos):
-                best = axis
-                break
-    if best is None:
-        raise Unsupported("no vectorizable axis: every store is non-affine or strided on all axes")
+    与原实现相比有三点变化：
 
-    # 归约检测：store 沿 best 轴均匀，但取值沿该轴变化。
+    * **联合可行性**：候选轴只需「没有 store 是
+      :attr:`AccessClass.TRUE_RANDOM`」且「至少一个 store 可写」——STRIDED /
+      PIECEWISE / PERMUTE / INDIRECT 的 store 现在都能进候选（靠 ``vscatter``）；
+    * **读加权**：读侧（:func:`_collect_load_exprs`）也计入打分，避免「写连续、
+      读却四处乱跳」的轴被误选；
+    * **轴回退**：返回的是**排序后的整条列表**，:func:`build_plan` 会依次尝试，
+      某个轴的取值发射失败时自动退到次优轴，而不是直接判整个 nest 不可向量化。
+
+    归约轴（store 沿该轴均匀且取值沿该轴变化）始终排在最前。
+    """
     for axis in axes:
         if all(info.axis_class(axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
             _value_varies_along(spec.value, axis, analyzer) for spec in stores
         ):
-            op = _reduce_op(stores)
-            reduce_info = ReduceInfo(axis=axis, op=op, recipe=_REDUCE_RECIPE[op])
-            best_reduce_axis = axis
-            break
-    if reduce_info is not None and best_reduce_axis is not None:
-        best = best_reduce_axis
+            return [axis]
 
-    return best, store_infos, reduce_info
+    ranked: list[tuple[int, Axis]] = []
+    for axis in axes:
+        if any(info.axis_class(axis)[0] == AccessClass.TRUE_RANDOM for info in store_infos):
+            continue  # 写侧不可构造 → 该轴不可向量化
+        if not any(info.axis_class(axis)[0] != AccessClass.TRUE_RANDOM for info in store_infos):
+            continue
+        ranked.append((_axis_score(store_infos, load_infos, axis), axis))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [axis for _, axis in ranked]
+
+
+def _axis_weight_sum(infos: list[AccessInfo], axis: Axis) -> int:
+    """一根轴上所有访存的形态权重之和（写侧用，见 :data:`_AXIS_WEIGHT`）。"""
+    return sum(_AXIS_WEIGHT[info.axis_class(axis)[0]] for info in infos)
+
+
+def _axis_score(store_infos: list[AccessInfo], load_infos: list[AccessInfo], axis: Axis) -> int:
+    """一根候选轴的联合打分：写侧主序（×100）、读侧次之（×10）、同分取更内层。"""
+    return 100 * _axis_weight_sum(store_infos, axis) + 10 * _axis_weight_sum(load_infos, axis) + axis.index
+
+
+def _axis_diagnostics(axes: list[Axis], store_infos: list[AccessInfo], load_infos: list[AccessInfo]) -> list[str]:
+    """每根轴的分类摘要（改进 7）：一次性暴露全部卡点，无论最终成功与否。
+
+    成功时它记录「哪些轴是候选、打分多少、比选中的差在哪」；失败时它是失败的
+    完整上下文，避免只报告第一个卡点。
+    """
+    lines: list[str] = []
+    for axis in axes:
+        label = f"axis '{axis.name}'[{axis.index}]{'' if axis.is_parallel else '(serial)'}"
+        store_classes = [info.axis_class(axis)[0].value for info in store_infos]
+        if any(info.axis_class(axis)[0] == AccessClass.TRUE_RANDOM for info in store_infos):
+            reasons = sorted({info.reason for info in store_infos if info.reason})
+            detail = f" ({'; '.join(reasons)})" if reasons else ""
+            lines.append(f"{label}: store={store_classes} -> rejected (true-random store){detail}")
+            continue
+        load_classes = [info.axis_class(axis)[0].value for info in load_infos]
+        lines.append(
+            f"{label}: store={store_classes} load={load_classes} -> candidate (score={_axis_score(store_infos, load_infos, axis)})"
+        )
+    return lines
 
 
 def _value_varies_along(expr, axis: Axis, analyzer: arith.Analyzer) -> bool:
@@ -861,7 +1187,7 @@ def _value_varies_along(expr, axis: Axis, analyzer: arith.Analyzer) -> bool:
     def visit(node):
         if isinstance(node, tirx.BufferLoad):
             info = classify_access(node.buffer, tuple(node.indices), [axis], analyzer, is_store=False)
-            if info.axis_class(axis)[0] in (AccessClass.CONTIGUOUS, AccessClass.STRIDED):
+            if info.axis_class(axis)[0] != AccessClass.UNIFORM:
                 varies.append(True)
 
     tirx.stmt_functor.post_order_visit(expr, visit)
@@ -888,17 +1214,16 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorPlan:
         axes, body       = split_nest(stmt)                # SCoP 迭代域
         aliases          = collect_aliases(body)           # 标量中间量内联
         stores           = normalize_body(body, aliases)   # 多语句 / 分支规范化
-        v, store_infos, reduce = select_vector_axis(axes, stores)
-        for spec, info in zip(stores, store_infos):
-            value = build_value(spec.value, ctx)           # Δ 分类的递归
-            mask  = build_value(spec.mask)  if spec.mask
-        return VectorPlan(axes, v, lanes, chunks, tail, stores, reduce)
+        ranked           = rank_vector_axes(axes, stores)  # 联合可行性 + 读写加权
+        for v in ranked:                                   # 轴回退：逐个尝试
+            try:    return build_plan_for_axis(v)          # Δ 分类的递归
+            except Unsupported: continue
 
     ``lanes`` 默认由元素位宽唯一决定（``2048 / elem_bits``，与 ``T.simd`` 的
     ``vreg`` 宽度一致），因此一般不需要显式传入。
     """
     analyzer = arith.Analyzer()
-    axes, body = _split_nest(stmt)
+    axes, body = _split_nest(stmt, analyzer)
     aliases = _collect_aliases(body)
     stores = normalize_body(body, aliases)
     if not stores:
@@ -908,8 +1233,40 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorPlan:
     if lanes is None:
         lanes = _vreg_lanes(elem)
 
-    vector_axis, store_infos, reduce_info = select_vector_axis(axes, stores, analyzer)
+    store_infos = [classify_access(spec.buffer, spec.indices, axes, analyzer, is_store=True) for spec in stores]
+    load_infos = [classify_access(load.buffer, tuple(load.indices), axes, analyzer, is_store=False) for load in _collect_load_exprs(stores)]
+    ranked = rank_vector_axes(axes, stores, store_infos, load_infos, analyzer)
+    diagnostics = _axis_diagnostics(axes, store_infos, load_infos)  # 改进 7：先记录每根轴的分类
+    if not ranked:
+        raise Unsupported(
+            "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
+            diagnostics=diagnostics,
+        )
 
+    errors: list[str] = []
+    for vector_axis in ranked:
+        try:
+            plan = _build_plan_for_axis(axes, stores, store_infos, vector_axis, lanes, elem, analyzer)
+        except Unsupported as err:
+            note = f"axis '{vector_axis.name}': {err}"
+            errors.append(note)
+            diagnostics.append(note)
+            continue
+        diagnostics.append(f"selected vector axis '{vector_axis.name}' (score={_axis_score(store_infos, load_infos, vector_axis)})")
+        plan.diagnostics = diagnostics
+        return plan
+    raise Unsupported("no vectorizable axis: " + "; ".join(errors), diagnostics=diagnostics)
+
+
+def _build_plan_for_axis(
+    axes: list[Axis],
+    stores: list[StoreSpec],
+    store_infos: list[AccessInfo],
+    vector_axis: Axis,
+    lanes: int,
+    elem: str,
+    analyzer: arith.Analyzer,
+) -> VectorPlan:
     extent = _const_int(vector_axis.extent)
     chunks = None if extent is None else (extent + lanes - 1) // lanes
     tail = None if extent is None else extent % lanes
@@ -928,14 +1285,31 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorPlan:
         lanes=lanes,
         chunks=chunks,
         tail=tail,
-        reduce=reduce_info,
+        reduce=_detect_reduce(stores, store_infos, vector_axis, analyzer),
     )
 
     for spec, info in zip(stores, store_infos):
+        kind = info.axis_class(vector_axis)[0]
         value = build_value(spec.value, ctx)
         mask = build_value(spec.mask, ctx) if spec.mask is not None else None
-        plan.stores.append(StorePlan(spec=spec, access=info, value=value, mask=mask, kind=info.axis_class(vector_axis)[0]))
+        index = index_value(info, ctx) if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT) else None
+        plan.stores.append(StorePlan(spec=spec, access=info, value=value, mask=mask, kind=kind, index=index))
     return plan
+
+
+def _detect_reduce(
+    stores: list[StoreSpec],
+    store_infos: list[AccessInfo],
+    vector_axis: Axis,
+    analyzer: arith.Analyzer,
+) -> ReduceInfo | None:
+    """归约检测（§2 Case II）：store 沿该轴均匀，但取值沿该轴变化。"""
+    if all(info.axis_class(vector_axis)[0] == AccessClass.UNIFORM for info in store_infos) and any(
+        _value_varies_along(spec.value, vector_axis, analyzer) for spec in stores
+    ):
+        op = _reduce_op(stores)
+        return ReduceInfo(axis=vector_axis, op=op, recipe=_REDUCE_RECIPE[op])
+    return None
 
 
 def _buffer_elem_dtype(buffer) -> str:
@@ -950,7 +1324,7 @@ def _buffer_elem_dtype(buffer) -> str:
 # 原语的前端封装，与 C++ pass ``AscendSimdVFLowerParallel`` 的发射风格一致：
 #
 #   vld(addr, "NORM")                          -> <elem> x lanes   连续装载
-#   vgather2(addr, vmuls(vci(0,u32), k), m)    -> <elem> x lanes   步长装载
+#   vgather2(base, idx, mask)                  -> <elem> x lanes   按每 lane 索引装载
 #   vdup(scalar, elem, mask)                   -> <elem> x lanes   lane 内均匀广播
 #   vci(base, "int32")                         -> int32 x lanes    lane 序号
 #   vadd/vsub/vmul/... (a, b, mask, mode)      -> <elem> x lanes   逐元素
@@ -963,10 +1337,14 @@ def _buffer_elem_dtype(buffer) -> str:
 #   vcadd/vcmax/vcmin(v, mask)                 -> <elem> x lanes   跨 lane 归约(lane0)
 #   vsts(addr, v, mask, "NORM_B{bits}")        -> void             连续存储
 #   vsts(addr, v, mask, "ONEPT_B{bits}")       -> void             单元素存储(归约回写)
+#   vscatter(v, base, idx, mask)               -> void             按每 lane 索引存储
 #
 # 地址统一用 ``BufferLoad(buffer, indices)`` 交给 ``T.simd`` 自动包成
-# ``access_ptr``；indices 里把向量轴变量替换成该 chunk 的 lane 基址
-# （普通路径 = ``chunk * lanes``；lane 内均匀访问 = ``0``）。
+# ``access_ptr``；连续装载/存储把向量轴变量替换成该 chunk 的 lane 基址
+# （普通路径 = ``chunk * lanes``；lane 内均匀访问 = ``0``）。**每 lane 索引向量**
+# 通道（STRIDED 步长 / PERMUTE 逆序 / PIECEWISE 分片 / INDIRECT 间接）改用
+# ``base = BufferLoad(buffer, 全 0)``（缓冲区起点）+ 绝对元素偏移索引向量
+# （``index_value`` 由 :func:`build_value` 在整数上下文构造）。
 #
 # 归约（§2 Case II）按 C++ pass 的定型方案**在编译期展开** chunk 循环，
 # 用 SSA 形式串起累加器（跨迭代的寄存器值无法用可变的 ``Var`` 表达）：:
@@ -995,6 +1373,14 @@ def _int(value: int):
 def _elem_dtype(dtype_like) -> str:
     """去掉 lane 维，取元素类型字符串。"""
     return str(dtype_like).split("x", 1)[0]
+
+
+def _unsigned_index(reg):
+    """把有符号整数索引向量按位重解释为无符号（``vgather2`` / ``vscatter`` 需要）。"""
+    dtype = str(reg.dtype)
+    if dtype.startswith("int"):
+        return tirx.reinterpret(dtype.replace("int", "uint", 1), reg)
+    return reg
 
 
 def _reduce_identity(recipe: str, elem: str):
@@ -1066,6 +1452,14 @@ class _Emitter:
         indices = [tirx.stmt_functor.substitute(index, {self.plan.vector_axis.var: base}) for index in access.indices]
         return tirx.BufferLoad(access.buffer, indices)
 
+    def index_addr(self, access: AccessInfo):
+        """索引向量通道的基址：``BufferLoad(buffer, 全 0)`` = 缓冲区起点。
+
+        索引向量（``index_value``）给出的是**绝对**元素偏移，因此基址必须落在
+        缓冲区起点，而不是某个 chunk 的 lane 基址。
+        """
+        return tirx.BufferLoad(access.buffer, [_int(0) for _ in access.indices])
+
     # -- 标量操作数 ---------------------------------------------------------
     def scalar(self, node: ValueNode):
         if node.recipe in ("imm", "uniform_expr"):
@@ -1110,6 +1504,12 @@ class _Emitter:
             mask = self.all_mask(bits)
             index = simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask)
             return self.bind(simd.vgather2(self.addr(node.access), index, mask), self.lets)
+        if recipe == "gather":
+            # 每 lane 索引向量通道（改进 1）：``args[0]`` 是绝对元素偏移向量。
+            bits = _mask_bits(node.dtype)
+            mask = self.all_mask(bits)
+            index = _unsigned_index(self.value(args[0]))
+            return self.bind(simd.vgather2(self.index_addr(node.access), index, mask), self.lets)
         if recipe in ("uniform_load", "uniform_expr", "vbrc"):
             operand = node if recipe != "vbrc" else args[0]
             elem = _elem_dtype(operand.dtype)
@@ -1120,6 +1520,10 @@ class _Emitter:
         if recipe in _VEC_SCALAR_BINARY.values():
             mask = self.all_mask(_mask_bits(node.dtype))
             return self.bind(getattr(simd, recipe)(self.value(args[0]), self.scalar(args[1]), mask, _MODE), self.lets)
+        if recipe in ("vshrs", "vshls"):
+            # 常量移位量走标量-向量移位（`vshrs` = 算术右移，即整型 FloorDiv by 2^k）。
+            mask = self.all_mask(_mask_bits(node.dtype))
+            return self.bind(getattr(simd, recipe)(self.value(args[0]), node.scalar, mask, _MODE), self.lets)
         if recipe in _ELEMENTWISE_UNARY.values():
             mask = self.all_mask(_mask_bits(node.dtype))
             return self.bind(getattr(simd, recipe)(self.value(args[0]), mask, _MODE), self.lets)
@@ -1174,14 +1578,29 @@ def _store_mask(plan: VectorPlan, store: StorePlan, emitter: _Emitter, bits: int
 
 
 def _emit_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
+    """发射一次写入：连续/均匀写走 ``vsts``，其余走每 lane 索引 ``vscatter``。"""
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
-    uniform = store.kind == AccessClass.UNIFORM
     value = emitter.vector_operand(store.value)
     mask = _store_mask(plan, store, emitter, bits)
-    dist = f"ONEPT_B{bits}" if uniform else f"NORM_B{bits}"
-    addr = emitter.addr(store.access, uniform=uniform)
-    emitter.lets.append(tirx.Evaluate(simd.vsts(addr, value, mask, dist)))
+
+    if store.kind in (AccessClass.CONTIGUOUS, AccessClass.UNIFORM):
+        uniform = store.kind == AccessClass.UNIFORM
+        dist = f"ONEPT_B{bits}" if uniform else f"NORM_B{bits}"
+        addr = emitter.addr(store.access, uniform=uniform)
+        emitter.lets.append(tirx.Evaluate(simd.vsts(addr, value, mask, dist)))
+        return
+
+    if store.kind == AccessClass.STRIDED:
+        # 常量步长写：chunk lane 基址 + 步长斜坡（与 ``vload_strided`` 对称）。
+        _, stride = store.access.axis_class(plan.vector_axis)
+        index = emitter.bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask), emitter.lets)
+        emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.addr(store.access), index, mask)))
+        return
+
+    # PERMUTE / PIECEWISE / INDIRECT：绝对元素偏移索引向量 + 缓冲区起点基址。
+    index = _unsigned_index(emitter.value(store.index))
+    emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.index_addr(store.access), index, mask)))
 
 
 def emit_plan(plan: VectorPlan) -> tirx.Stmt:
@@ -1216,24 +1635,36 @@ def _emit_reduce(plan: VectorPlan, chunk: tirx.Var) -> _Emitter:
 
     先要 ``vcadd/vcmax/vcmin`` 把每个 chunk 压成 lane0 的部分结果，再用
     ``vadd/vmax/vmin`` 累加；若写成累加形式 ``dst = dst op x``，末尾再并入目标
-    里原有的值（``vld(..., BRC_B{bits})`` 广播）。
+    里原有的值（``vld(..., BRC_B{bits})`` 广播）。``extent % lanes != 0`` 时最后
+    一个 chunk 是尾块：``update_mask`` 造尾块谓词，``vsel`` 把无效车道填成归约
+    单位元（改进 6），再按全 lane 掩码归约。
     """
     store = next(s for s in plan.stores if s.kind == AccessClass.UNIFORM)
-    if plan.tail:
-        raise Unsupported("reduction requires the vector axis extent to be a multiple of the vector width")
     emitter = _Emitter(plan, chunk)
     elem = _elem_dtype(store.spec.buffer.dtype)
     bits = _mask_bits(elem)
     mask = emitter.all_mask(bits)
     recipe = plan.reduce.recipe
     element_op = _REDUCE_ELEMENT[recipe]
-    acc = emitter.bind(simd.vdup(_reduce_identity(recipe, elem), elem, mask, _MODE), emitter.lets)
+    identity = _reduce_identity(recipe, elem)
+    acc = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets)
+
+    # 尾块（``extent % lanes != 0``，改进 6）：最后一个 chunk 只有 ``tail`` 个有效车道，
+    # 其余车道在 ``vld`` 里读到的是越界/脏数据。用 ``vsel(loaded, fill, tail_mask)`` 把它们
+    # 替换成归约单位元（add→0，max→-inf，min→+inf），再按全 lane 掩码归约，结果正确。
+    fill = emitter.bind(simd.vdup(identity, elem, mask, _MODE), emitter.lets) if plan.tail else None
 
     varying = _varying_operand(store.value)
+    last_chunk = (plan.chunks or 1) - 1
     for ck in range(plan.chunks or 1):
-        emitter.lane_base = _int(ck * plan.lanes)
+        lane_base = _int(ck * plan.lanes)
+        emitter.lane_base = lane_base
         emitter.memo = {}  # 地址随 chunk 变化，缓存必须按 chunk 失效
-        reduced = emitter.bind(getattr(simd, recipe)(emitter.value(varying), mask, _MODE), emitter.lets)
+        loaded = emitter.value(varying)
+        if fill is not None and ck == last_chunk:
+            tail_mask = emitter.bind(simd.update_mask(plan.vector_axis.extent - lane_base, bits), emitter.lets)
+            loaded = emitter.bind(simd.vsel(loaded, fill, tail_mask), emitter.lets)
+        reduced = emitter.bind(getattr(simd, recipe)(loaded, mask, _MODE), emitter.lets)
         acc = emitter.bind(getattr(simd, element_op)(acc, reduced, mask, _MODE), emitter.lets)
 
     if _is_accumulate(store):
@@ -1286,6 +1717,9 @@ def render_plan(plan: VectorPlan) -> str:
         sink = f"{store.spec.buffer.name}{list(store.spec.indices)}"
         lines.append(f"store {sink} [{store.kind.value}] mask={'yes' if store.mask else 'no'}")
         _render_value(store.value, lines, 1)
+    if plan.diagnostics:
+        lines.append("diagnostics:")
+        lines.extend(f"  {note}" for note in plan.diagnostics)
     return "\n".join(lines)
 
 
