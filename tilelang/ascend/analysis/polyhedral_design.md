@@ -1,6 +1,6 @@
 # Ascend 统一多面体向量化 —— 设计文档
 
-> 对应实现：[`polyhedral.py`](./polyhedral.py)（约 2454 行）
+> 对应实现：[`polyhedral/`](./polyhedral)（10 个模块，共约 2678 行；最大 `plan.py` 793 行）
 > 对应测试：[`testing/ascend/analysis/test_polyhedral_vectorize.py`](../../../../testing/ascend/analysis/test_polyhedral_vectorize.py)（87 个用例）
 > 需求基准：[`Parallel_ascend.md`](../../../../Parallel_ascend.md) §315–484「支持场景」
 > 参考实现（发射风格权威）：`src/ascend/transform/ascend_simdvf_lower_parallel.cc`
@@ -9,13 +9,13 @@
 
 ## 0. 文档定位
 
-本文档是 `polyhedral.py` 的设计说明，供以下场景使用：
+本文档是 `polyhedral` 包的设计说明，供以下场景使用：
 
 - **学习**：理解模块的数学内核、数据结构与发射逻辑；
 - **扩展**：新增算子 / 场景 / 硬件指令时，知道应该改哪一层；
 - **评审**：界定「支持 / 拒绝」的边界及其理由，避免静默降级。
 
-本文档描述的是**离线分析原型**：`polyhedral.py` 目前只被它自己的测试引用，尚未接入生产编译管线（见 §5.6）。
+本文档描述的是**离线分析原型**：`polyhedral` 包目前只被它自己的测试引用，尚未接入生产编译管线（见 §5.6）。
 
 ***
 
@@ -74,38 +74,54 @@ Ascend 现有的 `T.Parallel` 向量化在 C++ 侧按「代码形状」逐条分
   vectorize_parallel_nests(...)   把整棵语句树里的 Parallel 嵌套整段替换
 ```
 
-`VectorPlan` / `VectorProgram` 里**没有任何硬件指令名**——只有轴、lane 数、chunk、每个 store 的值 DAG。**指令选择推迟到** **`emit_plan`**。这条「硬件无关中间表示」的设计使换发射目标（如从自定义 `tl.vmi.*` 改为 `T.simd.*`）只需改发射层。
+`VectorPlan` / `VectorProgram` 里**没有任何硬件指令名**——只有轴、lane 数、chunk、每个 store 的值 DAG。**指令选择推迟到** **`emit_plan`**。这条「指令选择无关中间表示」的设计使换发射目标（如从自定义 `tl.vmi.*` 改为 `T.simd.*`）只需改发射层。
 
 `build_plan` **恒返回** `VectorProgram`：单段（一个主体 + 可选 `pre`/`post`）时它是「1 段 program」，`program.axes` 只含提到最外层包一次的**并行轴前缀**（`_outer_axes`），其余轴仍由该段自己包裹；`T.Parallel` 体内出现**多个并列的干净** **`T.serial`** **循环**时，program 含多段（每段一个 `VectorPlan`，§3.11）。`VectorPlan` 因此是**段级**中间表示，`VectorProgram` 才是 `build_plan` 对外的统一返回类型。
 
 ### 2.2 模块分层
 
+包内按**依赖单向向下**拆成 9 个职责模块（公共 API 由 `__init__.py` 统一再导出）：
+
 ```
-polyhedral.py
-├─ 0. 原语事实表        _ELEMENTWISE_BINARY/_UNARY, _VEC_SCALAR_BINARY, _COMPARE,
-│                       _BOOL_BINARY/_UNARY  —— 唯一保留的 per-op 事实（原语级）
-├─ 1. SCoP：迭代域       Axis, AccessClass
-├─ 2. 仿射原语           linear_element_offset, finite_difference, classify_delta
-├─ 3. 访问分类           AccessInfo, classify_access
-├─ 4. body 规范化        StoreSpec, normalize_body, _collect_aliases/_apply_aliases
-├─ 5. 值 DAG             ValueNode, build_value, broadcast, load_node, _build_call
-├─ 6. 规划               StorePlan, ReduceInfo, VectorPlan, VectorProgram, rank_vector_axes, build_plan
-├─ 7. 发射               _Emitter, emit_plan, _emit_reduce, render_plan
-└─ 8. 语句树变换         vectorize_parallel_nests
+polyhedral/
+├─ primitives.py   0. 原语事实表   _ELEMENTWISE_BINARY/_UNARY, _VEC_SCALAR_BINARY, _COMPARE,
+│                                  _BOOL_BINARY/_UNARY, _REDUCE_PRIMITIVES（含单位元）,
+│                                  _MASK_DTYPE/_MODE...
+│                                  —— ISA/算子事实与硬件常量的唯一来源
+│                                  + Unsupported + 语句/表达式小工具
+├─ access.py       1. SCoP：迭代域  Axis, AccessClass
+│                  2. 仿射原语      linear_element_offset, finite_difference, classify_delta
+│                  3. 访问分类      AccessInfo, classify_access
+├─ body.py         4. body 规范化   StoreSpec, normalize_body, _collect_aliases/_apply_aliases
+├─ value.py        5. 值 DAG        ValueNode, build_value, broadcast, load_node, _build_call
+├─ model.py        6. 计划数据结构  StorePlan, ReduceInfo, VectorPlan, VectorProgram
+├─ plan.py         7. 规划          _AXIS_WEIGHT, rank_vector_axes, build_plan（含多段 program）
+├─ emit.py         8. 发射          _Emitter, emit_plan, _emit_reduce
+├─ render.py       9. 可读渲染      render_plan
+├─ driver.py       10. 语句树变换   vectorize_parallel_nests
+└─ __init__.py      公共 API 再导出 + 整体设计说明
 ```
+
+> 依赖方向：`primitives ← access ← {body, value} ← model ← plan ← {emit, render} ← driver`。
+> `model` 只放共享数据结构，因此 `emit` / `render` 只依赖计划类型而不依赖规划算法；
+> 任意模块都**不得**反向导入上层，避免循环依赖。
+>
+> 改动指引：新增算子配方改 `primitives`；新增访存形态改 `access`；新增控制流形态改
+> `body`；新增取值算子改 `value`；新增计划字段改 `model`；新增轴选择 / 归约规则改
+> `plan`；换硬件指令目标改 `emit`。
 
 ### 2.3 数据结构总览
 
 | 结构              | 含义                                | 关键字段                                                                                           | 产出者                                  |
 | --------------- | --------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `Axis`          | 一根 `T.Parallel` 轴 `0<=var<extent` | `var, extent, index`                                                                           | `_split_nest`                        |
+| `Axis`          | 一根迭代轴 `0<=var<extent`（并行轴或被吸收的 serial 轴） | `var, extent, index, kind`                                                                     | `_split_nest` / `_absorb_serial_chain` |
 | `AccessClass`   | 沿某轴的访存形态（枚举）                      | `CONTIGUOUS/UNIFORM/STRIDED/PERMUTE/PIECEWISE/INDIRECT/TRUE_RANDOM`                            | `classify_delta` + `classify_access` |
 | `AccessInfo`    | 一次访存 + 逐轴分类                       | `buffer, indices, offset, is_store, per_axis, indirect, in_global, reason`                     | `classify_access`                    |
 | `StoreSpec`     | 一条写                               | `buffer, indices, value, mask`                                                                 | `normalize_body`                     |
 | `ValueNode`     | 值 DAG 节点                          | `recipe, dtype, args, access, scalar, detail`                                                  | `build_value`                        |
 | `StorePlan`     | 一条写的完整计划                          | `spec, access, value, mask, kind, index, reduce`                                               | `_build_plan_for_axis`               |
 | `ReduceInfo`    | 归约信息（逐 store）                       | `axis, op, recipe, varying, accumulate`                                                        | `_classify_reduce` → `_plan_reduce`  |
-| `VectorPlan`    | **段级**硬件无关计划（段 = 主体 + 可选 `pre`/`post`） | `axes, vector_axis, lanes, chunks, tail, stores, pre_stores, post_stores, reduce, diagnostics` | `_build_plan_for_axis`（每段一个）      |
+| `VectorPlan`    | **段级**指令选择无关计划（段 = 主体 + 可选 `pre`/`post`） | `axes, vector_axis, lanes, chunks, tail, stores, pre_stores, post_stores, reduce, diagnostics` | `_build_plan_for_axis`（每段一个）      |
 | `VectorProgram` | 统一计划（1..N 段，`build_plan` 的返回类型）      | `axes`（提层的并行轴前缀）, `segments`, `diagnostics`                                              | `build_plan`                         |
 
 `AccessClass` 分两层判定：Δ 层给常数形态，非常数再做**结构细化**（改进 4）：
@@ -124,12 +140,12 @@ polyhedral.py
 
 ```
 build_plan(stmt)
-  ├─ _try_build_program(stmt, notes)  ▶ VectorProgram?          # 多个并列 serial 段（§6 第三步）
+  ├─ _try_build_program(stmt, analyzer, lanes, notes) ▶ VectorProgram?   # 多个并列 serial 段（§6 第三步）
   │     └─ 命中 ≥2 个干净 serial 链 → _build_segment（每段一个 VectorPlan）
   │        任一段构造失败 → 段级原因写入 notes 并 return None（缺陷 B：不吞掉）
-  ├─ _split_nest    ▶ axes[], body                # 单段路径（回落）
-  ├─ _collect_aliases(body)          ▶ {var: expr}            # 标量中间量
-  ├─ normalize_body(body, aliases)   ▶ StoreSpec[]            # 控制流 → 线性写列表
+  ├─ _split_nest ▶ axes[], serial_axis, pre, main, post   # SCoP 迭代域（单段路径，回落）
+  ├─ _prepare_segment(axes, ..., pre, main, post) ▶ _SegmentSpecs
+  │     = normalize_body + lanes 推导 + 逐轴 classify_access（单段/多段共用）
   ├─ rank_vector_axes(axes, stores, store_infos, load_infos) ▶ 轴排行（联合可行性 + 读写加权）
   ├─ for vector_axis in ranked:      # 轴回退：逐个尝试
   │     try: 构造 _ValueContext(axes, vector_axis, lanes, analyzer, vector_dtype)
@@ -152,12 +168,23 @@ emit_plan(plan)
 
 ### 3.1 SCoP 建模
 
-**(a) 迭代域** —— `_split_nest` 从某个 `T.Parallel` For 出发，**连续吃掉**所有 `T.Parallel`，一旦遇到非 Parallel 就停：
+**(a) 迭代域** —— `_split_nest(stmt, analyzer)` 从某个 `T.Parallel` For 出发，**连续吃掉**并行轴；遇到**直接内嵌且干净**的 serial 轴（`_serial_is_clean`）也一并吸收。返回 `(axes, serial_axis, pre_stmts, main_stmt, post_stmts)`：
 
 ```python
-while isinstance(current, tirx.For) and current.kind == tirx.ForKind.PARALLEL:
-    axes.append(Axis(current.loop_var, current.extent, len(axes)))
+while isinstance(current, tirx.For):
+    if current.kind == tirx.ForKind.SERIAL:
+        if not _serial_is_clean(current, analyzer)[0]:
+            break                                  # 有循环携带依赖 → 不吸收，留给 normalize_body 拒绝
+    elif current.kind != tirx.ForKind.PARALLEL:
+        break
+    axis = Axis(current.loop_var, current.extent, len(axes), current.kind)
+    axes.append(axis)
+    if current.kind == tirx.ForKind.SERIAL:
+        serial_axis = axis
     current = current.body
+
+# 平行链结束后若是 SeqStmt，且其中恰好一个干净 serial 循环：
+#   → 前兄弟语句 = pre、循环体 = main、后兄弟语句 = post（§6 第二步）
 ```
 
 > 推论：**必须从嵌套头调用**才能拿到全部轴。这是 `vectorize_parallel_nests` 采用自顶向下遍历、测试 helper `_first_parallel` 取最外层的原因。
@@ -195,14 +222,25 @@ def classify_delta(delta, analyzer=None):          # Δ 层：只分常数 / 非
     if value == -1:   return PERMUTE
     return STRIDED, value
 
-def classify_access(...):                          # 结构细化层（改进 4）
-    indirect = any(含 BufferLoad for idx in indices)
+def classify_access(buffer, indices, axes, analyzer, *, is_store):   # 结构细化层（改进 4）
+    offset = linear_element_offset(buffer, tuple(indices), analyzer)
+    info   = AccessInfo(buffer=buffer, indices=tuple(indices), offset=offset, is_store=is_store, ...)
+    indirect = any(_contains_buffer_load(idx) for idx in indices)
     reason   = None if indirect else index_vector_reason(offset, analyzer)
     for axis in axes:
         kind, stride = classify_delta(finite_difference(offset, axis.var, analyzer), analyzer)
-        if kind == PIECEWISE and reason is not None:
-            kind = TRUE_RANDOM                     # 索引向量构造不出来 → 拒绝
-        info.per_axis[axis.name] = (kind, stride)
+        if indirect:
+            # 沿轴不变（Δ==0）的间接地址是 lane 内均匀的标量地址 → 仍归 UNIFORM（D11）
+            if kind != AccessClass.UNIFORM:
+                kind, stride = AccessClass.INDIRECT, None
+        elif kind == AccessClass.PIECEWISE and reason is not None:
+            kind, stride = AccessClass.TRUE_RANDOM, None     # 索引向量构造不出来 → 拒绝
+            info.reason = reason
+        elif kind == AccessClass.STRIDED and stride < 0 and reason is not None:
+            kind, stride = AccessClass.TRUE_RANDOM, None     # 负步长必须走索引向量（D8）
+            info.reason = reason
+        info.per_axis[axis.index] = (kind, stride)           # 键 = 轴在迭代域中的位置
+    return info
 ```
 
 > **设计精髓**：`_const_int(delta) is None` 把「仿射 vs 非仿射」的判定**外包给符号化简器的能力边界**——化简器能折成常数就是仿射，折不动就是非常数。这是「把语义问题转成符号计算问题」的典型手法，既优雅也有风险：**化简器的行为就是接口契约**（因此 `finite_difference` 前后各 `simplify` 一次）。
@@ -272,7 +310,7 @@ selected vector axis 'm' (score=330)
 - 该轴所有 store 都 `UNIFORM`（`Δ_store = 0`）；
 - 取值沿该轴**变化**（`_value_varies_along`：自由变量出现 **或** 被访问 buffer 沿轴 `CONTIGUOUS/STRIDED`）。
 
-命中则构造 `ReduceInfo(axis, op, recipe)`，其中 `op` 由取值的最外层算子在 `_reduce_op`（L1472–1494）里挑：
+命中则构造 `ReduceInfo(axis, op, recipe, varying, accumulate)`，其中 `op` 由取值的最外层算子在 `_reduce_op`（`plan.py`）里挑（表源是 `primitives._REDUCE_PRIMITIVES`）：
 
 | 最外层算子 | `op` | `recipe = _REDUCE_RECIPE[op]` |
 | --- | --- | --- |
@@ -281,9 +319,9 @@ selected vector axis 'm' (score=330)
 | `Min` | `vmin` | `vcmin` |
 | **其它（含 `Mul`）** | **拒绝**（`Unsupported`） | — |
 
-并用归约轴覆盖 `vector_axis`。
+并用归约轴作为 `vector_axis`（`rank_vector_axes` 对归约轴独占返回，不再回退到其它轴）。
 
-> ✅ **缺陷 D1（已修）**：`_reduce_op`（L1472–1494）原先把未识别算子一律默认成 `vadd`，于是
+> ✅ **缺陷 D1（已修）**：`_reduce_op`（`plan.py`）原先把未识别算子一律默认成 `vadd`，于是
 > `s[i] = s[i] * a[i,j]` 这类**乘积归约**被静默发射成 `vcadd`（求和），得到**错误的数值结果**。
 > 现改为查 `_REDUCE_OPS` 表，未命中即抛
 > `unsupported reduction operator(s) <Node> (方案 §2 Case II): only Add/Max/Min reductions are supported`。
@@ -299,9 +337,9 @@ selected vector axis 'm' (score=330)
 > 真正使用的 `_is_accumulate`（靠「DAG 里是否出现同 buffer 的 `uniform_load`」）**口径不一致**，两处
 > 可能给出不同结论。现删除 `_detect_reduce`/`_is_accumulate`/`_varying_operand`，改为**单一判据**：
 >
-> * 第一层 `_is_reduce_axis`（L1481–1496）——「store 全部 lane 均匀 + 取值沿轴变化」，由
+> * 第一层 `_is_reduce_axis`（`plan.py`）——「store 全部 lane 均匀 + 取值沿轴变化」，由
 >   `rank_vector_axes`（选轴）与 `_classify_reduce`（建计划）**共用**；
-> * 第二层 `_plan_reduce`（L1690）——把单条 lane 均匀 store 精化为累加形式 `dst[...] = dst[...] <op> x`
+> * 第二层 `_plan_reduce`（`plan.py`）——把单条 lane 均匀 store 精化为累加形式 `dst[...] = dst[...] <op> x`
 >   （`op` ∈ Add/Max/Min），旧值必须作为归约算子的**直接操作数**且**与写入地址同址**（`_strip_reduce`
 >   用 `_same_indices` 校验），否则显式拒绝。
 >
@@ -329,7 +367,7 @@ Cast → vcvt 或 uniform
 **第二核心谓词** **`ValueNode.is_uniform`**（是否 lane 内均匀、不需要向量寄存器）：
 
 ```python
-# 实现（polyhedral.py ValueNode.is_uniform，L685–700，D7 已修）
+# 实现（value.py ValueNode.is_uniform，D7 已修）
 if recipe in ("lane_index", "vbrc"): return False
 if recipe in _UNIFORM_RECIPES:      return True     # imm / uniform_load / uniform_expr
 if not self.args:                   return False    # ← D7 修复：所有无 args 叶子（vload/vload_strided/gather）
@@ -380,6 +418,7 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 | `uniform_load`/`uniform_expr`/`vbrc` | `vdup(scalar, elem, mask, MODE_ZEROING)`                   | 广播                                              |
 | 数据二元 / 一元                            | `vadd/vsub/vmul/... / vneg/vabs/...`                       | `(a, b, mask, mode)`                            |
 | 标量-向量                                | `vadds/vmuls/vmaxs/vmins`                                  | `(vec, scalar, mask, mode)`                     |
+| 常量移位                                 | `vshrs` / `vshls`                                          | 整型 `//` / `%` 2 的幂常量除数做 strength-reduction      |
 | `vcmp` / `vcmps`                     | `vcmp(a,b,mask,op)` / `vcmps(a,s,mask,op)`                 | 谓词                                              |
 | `vsel`                               | `vsel(t, f, mask)`                                         | mask 由 `predicate()` 给出                         |
 | `pand`/`por`/`pnot`                  | `pand/por/pnot`                                            | 谓词运算                                            |
@@ -389,13 +428,15 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 
 **SSA 与** **`Bind`**：每个中间值用 `tirx.Bind(var, expr)` 表示，追加进 `lets` 列表。不能用 `tirx.Let`，因为后者是**表达式**（body 必须是 PrimExpr），而 SSA 中间值是一条条独立语句，只能摊平成 `SeqStmt`。
 
-`_Emitter` 的三个状态容器：
+`_Emitter` 的主要状态：
 
-| 容器         | 作用                                                                  |
+| 状态 | 作用 |
 | ---------- | ------------------------------------------------------------------- |
 | `prologue` | **chunk 无关**的绑定，如全 lane 掩码 `pset(bits, "PAT_ALL")`（按 width 缓存，只绑一次） |
 | `lets`     | chunk 体内的 SSA 语句                                                    |
 | `memo`     | `id(node) → 变量`，同一子表达式去重                                            |
+| `_mask_vars` | 掩码按 width / 尾块键缓存，避免重复 `pset` / `update_mask`                        |
+| `counter`  | SSA 变量命名序号（跨段再加 `prefix` 区分）                                        |
 
 **掩码三层叠加**：`store 的最终掩码 = 用户谓词 ∧ 尾块掩码`，都为空则全 1。
 
@@ -439,6 +480,9 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 - `_mask_bits(dtype) = max(elem_bits, 8)`：CCE 谓词粒度 b8/b16/b32/b64（无 b4）。
 - `_MODE = "MODE_ZEROING"`。
 
+> 放置原则：`primitives.py` 只放 ISA/算子事实与硬件常量；分析词汇（`AccessClass`）留在
+> `access.py`，可调策略（`_AXIS_WEIGHT`）留在 `plan.py`——各表跟随其语义归属层，而非物理集中。
+
 ### 3.8 归约发射（最特别的部分）
 
 ```
@@ -446,10 +490,11 @@ mask = pset(bits, "PAT_ALL")
 acc  = vdup(identity, elem, mask)               # vadd→0, vmax→-inf, vmin→+inf
 fill = tail ? vdup(identity, elem, mask) : None # 尾块填充寄存器（改进 6）
 for ck in range(chunks):                        # 编译期展开，不是运行时 for！
-    x = vld(src_addr(ck), "NORM")               # 整 chunk
     if tail and ck == last:                     # 尾块：装载带谓词（vgather2），再填单位元
         x = vgather2(src_addr(ck), vci(0), tail_mask)   # 不越过 buffer 尾部（D10）
         x = vsel(x, fill, tail_mask)
+    else:
+        x = vld(src_addr(ck), "NORM")           # 整 chunk
     red = vcadd(x, mask)                        # 跨 lane 归约，结果只在 lane0
     acc = vadd(acc, red, mask)
 if 累加写: old = vld(dst_addr, "BRC_B{bits}"); acc = vadd(acc, old, mask)
@@ -461,7 +506,7 @@ vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
 配套细节：
 
 - `_reduce_identity`：`vadd→0`、`vmax→` 元素类型最小可表示值、`vmin→` 元素类型最大可表示值（按 dtype 派生）。
-  > ✅ **缺陷 D3（已修）**：`_reduce_identity`（L1713–1730）原先把单位元**硬编码成 f32 极值 `±3.402823e38`**，
+  > ✅ **缺陷 D3（已修）**：`_reduce_identity`（`primitives.py`）原先把单位元**硬编码成 f32 极值 `±3.402823e38`**，
   > 未按 store 的 dtype 派生，于是 `int32` 的 `max` 归约抛
   > `FloatImm supports only float, but int32 was supplied`、`float16` 的 `max` 归约抛
   > `Literal value -3.40282e+38 exceeds minimum of float16`——
@@ -499,7 +544,7 @@ vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
 
 `emit_plan` 对 `VectorProgram`（多个并列 serial 段，§6 第三步）：逐段发射（每段一个 `chunk_s<k>` 循环 + 该段自身的非向量 serial 轴），**共享外层并行轴只在最外层包一次**；各段掩码 prologue 提到最前。发射顺序即源码顺序。
 
-`vectorize_parallel_nests`：\*\*自顶向下（pre-order）\*\*遍历语句树，命中 `T.Parallel` 就整体 `emit_plan(build_plan(...))` 替换（`_split_nest` 会一路吃到非 Parallel，故整个 nest 被一次性下降）；整体规划失败才返回 `None` 继续下探子节点。
+`vectorize_parallel_nests`：**自顶向下（pre-order）**遍历语句树，命中 `T.Parallel` 就整体 `emit_plan(build_plan(...))` 替换（`_split_nest` 会把连续的并行轴与可吸收的干净 serial 轴一并吃掉，故整个 nest 被一次性下降）；整体规划失败才返回 `None` 继续下探子节点。
 
 > 若自底向上替换，最内层会先被换成串行代码，外层 `T.Parallel` 反而再也规划不了（`normalize_body` 撞到已发射的 `For`），导致多维嵌套只下降一半、外层 `T.Parallel` 残留。
 
@@ -553,7 +598,7 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 
 **每段的规划**（`_build_segment`）与单段完全同构：`axes = [*并行轴, *该段 serial 轴]`，**向量轴强制取该段最内层 serial 轴**（外层并行轴的向量化尚未支持），于是「`pre`/`post` 只能沿 serial 轴向量化」的门禁（§3.3 第二步）天然满足。每段独立产出 `VectorPlan`，各带自己的 `vector_axis` / `reduce` / `pre_stores` / `post_stores` / `diagnostics`。
 
-**发射**（`_emit_program`）：逐段调用 `_emit_segment_stmts(..., wrap_parallel=False)`——每段一个 `chunk_s<k>` 循环 + 该段自身的非向量 serial 轴；**共享外层并行轴只在最外层包一次**；各段掩码 prologue 提到最前；语句顺序 = 源码顺序。`_Emitter` 按段加名字前缀（`s0_`/`s1_`）避免跨段 SSA 重名。
+**发射**（`_emit_program`）：逐段调用 `_emit_segment_stmts(segment, chunk_s<k>, hoisted=program.axes, prefix=f"s<k>_")`——每段一个 `chunk_s<k>` 循环 + 该段自身的非向量 serial 轴；`hoisted` 里的**共享外层并行轴只在最外层包一次**（段内按变量身份跳过）；各段掩码 prologue 提到最前；语句顺序 = 源码顺序。`_Emitter` 按段加名字前缀（`s0_`/`s1_`）避免跨段 SSA 重名。
 
 **正确性前提**：段间依赖必须**沿各段向量轴均匀**（Δ=0）。此时每个并行迭代内的段间次序与标量程序一致，逐段向量化不改变结果：
 
@@ -603,10 +648,10 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 | §6 第二步    | 多条语句夹一个 serial（M1/M2/M3/夹心、S2 私有标量） | ✅            | body 为 `SeqStmt` 且**恰好含一个干净 serial 循环**时吸收该轴：其前置/后置兄弟语句成为 `pre`/`post` 段，发射在 chunk 循环**之外**（顺序 `pre → 主体 → post`）                      | `test_serial_pre_statement_absorbed`、`test_serial_post_statement_absorbed`、`test_serial_sandwiched_statements_absorbed`、`test_serial_independent_store_group_absorbed`、`test_direct_serial_private_scalar_absorbed`                                                  |
 | §6 第三步    | 多个**并列**的干净 serial 循环（≥2 段）         | ✅            | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间依赖须沿向量轴均匀                                                       | `test_multi_serial_independent_segments`、`test_multi_serial_reduce_then_use`、`test_multi_serial_compose_keeps_source_order`、`test_multi_serial_leading_statement_is_first_segment_pre`、`test_vectorize_parallel_nests_lowers_multi_serial_program`                   |
 | §6        | 嵌套 serial / 跨迭代标量状态 / 并列段中有一段不干净    | ❌            | `nested ... loop ... is not affine-vectorizable`                                                                                       | `test_serial_shared_scalar_rejected`、`test_serial_stencil_rejected`、`test_multi_serial_one_unclean_is_rejected`                                                                                                                                                      |
-| §1-I      | **双臂 `if` 的某一臂再嵌 `if`**（臂自带谓词）    | ❌            | `normalize_body`（L616）`masked branch merging is not supported`——**两份文档先前均未声明**（缺陷 D12）                                                 | `test_masked_branch_merging_is_rejected`（特征化）                                                                                                                                                                                                                        |
+| §1-I      | **双臂 `if` 的某一臂再嵌 `if`**（臂自带谓词）    | ❌            | `normalize_body`（`body.py`）`masked branch merging is not supported`——**两份文档先前均未声明**（缺陷 D12）                                                 | `test_masked_branch_merging_is_rejected`（特征化）                                                                                                                                                                                                                        |
 | §2-II     | **一个 nest 内多条归约**（`s1+=…` 且 `s2+=…`，或求和+求最大混合） | ✅            | 归约描述改为**逐 store**（`StorePlan.reduce`），`_emit_reduce` 遍历全部 store，各起独立累加链 + 各写一次 `ONEPT vsts`（**D6 已修**）                                                             | `test_defect_d6_two_reductions_in_one_nest_are_both_emitted`、`test_defect_d6b_mixed_reductions_keep_their_own_recipe`、`test_reduce_segment_with_uniform_broadcast_sibling`（**已摘 xfail**）                                                                                                                                                                                                  |
 | §2-II     | **归约体含 lane 均匀加数**（`s[i] += a[i,j] + 1.0`） | ✅            | `_strip_reduce` 沿归约算子脊递归剥离旧值 → 均匀加数保留在 `varying` 内（**D4/D5 已修**）                                                                                    | `test_defect_d4_uniform_addend_inside_reduction_is_not_dropped`、`test_defect_d5_scaled_old_value_is_rejected`（**已摘 xfail**）                                                                                                                                                                                               |
-| §2-II     | **非 Add/Max/Min 的归约**（乘积归约 `s[i] *= a[i,j]`） | ✅（拒绝）        | `_reduce_op`（L1472–1494）**已改**：未识别算子显式拒绝 → 乘积归约不再被发成求和（**D1 已修**）                                                                                    | `test_defect_d1_product_reduction_is_not_emitted_as_sum`（**已摘 xfail**）                                                                                                                                                                                                     |
+| §2-II     | **非 Add/Max/Min 的归约**（乘积归约 `s[i] *= a[i,j]`） | ✅（拒绝）        | `_reduce_op`（`plan.py`）**已改**：未识别算子显式拒绝 → 乘积归约不再被发成求和（**D1 已修**）                                                                                    | `test_defect_d1_product_reduction_is_not_emitted_as_sum`（**已摘 xfail**）                                                                                                                                                                                                     |
 | §2-II     | **覆写 `s[i] = a[i,j]`（store 沿轴均匀、取值变化）** | ✅（拒绝）        | 统一归约判据：lane 均匀但取值不读 `dst` → 显式拒绝（精确诊断 `does not read 's' … accumulate form`），不再误判成 `vcadd`（**D2 已修**，随 D13）                                                                                    | `test_defect_d2_plain_overwrite_is_not_treated_as_reduction`（**已摘 xfail**）                                                                                                                                                                                           |
 | §2-II     | **`int`/`fp16` 的 `max`/`min` 归约**  | ✅            | `_reduce_identity` 按 dtype 派生单位元（`tirx.min_value/max_value`）→ 不再抛 `ValueError`（**D3 已修**）                                                                                    | `test_defect_d3_int_max_reduction_does_not_crash`、`test_defect_d3_f16_max_reduction_does_not_crash`（**均已摘 xfail**）                                                                                                                                                    |
 | —         | 数学核心 Δ 分类                           | ✅            | 6 个直接单测                                                                                                                                | `test_finite_difference_classifies_*`、`test_finite_difference_classifies_non_constant_as_piecewise`、`test_const_int_proves_constant_beyond_literals`                                                                                                                 |
@@ -615,7 +660,7 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 
 ### 4.1 矩阵的可复现性
 
-`tmp/drive_plan.py` 逐条编码上述场景并打印 `OK/REJECT + 原因`（`--tir` 时连带打印发射出的 TIR）。脚本的 `first_parallel` 取**最外层** `T.Parallel`（`post_order_visit` 先出最内层，故取最后一个），与 `build_plan` 需要「嵌套头」一致（§3.1 推论）。实测输出（改进 1+2+3+4+6+7 全部落地后）：
+`tilelang/ascend/analysis/test_drive_plan.py` 逐条编码上述场景并打印 `OK/REJECT + 原因`（`--tir` 时连带打印发射出的 TIR）。脚本的 `first_parallel` 取**最外层** `T.Parallel`（`post_order_visit` 先出最内层，故取最后一个），与 `build_plan` 需要「嵌套头」一致（§3.1 推论）。实测输出（改进 1+2+3+4+6+7 全部落地后）：
 
 ```text
 [OK ] c0_copy  c0_broadcast  c1_ifelse  c1_ternary  c1_single_arm  c2_rank
@@ -637,11 +682,11 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 
 共 **36** 个场景：**31 OK**、**5 REJ**（嵌套循环 / 跨迭代 stencil / 并列段含不干净 serial / GM 操作数 / `TRUE_RANDOM`），REJ 用例统一置于列表尾部。每个用例的每根轴分类与打分都通过 `plan.diagnostics`（成功）或 `Unsupported.diagnostics`（失败）打印。
 
-> 上表对应脚本中**基线 36 例**；其后的 `d1`–`d15`（21 例）为下节固化的**已知缺陷复现**，不改变上表结论（其输出顶部打印 `[OK ]` / `[REJ]` / `[ERR]`，与基线 OK/REJ 分列统计）。
+> 上表对应脚本中**基线 36 例**；其后的 `d*`（20 例，覆盖 D1–D13 / A0）为下节固化的**已知缺陷复现**，不改变上表结论（其输出顶部打印 `[OK ]` / `[REJ]` / `[ERR]`，与基线 OK/REJ 分列统计；合计 56 例 = 45 OK / 11 REJ / 0 ERR）。
 
 ### 4.2 已知缺陷回归基线（D1–D13 与 A0 均已修，D12 为特征化边界）
 
-`tmp/drive_plan.py` 尾部与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾「已知缺陷回归基线（探针 A–M）」小节**成对固化**了下列用例。测试每个都断言**正确契约**：缺陷修复前用 `xfail(strict=True)` 标注（修复后 `XPASS` 强制摘标记），或以「拒绝也接受」的容错形式固化；现在全部转为正常 `pass`。
+`tilelang/ascend/analysis/test_drive_plan.py` 尾部与 `testing/ascend/analysis/test_polyhedral_vectorize.py` 末尾「已知缺陷回归基线（探针 A–M）」小节**成对固化**了下列用例。测试每个都断言**正确契约**：缺陷修复前用 `xfail(strict=True)` 标注（修复后 `XPASS` 强制摘标记），或以「拒绝也接受」的容错形式固化；现在全部转为正常 `pass`。
 
 | 缺陷 | 用例（`drive_plan.py` / pytest） | 现象（修复前） | 类别 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -671,7 +716,7 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 复现命令：
 
 ```bash
-python tmp/drive_plan.py --tir &> log_poly.log     # 45 OK / 11 REJ / 0 ERR
+python tilelang/ascend/analysis/test_drive_plan.py --tir &> log_poly.log     # 45 OK / 11 REJ / 0 ERR
 python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py -q
 # 期望：87 passed（0 xfailed；D12 为正常 pass 的特征化用例）
 ```
@@ -683,11 +728,11 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 ### 5.1 新增一个逐元素算子
 
 - 目标指令已在 `simd.py`：
-  - 有专用标量-向量变体 → 加进 `_VEC_SCALAR_BINARY`（如 `vsub→vsubs`）；
-  - 普通二元/一元 → 加进 `_ELEMENTWISE_BINARY/_UNARY`（键取 TIR 节点名尾段小写）。
+  - 有专用标量-向量变体 → 加进 `primitives.py` 的 `_VEC_SCALAR_BINARY`（如 `vsub→vsubs`）；
+  - 普通二元/一元 → 加进 `primitives.py` 的 `_ELEMENTWISE_BINARY/_UNARY`（键取 TIR 节点名尾段小写）。
   - **发射层无需改动**（`_build` 按 recipe 查表 dispatch）。
-- 目标指令是新的 `T.simd.*`：需先在 `simd.py` 注册内建，再在 `_build` 加一个 `recipe` 分支。
-- 比较 / 布尔类：改 `_COMPARE`/`_BOOL_BINARY`/`_BOOL_UNARY`（并注意 `_COMPARE_FLIP`）。
+- 目标指令是新的 `T.simd.*`：需先在 `simd.py` 注册内建，再在 `emit.py` 的 `_build` 加一个 `recipe` 分支。
+- 比较 / 布尔类：改 `primitives.py` 的 `_COMPARE`/`_BOOL_BINARY`/`_BOOL_UNARY`（并注意 `_COMPARE_FLIP`）。
 - **成本**：通常 1–5 行 + 1 个测试。
 
 ### 5.2 新增一个几何场景
@@ -696,12 +741,12 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 
 只有两种情况需要动代码：
 
-1. **引入新的** **`AccessClass`**（例如 stride 为负 / 分段仿射）→ 改 `classify_delta`（分类）+ `rank_vector_axes`（候选/打分）+ `load_node`（建节点）+ `_build` / `_emit_store`（发射）。
-2. **引入新的语句形态** → 在 `normalize_body` 加一个分支。
+1. **引入新的 `AccessClass`**（例如 stride 为负 / 分段仿射）→ 改 `access.py` 的 `classify_delta`（分类）+ `plan.py` 的 `rank_vector_axes`（候选/打分）+ `value.py` 的 `load_node`（建节点）+ `emit.py` 的 `_build` / `_emit_store`（发射）。
+2. **引入新的语句形态** → 在 `body.py` 的 `normalize_body` 加一个分支。
 
 ### 5.3 换发射目标 / 新增硬件指令
 
-因为 `VectorPlan` / `VectorProgram` 硬件无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_Emitter.tail_mask` / `_store_mask` 里的指令名。分析层（§2–§6 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
+因为 `VectorPlan` / `VectorProgram` 指令选择无关，**换 target 只改发射层**：`emit_plan` / `_Emitter._build` / `_Emitter.tail_mask` / `_store_mask` 里的指令名。分析层（§2–§6 的规划部分）完全不动。多段路径只改变**语句编排**（逐段发射、外层轴包一次），不引入任何新的指令选择。
 
 **成本**：与目标指令集规模成正比，与场景数量无关。
 
@@ -721,11 +766,11 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 
 ### 5.5 新增 reduction 算子
 
-`_reduce_op`（算子→`vadd/vmax/vmin`）+ `_REDUCE_RECIPE`（→`vcadd/vcmax/vcmin`）+ `_reduce_identity`（单位元）三处同步扩展；发射端 `_emit_reduce` 无需改（按 recipe 查表）。
+只需在 `primitives.py` 的 `_REDUCE_PRIMITIVES` 里**加一行** `ReducePrimitive(tir_op, op, recipe, scalar, identity)`：算子白名单（`_REDUCE_OPS`）、跨 lane 指令（`_REDUCE_RECIPE`）、标量同构（`_REDUCE_SCALAR_RECIPE`）与单位元（`_reduce_identity`）全部由这张表派生；发射端 `_emit_reduce` 无需改（按 recipe 查表）。
 
 ### 5.6 与生产管线接线
 
-当前 `polyhedral.py` 是**离线原型**（仅测试引用）。接入路径建议：
+当前 `polyhedral` 包是**离线原型**（仅测试引用）。接入路径建议：
 
 1. 在 `--convert-tilelang-to-npu` 之后新增一个 Python pass，对目标 `T.Parallel` 嵌套调用 `vectorize_parallel_nests`；
 2. 与 C++ 的 `vectorize_parallel_to_pto.cc` / `ascend_simdvf_lower_parallel.cc` 做**能力对齐或替换**时，先对齐 §4 矩阵的边界；
@@ -800,6 +845,6 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 - 需求基准：`Parallel_ascend.md` §315–484
 - 发射风格权威：`src/ascend/transform/ascend_simdvf_lower_parallel.cc`
 - 向量内建：`tilelang/ascend/language/simd.py`
-- 场景扫描脚本：`tmp/scan_cases.py`；计划打印脚本：`tmp/drive_plan.py`
+- 场景扫描脚本：`tmp/scan_cases.py`；计划打印脚本：`tilelang/ascend/analysis/test_drive_plan.py`
 - 测试套件：`testing/ascend/analysis/test_polyhedral_vectorize.py`
 

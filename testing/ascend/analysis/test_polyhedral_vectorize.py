@@ -1575,7 +1575,7 @@ def test_vectorize_parallel_nests_lowers_multi_serial_program():
 #   * 修复后测试会 XPASS，``strict=True`` 使其直接报错 —— 强制顺手删掉 xfail 标记；
 #   * 若某个缺陷被"以另一种合理方式"修复（例如从静默错发改为明确拒绝），
 #     用例里已把「拒绝」当作可接受结果一并接受，无需改动。
-# 复现入口：``tmp/drive_plan.py`` 尾部的 ``d*`` 用例；对应 ``log_poly.log`` 中的诊断。
+# 复现入口：``tilelang/ascend/analysis/test_drive_plan.py`` 尾部的 ``d*`` 用例；对应 ``log_poly.log`` 中的诊断。
 # ---------------------------------------------------------------------------
 
 
