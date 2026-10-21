@@ -319,14 +319,15 @@ def test_if_single_arm_is_predicated_store():
                     c[i, j] = 0.0
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
+    # ``(8, 8)`` 的最内层只有 8 个 lane（寄存器是 64）→ P1 合成连续轴把它整条展平。
+    assert plan.vector_axis.name.startswith("k_")
     store = plan.stores[0]
     assert store.mask is not None
-    # ``i < j`` with a uniform ``i`` → ``vcmps(j, i, "gt")`` (predicate flipped).
-    assert store.mask.recipe == "vcmps" and store.mask.detail == "gt"
+    # 展平后 i、j 都随合成轴变化，``i < j`` 变成逐 lane 比较（不再是标量 vcmps）。
+    assert store.mask.recipe == "vcmp"
     ops = _emitted_ops(emit_plan(plan))
-    # tail mask (P=8 < lanes) and the predicate combine via pand.
-    assert "tl.simd.update_mask" in ops and "tl.simd.pand" in ops
+    # 展平后 8x8 == 64 lane 恰好一个整 chunk，不再需要尾块谓词。
+    assert "tl.simd.vcmp" in ops and "tl.simd.update_mask" not in ops
 
 
 def test_ternary():
@@ -966,19 +967,26 @@ def test_direct_serial_copy_absorbed():
                     c[i, j] = a[i, j] * 2.0
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert [ax.name for ax in plan.axes] == ["i", "j"]
-    assert all(not ax.is_parallel for ax in plan.axes if ax.name == "j")
+    # ``KS=8 < lanes=64`` → P1 合成连续轴：整条 nesting 展平成一个满 lane 连续轴，
+    # 512 个元素正好 8 个整 chunk。展平的**前提**是 serial 轴已被吸收进迭代域。
+    assert plan.vector_axis.name.startswith("k_")
+    assert plan.vector_axis.extent.value == MS * KS
     assert plan.stores[0].kind.value == "contiguous"
     assert plan.reduce is None
-    ops = _emitted_ops(emit_plan(plan))
-    # KS=8 < lanes=64：主体只有一个尾块，装载退化成带谓词的 vgather2（``vld`` 没有谓词
-    # 形式，整 lane 读会越过 buffer 尾部，缺陷 D10）；只有整 chunk 才走 ``vld``。
-    assert "tl.simd.vgather2" in ops and "tl.simd.vsts" in ops
+    stmt = emit_plan(plan)
+    ops = _emitted_ops(stmt)
+    # 满 lane 连续：只有 vld/vsts，没有带谓词的 gather，也没有尾块谓词。
+    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vgather2" not in ops and "tl.simd.update_mask" not in ops
+    assert not _over_reading_contiguous_load(stmt)
 
 
 def test_direct_serial_predicated_absorbed():
-    """S1 + 谓词：serial 体内的 ``if`` 降成谓词化 store，掩码沿 serial 向量轴逐 lane 变化。"""
+    """S1 + 谓词：serial 体内的 ``if`` 降成谓词化 store，掩码沿向量轴逐 lane 变化。
+
+    ``KS=8 < lanes=64`` → 同 :func:`test_direct_serial_copy_absorbed`，走 P1 合成连续轴；
+    谓词 ``a[i, j] != 0`` 展平后是一整条 lane 上的向量比较（``vcmps``）。
+    """
     MS, KS = 64, 8
 
     @T.prim_func
@@ -992,9 +1000,35 @@ def test_direct_serial_predicated_absorbed():
                         c[i, j] = a[i, j]
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
+    assert plan.vector_axis.name.startswith("k_")
     assert plan.stores[0].mask is not None
-    assert "tl.simd.vcmps" in _emitted_ops(emit_plan(plan))
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vcmps" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vgather2" not in ops
+
+
+def test_flatten_is_skipped_when_a_load_still_needs_gather():
+    """P1 的读侧门禁：展平只是把下标换成 ``k`` 的分解式，**消不掉** gather。
+
+    ``d[i, j] = g[i] - g[j]`` 展平后两个读都是分片访问（``g[k//32]`` / ``g[k%32]``）→
+    合成轴不接手，原单轴路径（``vdup`` + 1 条 gather）保持不变。
+    """
+    S, M = 32, 16
+
+    @T.prim_func
+    def k(G: T.Tensor((S,), "float32"), D: T.Tensor((M, S), "float32")):
+        with T.Kernel(1):
+            g = T.alloc_shared((S,), "float32")
+            d = T.alloc_shared((M, S), "float32")
+            for i in T.Parallel(M):
+                for j in T.Parallel(S):
+                    d[i, j] = g[i] - g[j]
+
+    plan = _single_segment(k)
+    assert [axis.name for axis in plan.axes] == ["i", "j"]
+    assert plan.vector_axis.name == "j"
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vgather2" in ops and "tl.simd.vdup" in ops
 
 
 def test_direct_serial_reduction_absorbed():
@@ -1396,7 +1430,8 @@ def test_single_segment_program_emits_identically_to_single_plan():
 
     cases = [
         ("multi-axis copy", multi_axis_copy, "j", ["i"]),
-        ("serial absorbed", serial_absorbed, "j", ["i"]),
+        # ``(64, 8)`` 的最内层只有 8 lane → P1 展平成单轴，没有可提层的外层并行轴。
+        ("serial absorbed", serial_absorbed, "k_i_j", []),
         ("outer parallel vector axis", outer_parallel_vector_axis, "i", []),
     ]
     for name, func, vector_axis, outer_axes in cases:
@@ -1609,46 +1644,63 @@ def _negative_immediate_muls(stmt) -> bool:
     return bool(bad)
 
 
+def _loop_maxima(stmt) -> dict:
+    """收集所有循环变量的最大取值（常量区间；用于判断访问跨度是否越界）。"""
+    maxima: dict = {}
+
+    def visit(node):
+        if isinstance(node, tirx.For) and isinstance(node.min, tirx.IntImm) and isinstance(node.extent, tirx.IntImm):
+            lo, extent = int(node.min.value), int(node.extent.value)
+            maxima[node.loop_var] = lo + extent - 1 if extent > 0 else lo
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return maxima
+
+
 def _over_reading_contiguous_load(stmt) -> bool:
     """连续 ``vld`` 的 access_ptr footprint 是否越过源 buffer 的分配范围。
 
-    这是 ``p_two_serial_independent``（``log_poly.log`` 第 1322 行）暴露的越界读形态
-    （缺陷 D10），有两条判据：
-
-    * 多维 buffer 的整 lane 连续读跨度超过**最内维**长度（行内跨界）；
-    * 起步下标全是常量时，``start + extent`` 超过 buffer 的**元素总数**（一维尾部越界，
-      如 ``(100,)`` 上 ``vld(a[64], 64)``）。
+    判据只有一条：``start + extent > buffer 的元素总数``。多维 buffer 里「整 lane 读跨越
+    最内维」本身不是错误——只要是同一块紧凑分配（P1 展平后正是这种形态：``(64, 8)``
+    上一次读 8 行），跨行读仍落在分配范围内。循环变量按**最大值**代入（只对沿该变量
+    ``Δ`` 为非负常数的下标做，保证取到的是上界）。
     """
+    analyzer = arith.Analyzer()
+    maxima = _loop_maxima(stmt)
     bad: list = []
 
-    def is_over_reading(node) -> bool:
+    def max_start(indices, strides):
+        total = 0
+        for index, stride in zip(indices, strides):
+            expr = index
+            for var, hi in maxima.items():
+                delta = finite_difference(expr, var, analyzer)
+                if isinstance(delta, tirx.IntImm) and int(delta.value) >= 0:
+                    expr = tirx.stmt_functor.substitute(expr, {var: tirx.IntImm("int32", hi)})
+                    expr = analyzer.simplify(expr)
+            if not isinstance(expr, tirx.IntImm):
+                return None
+            total += int(expr.value) * stride
+        return total
+
+    def visit(node):
         if not (isinstance(node, tirx.Call) and str(getattr(node.op, "name", "")) == "tl.simd.vld"):
-            return False
+            return
         addr = node.args[0]
         if not (isinstance(addr, tirx.Call) and str(getattr(addr.op, "name", "")) == "tl.access_ptr"):
-            return False
+            return
         inner, extent = addr.args[0], addr.args[1]
         if not (isinstance(inner, tirx.BufferLoad) and isinstance(extent, tirx.IntImm)):
-            return False
+            return
         shape = inner.buffer.shape
-        if len(shape) < 1:
-            return False
-        if len(shape) >= 2 and isinstance(shape[-1], tirx.IntImm) and int(shape[-1]) < int(extent):
-            return True
-        if not all(isinstance(dim, tirx.IntImm) for dim in shape):
-            return False
-        if not all(isinstance(idx, tirx.IntImm) for idx in inner.indices):
-            return False
-        strides = [1] * len(shape)
-        numel = 1
+        if not shape or not all(isinstance(dim, tirx.IntImm) for dim in shape):
+            return
+        strides, numel = [1] * len(shape), 1
         for k in range(len(shape) - 1, -1, -1):
             strides[k] = numel
             numel *= int(shape[k].value)
-        start = sum(int(idx.value) * stride for idx, stride in zip(inner.indices, strides))
-        return start + int(extent) > numel
-
-    def visit(node):
-        if is_over_reading(node):
+        start = max_start(inner.indices, strides)
+        if start is not None and start + int(extent.value) > numel:
             bad.append(True)
 
     tirx.stmt_functor.post_order_visit(stmt, visit)
@@ -2090,6 +2142,53 @@ def test_defect_d10_one_dimensional_tail_load_is_bounded():
     except Unsupported:
         return
     assert not _over_reading_contiguous_load(stmt)
+
+
+def _chunk_iterations(stmt) -> list[tuple]:
+    """收集每个 chunk 循环的 ``(loop_var 名, 起始, 迭代次数)``（常量区间）。"""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.For) and "chunk" in node.loop_var.name:
+            lo = int(node.min.value) if isinstance(node.min, tirx.IntImm) else None
+            extent = int(node.extent.value) if isinstance(node.extent, tirx.IntImm) else None
+            found.append((node.loop_var.name, lo, extent))
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return found
+
+
+def _one_dimensional_copy(M):
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), C: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            c = T.alloc_shared((M,), "float32")
+            for i in T.Parallel(M):
+                c[i] = a[i]
+
+    return k
+
+
+def test_tail_chunk_loop_runs_exactly_one_iteration():
+    """P0：尾块循环必须是**单次**迭代 ``[chunks-1, chunks)``。
+
+    ``tirx.For(var, min, extent)`` 的第三个参数是 extent（不是 end）。旧实现写成
+    ``For(tailchunk, full, chunks)``，于是从 ``full`` 起跑 ``chunks`` 次：``(100,)``
+    上会按 36 个有效 lane 写 ``c[128..163]``（缓冲区只有 100 个元素）——越界读写。
+    """
+    lanes = 64
+    for M in (100, 200, 300):
+        chunks = (M + lanes - 1) // lanes
+        iterations = _chunk_iterations(emit_plan(_single_segment(_one_dimensional_copy(M))))
+        assert iterations, "expected a strip-mined chunk loop"
+        covered: list = []
+        for name, lo, extent in iterations:
+            assert lo is not None and extent is not None, f"{name}: non-constant chunk span"
+            assert lo >= 0 and lo + extent <= chunks, f"M={M}: chunk loop {name} escapes [0, {chunks})"
+            covered.extend(range(lo, lo + extent))
+        # 所有 chunk 循环的并集必须**恰好**是 [0, chunks)：不多跑（越界）也不少跑。
+        assert sorted(covered) == list(range(chunks)), f"M={M}: chunk coverage {sorted(covered)} != [0, {chunks})"
 
 
 def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():

@@ -600,14 +600,15 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 
 **发射**（`_emit_program`）：逐段调用 `_emit_segment_stmts(segment, chunk_s<k>, hoisted=program.axes, prefix=f"s<k>_")`——每段一个 `chunk_s<k>` 循环 + 该段自身的非向量 serial 轴；`hoisted` 里的**共享外层并行轴只在最外层包一次**（段内按变量身份跳过）；各段掩码 prologue 提到最前；语句顺序 = 源码顺序。`_Emitter` 按段加名字前缀（`s0_`/`s1_`）避免跨段 SSA 重名。
 
-**正确性前提**：段间依赖必须**沿各段向量轴均匀**（Δ=0）。此时每个并行迭代内的段间次序与标量程序一致，逐段向量化不改变结果：
+**正确性前提**：每个并行迭代内，各段按源码顺序**整段执行**（段 k 的全部 lane 完成后才进入段 k+1），因此**段间** RAW/WAR 天然成立；真正需要排除的是**段内**的循环携带依赖（由 `_serial_is_clean` 检查）：
 
-| 形态                                                | 段间依赖                | 是否支持                               |
+| 形态                                                | 依赖关系                | 是否支持                               |
 | ------------------------------------------------- | ------------------- | ---------------------------------- |
 | 两个互不相关的 serial（各自 element-wise）                   | 无                   | ✅                                  |
-| 归约段 → 广播使用段（`s[i] += …` 后 `c[i,l] = s[i]*2`）      | `s[i]` 沿第二段向量轴 l 均匀 | ✅                                  |
-| element-wise 组合（`c[i,j]=a*2` 后 `d[i,l]=c[i,l]+1`） | 同址、沿向量轴等值           | ✅                                  |
-| 跨地址真依赖（`c[i,l] = c[i,l-1] + …`，stencil）           | 沿向量轴非均匀             | ❌ 拒绝                               |
+| 归约段 → 广播使用段（`s[i] += …` 后 `c[i,l] = s[i]*2`）      | 顺序执行；`s[i]` 在前段已完成 | ✅                                  |
+| element-wise 组合（`c[i,j]=a*2` 后 `d[i,l]=c[i,l]+1`） | 顺序执行；`c` 在前段已完成     | ✅                                  |
+| **跨段**跨地址读（前段写 `c`，后段读 `c[i,N-1-l]`）             | 顺序执行；`c` 已完整物化      | ✅（后段按每 lane 索引向量 `gather` 读）        |
+| **同一段内**跨地址真依赖（`c[i,l] = c[i,l-1] + …`，循环携带 stencil） | 段内沿向量轴非均匀          | ❌ 拒绝                               |
 | 并列段中**任一段**不干净                                    | —                   | ❌ 整体回落单段路径，按「nested serial loop」拒绝 |
 
 > **不变式（低风险设计）**：多段路径**只新增**接受面，不改动既有行为——`_try_build_program` 一旦返回 `None`（不适用 / 无 ≥2 段 / 任一段构造失败），`build_plan` 走的是与多段支持之前**逐字节相同**的单段代码。这保证既有测试（含各拒绝用例）零 churn，单段被接受场景的发射结果也不变。`render_plan` / `emit_plan` 同时接受两种计划类型。
@@ -615,6 +616,207 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 > **统一返回契约（级别 1）**：无论走哪条路径，`build_plan` 都返回 `VectorProgram`——单段路径把结果包成 1 段（`axes=_outer_axes(...)`，仅含提到最外层包一次的并行轴前缀），因而调用方只需处理一种计划类型。该包装不改变发射结果：单独发射一个 `VectorPlan`（自己包全部非向量轴）与发射「1 段 program」产出的 TIR **逐节点结构等价**，由护栏测试 `test_single_segment_program_emits_identically_to_single_plan` 覆盖（含「向量轴就是外层并行轴」的关键用例）。
 >
 > **诊断不吞（缺陷 A/B）**：多段路径的 program 与每段都带 `diagnostics`（段级含逐轴分类与「强制向量轴」说明，program 级含段数摘要）；某一段构造失败时，段级原因经 `notes` 合并进最终 `Unsupported.diagnostics`，不会只剩回落单段路径后那句泛化的「nested serial loop」。
+
+### 3.12 条件分支：`if` 的降级与谓词化
+
+分支全部在**规范化层**（`body.normalize_body`）与**值 DAG 层**（`value._select_node`）消化；发射层只看到「带 mask 的 store」或「`vsel` 节点」，不再有控制流。因此「带 `if` 怎么向量化」等价于「谓词从哪来、加在谁身上」。
+
+#### 3.12.1 语句级 `if` 的三种结局
+
+| TIR 形态 | 判定（`body.normalize_body`） | 产物 | 发射 |
+|---|---|---|---|
+| `if c: body`（单臂；`else` 缺省或为 `Evaluate(0)`） | 递归规范化 `body`，把 `c` 与已有 mask 取合取 | 谓词化 store（单臂可含**多条**写，全部带谓词） | `vsts(..., mask)` |
+| `if c: storeA else: storeB`，两臂各**恰好 1 条**写、`buffer.same_as`、下标 `expr_deep_equal` | 合并 | `StoreSpec(value=Select(c, A, B), mask=外层 mask)` | `vsel` |
+| 有 `else` 且双臂不满足上述条件（异址 / 臂内多条写 / 同址但某臂已有 mask） | 无法合并 | `Unsupported` | — |
+
+关键点：
+
+1. **单臂是「谓词化 store」，不是控制流提升**：`mask = And(外层 mask, cond)` 会一路累积，因此嵌套单臂 `if` 自然合成复合谓词。
+2. **同址判定用结构化相等**：`_same_indices` 用 `tirx.analysis.expr_deep_equal`，`IntImm(0)` 这类「不同对象、同值」的下标也能识别。
+3. **有 `else` 时两臂必须各只有一条写**（单臂分支不限制写条数）；否则不是同一位置的 `select` → `divergent branch arms`（§4 矩阵 §1-I-b）。
+4. **`masked branch merging`**：两臂同址但某臂内部已经是谓词化写（如 `if c1: if c2: c[i]=x else: c[i]=y`），一个 `Select` 表达不了两份 mask → 显式拒绝（D12，已知边界）。
+5. `else` 为字面量 `0`（TIR 的 `Evaluate(0)`）视作无 `else`（`_is_truthy_else`）。
+
+实现骨架（`body.py`）：
+
+```python
+if not else_stores:                         # 单臂 → 谓词化
+    combined = condition if mask is None else tirx.And(mask, condition)
+    for spec in then_stores:
+        spec.mask = combined if spec.mask is None else tirx.And(combined, spec.mask)
+elif len(then_stores) == 1 and len(else_stores) == 1:
+    if 同 buffer and _same_indices(...) and 两臂都没有 mask:
+        return [StoreSpec(buf, idx, tirx.Select(condition, t, f), mask)]
+    raise Unsupported("divergent branch arms ...")
+else:
+    raise Unsupported("divergent branch arms ...")
+```
+
+#### 3.12.2 `Select` 表达式 → `vsel`
+
+`T.if_then_else` / `tirx.Select` 走 `build_value`：
+
+```text
+条件 / 真臂 / 假臂全部 is_uniform → _uniform(expr)            # 标量求值一次 + vdup
+否则                              → ValueNode("vsel", [cond, t, f])
+```
+
+条件有两种来源，发射端 `_Emitter.predicate` 统一处理：
+
+| 条件 | 判定 | 发射 |
+|---|---|---|
+| 逐 lane（随向量轴变化） | `cond.is_uniform == False` | 条件本身即谓词寄存器（`vcmp` / `vcmps` / `pand` / `por` / `pnot`），直接作 `vsel` 的 mask |
+| 循环不变（沿向量轴 Δ=0） | `cond.is_uniform == True` | `update_mask(Select(cond, lanes, 0), bits)` 广播成全 lane 谓词，整个 chunk 同真同假 |
+
+布尔组合由 `_bool_node` 建 `pand` / `por` / `pnot`；比较由 `_compare` 建 `vcmp`（两侧都随 lane 变化）或 `vcmps`（一侧 lane 均匀，交换操作数时翻转谓词）。
+
+#### 3.12.3 访存怎么处理（关键语义）
+
+**只有 store 会被用户条件掩码；load 不随用户条件谓词化。**
+
+- `if c: c[i] = a[i]` → `vld a`（无条件） + `vsts c`（mask = `c`）；
+- `if c: c[i] = a[i] else: c[i] = b[i]` → `vld a` + `vld b` + `vsel` + `vsts`（无 mask）。
+
+原因：`build_value` 会**同时**构造 `Select` 两臂与右值的值 DAG，发射端逐节点求值，没有惰性分支。正确性前提是：
+
+> **所有被引用地址在所有 lane 上都必须可安全访问**（UB 内且不越界）；条件为假时只是结果被掩码丢弃，而不是跳过求值。
+
+因此不能用 `if` 去保护越界地址：`if i < n: c[i] = a[i]` 在 `n < extent` 时，`a[i]` 仍会整 lane 读取。尾部越界由尾块掩码单独处理（D10），与用户条件无关。
+
+chunk 内 mask 的叠加（`_store_mask`）：
+
+```text
+store 最终 mask = 用户谓词 ∧ 尾块谓词（都为空 → 全 lane 谓词）
+pre/post store = 用户谓词（不叠加尾块谓词，它们不随 chunk 变化）
+```
+
+#### 3.12.4 已知缺口（`if` 相关，待修）
+
+以下两种形态当前**构建成功但违反「build 成功 ⇒ emit 成功」契约**：
+
+| 形态 | 现象 | 根因 / 预期修法 |
+|---|---|---|
+| 单臂 `if` + **循环不变条件**（`if a[0] > 0: c[i] = a[i]`） | build OK，emit 抛 `ValueError: Cannot infer default mask width for dtype 'bool'` | `store.mask` 是 lane 均匀的 bool，`_store_mask` 走 `emitter.value()` 把它当数据向量 `vdup`；应改用 `_Emitter.predicate(node, elem_dtype)`，均匀条件走 `update_mask`（`Select` 路径已如此） |
+| **被条件包裹的归约**（`if i < N//2: s[0] += a[i]`） | build OK，归约忽略 mask，**静默对全部 lane 求和** | `_emit_one_reduce` 只使用全 lane 谓词；应在 `_plan_reduce` / `_classify_reduce` 对 `spec.mask is not None` 的归约显式拒绝（部分 lane 的跨 lane 归约语义需另行定义） |
+
+> 两者与 ana.md 的 A1（bool 数据操作数）同族：都是契约裂缝。规避方式：把条件改写成 `Select` 形式（`c[i] = T.if_then_else(cond, a[i], c[i])`），或不要在条件内做归约。
+
+### 3.13 拒绝判据（REJ）总表
+
+#### 3.13.1 判定层级与回退语义
+
+| 层级 | 触发点 | 影响范围 | 能否回退 |
+|---|---|---|---|
+| **轴级** | `rank_vector_axes` 过滤候选；或 `plan_for` 抛 `Unsupported` | 一根候选向量轴 | ✅ 换下一根轴（`build_plan` 的轴回退） |
+| **段级** | `_build_segment` / `_try_build_program` | 一个 serial 段 | ✅ 回落单段路径（`_try_build_program` 返回 `None`，原因写入 `notes`） |
+| **Nest 级** | `_split_nest` / `_prepare_segment`；或所有候选轴都失败 | 整个 `T.Parallel` | ❌ 整段拒绝；`vectorize_parallel_nests` 捕获后保留原 IR |
+| **Build 门禁** | `_require_supported_element`、归约精化、pre/post 均匀性 | 整个 nest | ❌（保证 build 成功 ⇒ emit 成功） |
+| **Emit 防御** | `_Emitter.scalar` / `_build` / `_emit_store` | — | 理论上不可达；触发即说明 build 门禁有缺口 |
+
+**轴级 vs Nest 级的分界**很关键：
+
+- **写侧**是 `TRUE_RANDOM` 时，该轴在 `rank_vector_axes` 阶段就被淘汰（不进入候选）；
+- **读侧 / 值算子 / 内存域**的问题只有在 `plan_for` 真正建值 DAG 时才暴露，属轴级失败，可以回退到次优轴；
+- 所有轴都失败才抛 nest 级 `no vectorizable axis: ...`；两种消息分别对应「无候选轴」与「候选轴逐个失败」。
+
+#### 3.13.2 A. 模型 / 边界类拒绝
+
+| 判据 | 触发条件 | 典型消息 | 代码位置 |
+|---|---|---|---|
+| 无并行轴 | 入口不是 `T.Parallel` 嵌套 | `no T.Parallel axis found` | `plan._split_nest` |
+| 无写语句 | `main` 规范化为空 | `T.Parallel body has no store to vectorize` | `plan._prepare_segment` |
+| 元素类型不支持 | store 元素类型推不出谓词宽度（如 `bool`） | `store element dtype 'bool' ... is not supported` | `plan._require_supported_element` |
+| GM 操作数 | 访存 `buffer.scope() == "global"` 且未 staging | `global-memory operand ... needs an explicit UB staging copy` | `value.load_node` |
+| 原子操作 | `Evaluate(atomic_*)` 或值表达式含原子调用 | `atomic op ... no vector+scalar atomic recipe` | `body.normalize_body` / `value._build_call` |
+| 无法识别的语句 | 非 `SeqStmt`/`BufferStore`/`BufferLoad`/`Evaluate`/`IfThenElse`/`For`/`Bind` | `unsupported statement in T.Parallel body: ...` | `body.normalize_body` |
+| 访问秩不匹配 | 下标个数 ≠ buffer 秩 | `access rank ... does not match buffer rank ...` | `access.linear_element_offset` |
+
+#### 3.13.3 B. 访存 / 仿射类拒绝
+
+| 判据 | 触发条件 | 典型消息 |
+|---|---|---|
+| 真无结构（写侧） | 某 store 沿轴为 `TRUE_RANDOM` | 该轴**不进入候选**；全轴如此 → `every store is true-random ... on all axes` |
+| 真无结构（读侧/值） | 元素偏移无法在索引向量通道构造 | 轴级：`non-affine access ... the per-lane index vector is not constructible (...)` |
+| 非 2 的幂常量除法 | 索引含 `FloorDiv/FloorMod`，除数不是正 2 的幂 | `FloorDiv by 3 is not a power of two`（`index_vector_reason`） |
+| 非常量除法 | 索引的 `FloorDiv/FloorMod` 除数不是编译期常量 | `needs a compile-time constant divisor` |
+| 不支持的索引算子 | 索引 DAG 含 `index_vector_reason` 不认识的算子 | `unsupported index operator <Name>` |
+| 负步长不可构造 | `STRIDED` 且 `stride < 0`，但索引向量构造不出 | `FloorDiv/... is not a power of two` 等（落 `TRUE_RANDOM`，D8） |
+
+#### 3.13.4 C. 值 DAG 类拒绝
+
+| 判据 | 触发条件 | 典型消息 |
+|---|---|---|
+| 不支持的值表达式 | 非 BufferLoad/Var/Imm/Call/Select/Cast/比较/算术/布尔 | `unsupported value expression: <Node>` |
+| 不支持的内建调用 | intrinsic 尾段不在 recipe 表 | `unsupported intrinsic call in T.Parallel body: <tail>` |
+| `FloorDiv/FloorMod` 作值算子 | 除数非正、非常量或非 2 的幂 | `... needs a positive compile-time constant divisor` / `not strength-reduced yet` |
+| 无法标量化 | 把向量值当标量操作数（emit 防御） | `cannot scalarize vector value '<recipe>'` |
+| 无发射 recipe | 值节点 recipe 没有 `_build` 分支 | `no emitter for value recipe '<recipe>'` |
+
+#### 3.13.5 D. 归约类拒绝
+
+| 判据 | 触发条件 | 典型消息 |
+|---|---|---|
+| 非 Add/Max/Min | 最外层归约算子为 `Mul` 等 | `unsupported reduction operator(s) Mul ... only Add/Max/Min ...` |
+| 覆写（last-write-wins） | lane 均匀地址 + 取值不读 dst | `... does not read 's': only the accumulate form ...` |
+| 旧值不在累加位置 | 旧值被缩放 / 嵌套 / 跨址（stencil） | `must be a direct operand ... accumulate position` |
+| 归约体在非累加位置读 dst | 剥离后 `varying` 仍读目标 buffer | `the reduction body reads the destination buffer ... outside the accumulate position` |
+| 部分归约 | 吸收的 serial 轴上，lane 均匀写 + 取值逐 lane 变化，但整段不是归约 | `a partial reduction mixed with element-wise stores has no vector form` |
+| 归约 + 符号 extent | `chunks is None` 且 `plan.reduce != None` | `a reduction needs a compile-time vector-axis extent ...` |
+| 条件归约（缺口） | 归约 store 带 mask（`if cond: s[0] += ...`） | 当前**不拒绝**（见 §3.12.4，需修） |
+
+#### 3.13.6 E. 语句结构 / serial 类拒绝
+
+| 判据 | 触发条件 | 典型消息 |
+|---|---|---|
+| 嵌套循环 | 进入 `normalize_body` 的 `For`（不干净 serial / 嵌套 `T.Parallel` / 非直接内嵌） | `nested <kind> loop inside T.Parallel is not affine-vectorizable` |
+| 兄弟语句只能沿 serial 轴 | 有 `pre`/`post` 但向量轴不是该 serial 轴 | `... can only be vectorized along that serial axis` |
+| pre/post 非均匀 | `pre`/`post` 的 store 沿向量轴不是 `UNIFORM` | `a statement before/after the serial loop must be uniform ...` |
+| 发散分支 | 双臂写不同地址 / 某一臂多条写 | `divergent branch arms ...` |
+| 带 mask 的臂合并 | 两臂同址但臂内已有谓词 | `masked branch merging is not supported`（D12） |
+| 多段中任一段不干净 | `_absorb_serial_chain` 返回 `None` | 回落单段 → `nested serial loop ...`；段级原因在 `diagnostics` |
+
+#### 3.13.7 F. 数据依赖类拒绝（serial 吸收的判据）
+
+`T.Parallel` 的迭代按定义相互独立；真正需要依赖分析的是**被吸收的 `T.serial` 轴**。`plan._serial_is_clean` 用三条保守判据排除循环携带依赖：
+
+| # | 判据 | 拒绝条件 | 典型消息 |
+|---|---|---|---|
+| 1 | 沿循环变量**地址不变**的写必须是归约 | 目的地址 `Δ==0`，但取值不是 `dst[...] = dst[...] <op> x`（同址自读） | `write to X is invariant along 'j' but not a reduction` |
+| 2 | 归约必须真的随循环变量变化 | 是累积写，但取值沿该轴 `Δ==0`（如 `cnt[0] += 1`） | `reduction into X does not vary along 'j'` |
+| 3 | 禁止跨迭代读 | 循环内某 buffer 被写，又被读，且读地址与**所有**写地址都不同（stencil） | `cross-iteration read of X along 'j'` |
+
+补充说明：
+
+- 判据 1、2 共同覆盖「共享标量」：`cnt[0] = a[i,j]`（覆盖写）与 `cnt[0] += 1`（取值不变化）都拒绝；
+- 判据 3 的等价表述：读地址必须与某条写的地址**同址**（`_same_indices`），才允许「读自己刚写的值」；
+- 通过者即 S1（`c[i,j] = a[i,j]`）与 S3（`s[i] += a[i,j]`）；
+- 吸收失败不会立即报错：`_split_nest` 停止吸收，`normalize_body` 最终以 `nested serial loop` 拒绝（多段路径则先回落单段，段级原因保留在 `diagnostics`）。
+
+**没有做的依赖分析**：
+
+- 不做通用的跨语句 / 跨段依赖求解；多段路径依赖**源序顺序执行**保证段间 RAW/WAR 正确，不做重排；
+- 同一 `T.Parallel` 内**多迭代写同一地址**的语义未定义（数据竞争），模型不拒绝也不保证 last-write-wins（ana.md A3）；
+- 归约的旧值必须同址，这条规则既是正确性要求，也是当前唯一建模的「循环携带依赖」形式。
+
+#### 3.13.8 与 `test_drive_plan.py` 的对应
+
+`drive_plan` 当前 11 个 REJ 用例与上述判据的对应关系：
+
+| 用例 | 判据类别 | 具体原因 |
+|---|---|---|
+| `c6_complex` | E. 嵌套循环 | 共享标量 + 非直接内嵌 serial → `nested serial loop` |
+| `s_serial_stencil` | F. 跨迭代读 | stencil 读地址 ≠ 写地址 |
+| `p_serial_one_unclean` | E. 多段不干净 | 一段不可吸收 → 回落单段 → nested loop |
+| `c_gm` | A. 内存域 | GM 操作数需 staging |
+| `c4_true_random` | B. 索引不可构造 | `i//3` 非 2 的幂 |
+| `d9b_symbolic_extent_reduce` | D. 归约 + 符号 extent | chunk 需编译期展开 |
+| `d14_partial_reduce` | D. 部分归约 | serial 轴上 lane 均匀写 + 变化取值 |
+| `d15_bool_store` | A. 元素类型 | `bool` 无谓词宽度 |
+| `d1_product_reduce` | D. 归约算子 | `Mul` 不在白名单 |
+| `d2_plain_overwrite` | D. 覆写 | 取值不读 dst |
+| `d12_masked_branch` | E. 分支形态 | 臂内已有 mask，无法合并 |
+
+> 统一约定：**所有拒绝都抛 `Unsupported`**（不抛 `ValueError` / `AssertionError`），并尽可能携带 `diagnostics`。已知例外是 §3.12.4 记录的两个 `if` 缺口，以及 ana.md A1（`bool` 作数据操作数）。
 
 ***
 
@@ -646,7 +848,7 @@ return VectorProgram(axes=parallel_axes, segments=segments)
 | §5        | `T.atomic_add`                      | ❌            | 无「向量+标量」原子配方                                                                                                                           | `test_atomic_rejected`                                                                                                                                                                                                                                               |
 | §6 第一步    | 直接内嵌、干净的 serial 循环（S1 copy / S3 归约） | ✅            | serial 轴被吸收为候选轴：S1 → 连续 `vld/vsts`，S3 → `vcadd`；含循环携带状态（共享标量 / stencil）仍拒                                                              | `test_direct_serial_copy_absorbed`、`test_direct_serial_predicated_absorbed`、`test_direct_serial_reduction_absorbed`                                                                                                                                                  |
 | §6 第二步    | 多条语句夹一个 serial（M1/M2/M3/夹心、S2 私有标量） | ✅            | body 为 `SeqStmt` 且**恰好含一个干净 serial 循环**时吸收该轴：其前置/后置兄弟语句成为 `pre`/`post` 段，发射在 chunk 循环**之外**（顺序 `pre → 主体 → post`）                      | `test_serial_pre_statement_absorbed`、`test_serial_post_statement_absorbed`、`test_serial_sandwiched_statements_absorbed`、`test_serial_independent_store_group_absorbed`、`test_direct_serial_private_scalar_absorbed`                                                  |
-| §6 第三步    | 多个**并列**的干净 serial 循环（≥2 段）         | ✅            | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间依赖须沿向量轴均匀                                                       | `test_multi_serial_independent_segments`、`test_multi_serial_reduce_then_use`、`test_multi_serial_compose_keeps_source_order`、`test_multi_serial_leading_statement_is_first_segment_pre`、`test_vectorize_parallel_nests_lowers_multi_serial_program`                   |
+| §6 第三步    | 多个**并列**的干净 serial 循环（≥2 段）         | ✅            | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间按源码顺序整段执行（段内不得有循环携带依赖）                                                       | `test_multi_serial_independent_segments`、`test_multi_serial_reduce_then_use`、`test_multi_serial_compose_keeps_source_order`、`test_multi_serial_leading_statement_is_first_segment_pre`、`test_vectorize_parallel_nests_lowers_multi_serial_program`                   |
 | §6        | 嵌套 serial / 跨迭代标量状态 / 并列段中有一段不干净    | ❌            | `nested ... loop ... is not affine-vectorizable`                                                                                       | `test_serial_shared_scalar_rejected`、`test_serial_stencil_rejected`、`test_multi_serial_one_unclean_is_rejected`                                                                                                                                                      |
 | §1-I      | **双臂 `if` 的某一臂再嵌 `if`**（臂自带谓词）    | ❌            | `normalize_body`（`body.py`）`masked branch merging is not supported`——**两份文档先前均未声明**（缺陷 D12）                                                 | `test_masked_branch_merging_is_rejected`（特征化）                                                                                                                                                                                                                        |
 | §2-II     | **一个 nest 内多条归约**（`s1+=…` 且 `s2+=…`，或求和+求最大混合） | ✅            | 归约描述改为**逐 store**（`StorePlan.reduce`），`_emit_reduce` 遍历全部 store，各起独立累加链 + 各写一次 `ONEPT vsts`（**D6 已修**）                                                             | `test_defect_d6_two_reductions_in_one_nest_are_both_emitted`、`test_defect_d6b_mixed_reductions_keep_their_own_recipe`、`test_reduce_segment_with_uniform_broadcast_sibling`（**已摘 xfail**）                                                                                                                                                                                                  |

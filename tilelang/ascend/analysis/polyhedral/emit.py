@@ -43,7 +43,7 @@ PIECEWISE 分片 / INDIRECT 间接）改用 ``base = BufferLoad(buffer, 全 0)``
 
 from __future__ import annotations
 
-from tvm import tirx
+from tvm import arith, tirx
 
 from tilelang.ascend.language import simd
 from tilelang.ascend.language.simd import _mask_bits
@@ -76,6 +76,19 @@ def _unsigned_index(reg):
     return reg
 
 
+def _value_key(node: ValueNode):
+    """SSA 复用键：同一次访存（同 buffer、同下标）只发一条装载。
+
+    ``build_value`` 对每个 ``BufferLoad`` 都新建 :class:`ValueNode`，所以
+    ``if a[i, j] != 0: c[i, j] = a[i, j]`` 里的两次读是**两个节点**；按 ``id(node)``
+    缓存会让它们各自发一条 ``vld``/``vgather2``。无副作用的装载叶子按结构复用。
+    """
+    if node.recipe in ("vload", "vload_strided", "uniform_load") and node.access is not None:
+        access = node.access
+        return (node.recipe, id(access.buffer), tuple(str(index) for index in access.indices), node.detail)
+    return id(node)
+
+
 class _Emitter:
     """把 :class:`VectorPlan` 的 chunk 体发射成 ``T.simd.*`` SSA 序列。
 
@@ -93,9 +106,14 @@ class _Emitter:
         self.masked_tail = masked_tail  # 本发射块是否需要屏蔽尾部车道（尾块，见 tail_mask）
         self.memo: dict = {}
         self.lets: list = []  # chunk 体内的 Bind / Evaluate
-        self.prologue: list = []  # chunk 无关的 Bind（掩码）
+        self.prologue: list = []  # chunk 无关的 Bind（掩码 / 步长斜坡）
         self.counter = 0
         self._mask_vars: dict = {}
+        self._ramps: dict = {}
+        self._prologue_vars: set = set()
+        # 地址化简：合成轴（P1 展平）的分解式在 chunk 基址代入后（``(chunk*64)//8`` →
+        # ``chunk*8``）必须折掉，否则会在生成的 C 代码里留下运行期整数除法。
+        self.analyzer = arith.Analyzer()
 
     # -- SSA 绑定 -----------------------------------------------------------
     def bind(self, expr, target: list):
@@ -103,6 +121,30 @@ class _Emitter:
         self.counter += 1
         target.append(tirx.Bind(var, expr))
         return var
+
+    def prologue_bind(self, expr):
+        """绑一个**与 chunk 无关**的值（提到 chunk 循环外只算一次）。"""
+        var = self.bind(expr, self.prologue)
+        self._prologue_vars.add(id(var))
+        return var
+
+    def ramp(self, stride: int, mask):
+        """步长索引斜坡 ``vci(0) * stride``（``vgather2``/``vscatter`` 的每 lane 偏移）。
+
+        斜坡与 chunk 无关：掩码也是 chunk 无关（整 chunk 的全 lane 谓词）时提到循环外
+        只算一次；尾块/符号 extent 的谓词绑在 chunk 体内，此时就地发射，但在同一块内
+        仍按 ``(stride, mask)`` 复用（多条访存共用一个斜坡）。
+        """
+        key = (stride, id(mask))
+        cached = self._ramps.get(key)
+        if cached is not None:
+            return cached
+        if id(mask) in self._prologue_vars:
+            cached = self.prologue_bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask))
+        else:
+            cached = self.bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask), self.lets)
+        self._ramps[key] = cached
+        return cached
 
     # -- 掩码 ---------------------------------------------------------------
     def all_mask(self, bits: int):
@@ -112,6 +154,7 @@ class _Emitter:
             return cached
         var = tirx.Var(f"mask{self.prefix}{bits}", _MASK_DTYPE)
         self.prologue.append(tirx.Bind(var, simd.pset(bits, "PAT_ALL")))
+        self._prologue_vars.add(id(var))
         self._mask_vars[bits] = var
         return var
 
@@ -173,7 +216,9 @@ class _Emitter:
     def addr(self, access: AccessInfo, uniform: bool = False):
         """一次访问的 ``BufferLoad``：向量轴变量代入当前 chunk 的 lane 基址。"""
         base = _int(0) if uniform else self.lane_base
-        indices = [tirx.stmt_functor.substitute(index, {self.plan.vector_axis.var: base}) for index in access.indices]
+        indices = [
+            self.analyzer.simplify(tirx.stmt_functor.substitute(index, {self.plan.vector_axis.var: base})) for index in access.indices
+        ]
         return tirx.BufferLoad(access.buffer, indices)
 
     def index_addr(self, access: AccessInfo):
@@ -196,7 +241,7 @@ class _Emitter:
 
     # -- 值 ----------------------------------------------------------------
     def value(self, node: ValueNode):
-        key = id(node)
+        key = _value_key(node)
         if key in self.memo:
             return self.memo[key]
         expr = self._build(node)
@@ -231,7 +276,7 @@ class _Emitter:
             _, stride = node.access.axis_class(self.plan.vector_axis)
             bits = _mask_bits(node.dtype)
             mask = self.load_mask(bits)
-            index = simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask)
+            index = self.ramp(stride, mask)
             return self.bind(simd.vgather2(self.addr(node.access), index, mask), self.lets)
         if recipe == "gather":
             # 每 lane 索引向量通道（改进 1）：``args[0]`` 是绝对元素偏移向量。
@@ -318,7 +363,7 @@ def _emit_store(plan: VectorPlan, store: StorePlan, emitter: _Emitter) -> None:
         # 负步长落到下面的索引向量通道：无符号斜坡乘负步长表达不了负方向（缺陷 D8）。
         _, stride = store.access.axis_class(plan.vector_axis)
         if stride is not None and stride > 0:
-            index = emitter.bind(simd.vmuls(simd.vci(_int(0), "uint32"), _int(stride), mask), emitter.lets)
+            index = emitter.ramp(stride, mask)
             emitter.lets.append(tirx.Evaluate(simd.vscatter(value, emitter.addr(store.access), index, mask)))
             return
 
@@ -379,13 +424,15 @@ def _emit_elementwise_chunks(plan: VectorPlan, chunk: tirx.Var, prefix: str) -> 
     full = plan.chunks - 1
     if full > 0:
         blocks.append(tirx.For(chunk, 0, _int(full), tirx.ForKind.SERIAL, _seq(emit_body(chunk, False, ""))))
-    # 尾块是单次循环（``[chunks-1, chunks)``）：只有这一块带尾块谓词，整 chunk 保留全 lane。
+    # 尾块是**单次**循环（``[chunks-1, chunks)``）：只有这一块带尾块谓词，整 chunk 保留全 lane。
+    # ``tirx.For(var, min, extent)`` 的第三个参数是 **extent**（不是 end）：写成 ``plan.chunks``
+    # 会让尾块从 ``full`` 起跑 ``chunks`` 次（越界读写，P0）。
     tail_chunk = tirx.Var(f"{prefix}tailchunk", "int32")
     blocks.append(
         tirx.For(
             tail_chunk,
             _int(full),
-            _int(plan.chunks),
+            _int(1),
             tirx.ForKind.SERIAL,
             _seq(emit_body(tail_chunk, True, f"{prefix}tail_")),
         )

@@ -783,14 +783,15 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 
 发射（`_emit_program`）：逐段生成 `chunk_s<k>` 循环，**共享外层并行轴只包一次**，各段掩码 prologue 提到最前，顺序 = 源码顺序。
 
-**正确性前提**：段间依赖必须**沿各段向量轴均匀**（Δ=0）——此时每个并行迭代内的段间次序与标量程序一致：
+**正确性前提**：每个并行迭代内，各段按源码顺序**整段执行**（段 k 的全部 lane 完成后才进入段 k+1），因此**段间** RAW/WAR 天然成立；真正需要排除的是**段内**的循环携带依赖：
 
-| 形态 | 段间依赖 | 结果 |
+| 形态 | 依赖关系 | 结果 |
 |---|---|---|
 | 两个互不相关的 serial（各自 element-wise） | 无 | 支持 |
-| 归约段 → 广播使用段（`s[i] += …` 后 `c[i,l] = s[i]*2`） | `s[i]` 沿第二段向量轴 l 均匀 | 支持 |
-| element-wise 组合（`c[i,j]=a*2` 后 `d[i,l]=c[i,l]+1`） | 同址、沿向量轴等值 | 支持 |
-| 跨地址真依赖（`c[i,l] = c[i,l-1] + …`，stencil） | 沿向量轴非均匀 | 拒绝 |
+| 归约段 → 广播使用段（`s[i] += …` 后 `c[i,l] = s[i]*2`） | 顺序执行；`s[i]` 在前段已完成 | 支持 |
+| element-wise 组合（`c[i,j]=a*2` 后 `d[i,l]=c[i,l]+1`） | 顺序执行；`c` 在前段已完成 | 支持 |
+| **跨段**跨地址读（前段写 `c`，后段读 `c[i,N-1-l]`） | 顺序执行；`c` 已完整物化 | 支持（后段按每 lane 索引向量 `gather` 读） |
+| **同一段内**跨地址真依赖（`c[i,l] = c[i,l-1] + …`，循环携带 stencil） | 段内沿向量轴非均匀 | 拒绝 |
 | 并列段中**任一段**不干净 | — | 整体回落单段路径，按「nested serial loop」拒绝 |
 
 > **低风险不变式**：多段路径**只新增**接受面。`_try_build_program` 一旦返回 `None`，`build_plan` 走的是与多段支持之前**逐字节相同**的单段代码；因此既有测试（含各拒绝用例）零改动，单段被接受场景的发射结果也不变。`render_plan` / `emit_plan` 同时接受两种计划类型。
@@ -829,7 +830,7 @@ def _try_build_program(stmt, analyzer, lanes, notes=None) -> VectorProgram | Non
 | §5 | `T.atomic_add` | 拒绝 | 无「向量+标量」原子配方 |
 | §6 第一步 | 直接内嵌、干净的 serial 循环（S1 copy / S3 归约） | 支持 | serial 轴被吸收为候选轴；S1 → 连续 `vld/vsts`，S3 → `vcadd` |
 | §6 第二步 | 多条语句夹一个 serial（M1/M2/M3/夹心、S2 私有标量） | 支持 | body 恰好含一个干净 serial 循环时，其前后兄弟语句作为 `pre`/`post` 段，在 chunk 循环外每迭代一次（`pre → 主体 → post`） |
-| §6 第三步 | 多个**并列**的干净 serial 循环（≥2 段） | 支持 | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间依赖须沿向量轴均匀 |
+| §6 第三步 | 多个**并列**的干净 serial 循环（≥2 段） | 支持 | 逐段独立向量化 + 源序发射（`VectorProgram`）：每段各自选向量轴/归约/`pre`/`post`，共享外层并行轴只包一次；段间按源码顺序整段执行（段内不得有循环携带依赖） |
 | §6 | 嵌套 serial / 跨迭代标量状态 / 并列段中有一段不干净 | 拒绝 | `nested ... loop ... is not affine-vectorizable` |
 | §1-I | **双臂 `if` 的某一臂再嵌 `if`**（臂自带谓词） | 拒绝 | `masked branch merging is not supported`（先前文档未声明；缺陷 D12） |
 | §2-II | **一个 nest 内多条归约**（`s1+=…` 且 `s2+=…`，或求和+求最大混合） | 支持 | **D6 已修**：逐 store 发射——每条归约各起独立累加链、各写一次 `ONEPT vsts`（求和用 `vcadd`、求最大用 `vcmax`） |

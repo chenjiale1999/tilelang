@@ -29,6 +29,7 @@ from .primitives import (
     _REDUCE_SCALAR_RECIPE,
     Unsupported,
     _elem_dtype,
+    _int,
     _same_buffer,
     _same_indices,
     _seq,
@@ -491,6 +492,127 @@ def _reduce_op(stores: list[StoreSpec]) -> str:
     raise Unsupported(f"unsupported reduction operator(s) {names} (方案 §2 Case II): only Add/Max/Min reductions are supported")
 
 
+def _expr_reads_buffers(expr, buffers: list) -> bool:
+    """表达式里是否读到了给定 buffer 之一（用于展平通道的写冲突门禁）。"""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferLoad) and any(_same_buffer(node.buffer, buffer) for buffer in buffers):
+            found.append(True)
+
+    tirx.stmt_functor.post_order_visit(expr, visit)
+    return bool(found)
+
+
+def _flatten_axes(axes: list[Axis], analyzer: arith.Analyzer) -> tuple[Axis, dict, int] | None:
+    """把整条 nesting 展平成一个合成轴 ``k``（P1）。
+
+    展平是「最内层轴不足一个向量寄存器」场景（``(64, 8)`` + 64 lane）的正解：单轴
+    向量化只能用到 8/64 个 lane，还要用带谓词的 ``vgather2`` 装载；展平后是一次
+    **满 lane 连续** ``vld``/``vsts``。
+
+    每个成员轴 ``v_m`` 用 ``k`` 的分解式替换（行主序）::
+
+        v_inner = k % E_inner
+        v_mid   = (k // suffix_m) % E_m
+        v_outer = k // suffix_outer          # 最外层不取模：k < Π E 恒成立
+
+    最外层**不能**写成 ``(k // suffix) % E``：TVM 会把它化简成 ``k % Π E``，进而
+    ``Δ(k)`` 不再是常数 1，连续性就丢了（实测）。
+
+    只接受 2 的幂 extent：分解式的除数因此都是 2 的幂，chunk 基址代入后能被
+    ``arith.Analyzer`` 化简成 ``chunk * <每 chunk 行数>``（否则会在生成的 C 代码里
+    留下运行期整数除法）。
+
+    返回 ``(合成轴, {成员轴变量: 分解式}, 总 extent)``；不适用时返回 ``None``。
+    """
+    if len(axes) < 2:
+        return None
+    extents = []
+    for axis in axes:
+        extent = _const_int(axis.extent, analyzer)
+        if extent is None or extent < 2 or (extent & (extent - 1)):
+            return None
+        extents.append(extent)
+    total = 1
+    for extent in extents:
+        total *= extent
+    var = tirx.Var("k_" + "_".join(axis.name for axis in axes), "int32")
+    mapping: dict = {}
+    suffix = 1
+    for position, (axis, extent) in enumerate(zip(reversed(axes), reversed(extents))):
+        if position == 0:
+            mapping[axis.var] = var % extent
+        elif position == len(axes) - 1:
+            mapping[axis.var] = var // suffix
+        else:
+            mapping[axis.var] = (var // suffix) % extent
+        suffix *= extent
+    return Axis(var, _int(total), 0, tirx.ForKind.PARALLEL), mapping, total
+
+
+def _try_flatten(
+    axes: list[Axis],
+    pre_stmts: list[tirx.Stmt],
+    main_stmt: tirx.Stmt,
+    post_stmts: list[tirx.Stmt],
+    lanes: int,
+    analyzer: arith.Analyzer,
+) -> tuple[_SegmentSpecs | None, str]:
+    """尝试「合成连续轴」通道，返回 ``(specs, 拒绝原因)``。
+
+    适用条件（全部满足才生成候选）：
+
+    * 没有 ``pre``/``post`` 兄弟语句（它们引用外层并行变量，展平后不再是 lane 均匀的；
+      保留原路径即可）；
+    * 最内层轴的 extent **小于** lanes——这正是唯一需要展平的场景；``extent == lanes``
+      或更大时现有单轴实现本就发出满 lane ``vld``，不做改动；
+    * 全部 extent 是常量且为 2 的幂（见 :func:`_flatten_axes`）；
+    * **写侧门禁**：每条 store 沿合成轴都是 ``CONTIGUOUS``（``Δ == 1``）——组内每个 k
+      的写地址两两不同，故展平成并行轴不会引入写冲突，也天然排除归约/覆盖写；
+    * **读侧门禁 1**：所有读只能是 ``CONTIGUOUS`` 或 ``UNIFORM``——展平只是把下标换成
+      ``k`` 的分解式，**消不掉** gather（分片/置换/间接读取）；
+    * **读侧门禁 2**：被写的 buffer 不得在体内被读（排除 stencil、累加、跨 k 依赖）。
+
+    任何一步不满足都返回 ``(None, reason)``，由调用方记录诊断后走原有路径——**纯增量**，
+    不改变任何既有行为。
+    """
+    if pre_stmts or post_stmts:
+        return None, ""
+    if len(axes) < 2:
+        return None, ""
+    innermost = _const_int(axes[-1].extent, analyzer)
+    if innermost is None or innermost >= lanes:
+        return None, ""  # 最内层已能填满一个向量寄存器：不是本次要解决的问题
+    flat = _flatten_axes(axes, analyzer)
+    if flat is None:
+        return None, f"flatten rejected: extent product of [{', '.join(axis.name for axis in axes)}] is not a power-of-two chain"
+    flat_axis, mapping, total = flat
+    body = tirx.stmt_functor.substitute(main_stmt, mapping)
+    try:
+        specs = _prepare_segment([flat_axis], None, [], body, [], _collect_aliases(body), analyzer, lanes)
+    except Unsupported as err:
+        return None, f"flatten rejected: {err}"
+    if any(info.axis_class(flat_axis)[0] != AccessClass.CONTIGUOUS for info in specs.main_infos):
+        return None, (f"flatten rejected: not every store is contiguous along the synthesized axis '{flat_axis.name}' (extent {total})")
+    # 读侧门禁：展平只负责「连续 + 广播」；若还有访存需要每 lane 索引向量（gather），
+    # 展平并不能消掉 gather（只是换个轴算下标），就不接手，保持原单轴路径。
+    load_infos = _load_infos([flat_axis], specs.all_specs, analyzer)
+    if any(info.axis_class(flat_axis)[0] not in (AccessClass.CONTIGUOUS, AccessClass.UNIFORM) for info in load_infos):
+        return None, (
+            f"flatten rejected: a load along the synthesized axis '{flat_axis.name}' still needs an "
+            f"index vector (gather) — flattening would not remove it"
+        )
+    targets = [spec.buffer for spec in specs.main_specs]
+    for spec in specs.main_specs:
+        for expr in (spec.value, spec.mask):
+            if expr is not None and _expr_reads_buffers(expr, targets):
+                return None, (
+                    f"flatten rejected: a written buffer is also read inside the nest (no write-conflict-free flattening) — extent {total}"
+                )
+    return specs, ""
+
+
 def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorProgram:
     """主入口：``T.Parallel`` 嵌套 → :class:`VectorProgram`（1..N 段）。
 
@@ -532,9 +654,32 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorProgram:
         raise
     all_infos = specs.all_infos
     load_infos = _load_infos(axes, specs.all_specs, analyzer)
+
+    # P1「合成连续轴」：最内层轴不足一个向量寄存器时（如 ``(64, 8)`` + 64 lane），
+    # 单轴向量化只能用 8/64 个 lane 并退化成带谓词的 ``vgather2`` 装载；把整条 nesting
+    # 展平成一个满 lane 连续的合成轴后是纯粹的 ``vld``/``vsts``。这是**增量通道**：
+    # 不适用时原样回落到单轴排序路径（诊断照旧）。
+    flattened, flatten_note = _try_flatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes, analyzer)
+    flatten_notes = [flatten_note] if flatten_note else []
+    if flattened is not None:
+        flat_axis = flattened.axes[0]
+        try:
+            plan = flattened.plan_for(flat_axis, analyzer)
+        except Unsupported as err:
+            flatten_notes.append(f"flattened axis '{flat_axis.name}': {err}")
+        else:
+            plan.diagnostics = [
+                f"flattened nest [{', '.join(axis.name for axis in axes)}] -> '{flat_axis.name}' "
+                f"(extent {flat_axis.extent}, full-lane chunks)",
+                *_axis_diagnostics(flattened.axes, flattened.all_infos, _load_infos(flattened.axes, flattened.all_specs, analyzer)),
+            ]
+            program = VectorProgram(axes=[], segments=[plan])
+            program.diagnostics = [f"single-segment program: 1 segment, flattened axis '{flat_axis.name}'"]
+            return program
+
     ranked = rank_vector_axes(axes, specs.main_specs, all_infos, load_infos, analyzer)
     # 改进 7：先记录每根轴的分类；多段路径试过但失败的原因一并带上（缺陷 B）。
-    diagnostics = [*notes, *_axis_diagnostics(axes, all_infos, load_infos)]
+    diagnostics = [*notes, *flatten_notes, *_axis_diagnostics(axes, all_infos, load_infos)]
     if not ranked:
         raise Unsupported(
             "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
