@@ -6,6 +6,32 @@ from tilelang.transform import _ffi_api
 from . import z3_scheduler  # noqa: F401
 
 
+def AscendAnalyzeSimdVFMemory():
+    """Analyze memory legality of every SIMD_VF block (read-only debug pass).
+
+    The pass returns the IR unchanged and logs a report of store injectivity
+    and cross-iteration dependences. Use it to inspect the P1 position without
+    changing the pipeline.
+    """
+    return _ffi_api.AscendAnalyzeSimdVFMemory()  # type: ignore
+
+
+def AscendAnalyzeSimdVFMemoryReport(func):
+    """Return a human-readable memory-legality report for a PrimFunc.
+
+    Parameters
+    ----------
+    func : tvm.tirx.PrimFunc
+        A function containing one or more ``SIMD_VF`` blocks.
+
+    Returns
+    -------
+    report : str
+        Per-VF/per-nest legality report. This function does not rewrite the IR.
+    """
+    return _ffi_api.AscendAnalyzeSimdVFMemoryReport(func)  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -227,6 +253,8 @@ __all__ = [
     "AnnotateMultiBufferEligible",
     "AscendRemoveNoOp",
     "AscendInsertOOBPadding",
+    "AscendAnalyzeSimdVFMemory",
+    "AscendAnalyzeSimdVFMemoryReport",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",
