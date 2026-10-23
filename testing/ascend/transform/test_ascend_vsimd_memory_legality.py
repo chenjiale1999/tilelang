@@ -396,6 +396,26 @@ def test_tail_min_legal():
     assert "queries=1" in report
 
 
+def test_alloc_var_unsupported():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                v = T.alloc_var("float32", init=0.0)
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] + v
+            T.copy(c_ub, C)
+
+    report = _report(main)
+    assert "status=UNSUPPORTED" in report
+    assert "local.var" in report
+
+
 def test_no_vf_reports_empty():
     @T.prim_func
     def main(A: T.Tensor((16,), "float32")):

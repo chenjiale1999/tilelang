@@ -21,17 +21,17 @@
 #include <vector>
 
 #include "ascend/layout/ascend_layouts.h"
+#include "vsimd_analysis_common.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tirx;
+using namespace vsimd;
 using ffi::Any;
 using ffi::Array;
 using ffi::Map;
 using ffi::String;
-
-using VarSet = std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
 namespace {
 
@@ -95,16 +95,7 @@ static MapClass MaxClass(MapClass a, MapClass b) {
   return static_cast<int>(a) >= static_cast<int>(b) ? a : b;
 }
 
-struct LoopInfo {
-  Var var;
-  PrimExpr min;
-  PrimExpr extent;
-};
-
-struct AccessInfo {
-  Buffer buffer;
-  Array<PrimExpr> indices;
-  bool is_write{false};
+struct AccessInfo : vsimd::AccessInfo {
   MapClass map_class{MapClass::kAffine};
   bool layout_changing{false};
   bool injective{true};
@@ -322,15 +313,6 @@ static PrimExpr LinearizeAccess(const Buffer &buffer,
   return off;
 }
 
-static bool IsManualCall(const CallNode *call) {
-  const auto *op = call->op.as<OpNode>();
-  if (op == nullptr)
-    return false;
-  std::string name = op->name;
-  return name.rfind("tl.simd.", 0) == 0 ||
-         name.rfind("tl.ascend_nd2nz", 0) == 0;
-}
-
 /* ------------------------------------------------------------------------- */
 /* Function-level collection                                                 */
 /* ------------------------------------------------------------------------- */
@@ -395,133 +377,6 @@ private:
 
 /* ------------------------------------------------------------------------- */
 /* Manual SIMD detection                                                     */
-/* ------------------------------------------------------------------------- */
-
-class ManualDetector : public StmtExprVisitor {
-public:
-  bool manual{false};
-
-  void VisitExpr_(const CallNode *op) final {
-    if (IsManualCall(op))
-      manual = true;
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  void VisitStmt_(const AllocBufferNode *op) final {
-    if (op->buffer.scope() == "local.var")
-      manual = true;
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const DeclBufferNode *op) final {
-    if (op->buffer.scope() == "local.var")
-      manual = true;
-    StmtExprVisitor::VisitStmt_(op);
-  }
-};
-
-/* ------------------------------------------------------------------------- */
-/* Parallel nest collection                                                  */
-/* ------------------------------------------------------------------------- */
-
-class NestCollector : public StmtExprVisitor {
-public:
-  std::vector<NestInfo> nests;
-  bool unsupported{false};
-  std::string unsupported_reason;
-
-  void VisitStmt_(const ForNode *op) final {
-    if (op->kind == ForKind::kParallel) {
-      bool outer = depth_ == 0;
-      if (outer) {
-        loops_.clear();
-        accesses_.clear();
-      }
-      loops_.push_back(LoopInfo{op->loop_var, op->min, op->extent});
-      ++depth_;
-      StmtExprVisitor::VisitStmt_(op);
-      --depth_;
-      if (outer) {
-        NestInfo nest;
-        nest.loops = loops_;
-        nest.accesses = accesses_;
-        nests.push_back(std::move(nest));
-        loops_.clear();
-        accesses_.clear();
-      }
-    } else {
-      if (depth_ > 0 && !unsupported) {
-        unsupported = true;
-        unsupported_reason = "serial loop inside T.Parallel";
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-  }
-
-  void VisitStmt_(const IfThenElseNode *op) final {
-    if (depth_ > 0 && !unsupported) {
-      unsupported = true;
-      unsupported_reason = "if inside T.Parallel";
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const WhileNode *op) final {
-    if (depth_ > 0 && !unsupported) {
-      unsupported = true;
-      unsupported_reason = "while inside T.Parallel";
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BufferStoreNode *op) final {
-    if (depth_ > 0) {
-      AccessInfo info;
-      info.buffer = op->buffer;
-      info.indices = op->indices;
-      info.is_write = true;
-      accesses_.push_back(std::move(info));
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitExpr_(const BufferLoadNode *op) final {
-    if (depth_ > 0) {
-      AccessInfo info;
-      info.buffer = op->buffer;
-      info.indices = op->indices;
-      info.is_write = false;
-      accesses_.push_back(std::move(info));
-    }
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  void VisitExpr_(const CallNode *op) final {
-    if (depth_ > 0 && !unsupported) {
-      const auto *callee = op->op.as<OpNode>();
-      if (callee != nullptr) {
-        std::string name = callee->name;
-        if (name.rfind("tl.tileop.", 0) == 0 ||
-            name.rfind("tl.ascend_", 0) == 0) {
-          unsupported = true;
-          unsupported_reason = "TileOp/copy inside T.Parallel";
-          return;
-        }
-      }
-    }
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-private:
-  int depth_{0};
-  std::vector<LoopInfo> loops_;
-  std::vector<AccessInfo> accesses_;
-};
-
-/* ------------------------------------------------------------------------- */
-/* Legality helpers                                                          */
-/* ------------------------------------------------------------------------- */
-
 struct AliasKind {
   enum Kind { kSameStorage, kNoAlias, kMayAlias } kind;
 };
@@ -664,13 +519,6 @@ static bool HasSymbolicExtent(const NestInfo &nest) {
   return false;
 }
 
-static void AddUndefinedVars(const PrimExpr &expr, VarSet *vars) {
-  if (!expr.defined())
-    return;
-  for (const Var &v : tirx::UndefinedVars(expr))
-    vars->insert(v);
-}
-
 static std::string SanitizeModel(const std::string &model) {
   std::string s = model;
   for (char &c : s) {
@@ -681,26 +529,6 @@ static std::string SanitizeModel(const std::string &model) {
     s = s.substr(0, 240) + "...";
   return s;
 }
-
-class AssumptionFilter : public StmtExprVisitor {
-public:
-  bool ok{true};
-  void VisitExpr_(const BufferLoadNode *) final { ok = false; }
-  void VisitExpr_(const ProducerLoadNode *) final { ok = false; }
-  void VisitExpr_(const CallNode *) final { ok = false; }
-};
-
-static bool IsSupportedAssumption(const PrimExpr &cond) {
-  if (!cond.defined() || !cond.dtype().is_bool())
-    return false;
-  if (tirx::SideEffect(cond) > tirx::CallEffectKind::kPure)
-    return false;
-  AssumptionFilter filter;
-  filter(cond);
-  return filter.ok;
-}
-
-
 
 class LegalityAnalyzer {
 public:
@@ -736,7 +564,17 @@ public:
     Legality overall = Legality::kLegal;
     std::ostringstream body;
     int nest_index = 0;
-    for (NestInfo &nest : collector.nests) {
+    for (const ParallelNest &parallel_nest : collector.nests) {
+      NestInfo nest;
+      nest.loops = parallel_nest.loops;
+      for (const vsimd::AccessInfo &src : parallel_nest.accesses) {
+        AccessInfo acc;
+        acc.buffer = src.buffer;
+        acc.indices = src.indices;
+        acc.value = src.value;
+        acc.is_write = src.is_write;
+        nest.accesses.push_back(std::move(acc));
+      }
       AnalyzeNest_(&nest);
       overall = std::max(overall, nest.status);
       body << "  nest " << nest_index++ << ": domain=";

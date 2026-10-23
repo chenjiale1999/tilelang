@@ -32,6 +32,21 @@ def AscendAnalyzeSimdVFMemoryReport(func):
     return _ffi_api.AscendAnalyzeSimdVFMemoryReport(func)  # type: ignore
 
 
+def AscendAnalyzeSimdVFCapture():
+    """Analyze capture sets and scope closure of SIMD_VF blocks (read-only)."""
+    return _ffi_api.AscendAnalyzeSimdVFCapture()  # type: ignore
+
+
+def AscendAnalyzeSimdVFCaptureReport(func):
+    """Return a capture/scope report for a PrimFunc containing SIMD_VF blocks."""
+    return _ffi_api.AscendAnalyzeSimdVFCaptureReport(func)  # type: ignore
+
+
+def AscendAnalyzeSimdVFCaptureInfo(func):
+    """Return typed capture/scope results (list of dicts) for a PrimFunc."""
+    return _ffi_api.AscendAnalyzeSimdVFCaptureInfo(func)  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -255,6 +270,9 @@ __all__ = [
     "AscendInsertOOBPadding",
     "AscendAnalyzeSimdVFMemory",
     "AscendAnalyzeSimdVFMemoryReport",
+    "AscendAnalyzeSimdVFCapture",
+    "AscendAnalyzeSimdVFCaptureReport",
+    "AscendAnalyzeSimdVFCaptureInfo",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",
