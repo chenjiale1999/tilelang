@@ -3,11 +3,12 @@
 本文档按「`T.Parallel` 体内的语句长什么样」对多面体向量化器的全部已知场景做分类，
 每个场景给出：TIR 骨架、规划结果、发射形态、当前状态（支持 / 拒绝）与已知限制。
 
-- 用例来源：`tilelang/ascend/analysis/test_drive_plan.py`（58 个场景）与 `log_poly.log` 的实际发射结果。
+- 用例来源：`tilelang/ascend/analysis/test_drive_plan.py`（66 个场景）与 `log_poly.log` 的实际发射结果。
 - 实现：`tilelang/ascend/analysis/polyhedral/{plan,value,emit,access,body}.py`。
 - 配套方案：仓库根目录 `Parallel_ascend.md`（下文 §x 引用其章节号）。
-- 状态说明：部分用例在 `CASES` 里的分组注释已过期（`d3*/d4/d6/d6b/d7` 实际是 OK，
-  `d9b` 实际是 OK），以本文第 9 节索引表的「实际状态」为准。
+- 状态说明：部分用例在 `CASES` 里的分组注释已过期（`d3*/d4/d6/d6b/d7/d9b` 实际是 OK），
+  以本文第 9 节索引表的「实际状态」为准；`r1`–`r7` 是 R1–R7 设计层审计回归，
+  `d16`/`d16b` 是 D16 装载守卫与 chunk 边界回退（前缀/后缀两个方向）。
 
 ---
 
@@ -22,10 +23,16 @@
 | **A** | 单语句，逐元素 | `_split_nest` 无 serial | 单段 `VectorPlan` |
 | **B** | 单语句，归约 | store 沿轴 `Δ==0` 且取值沿轴变化 | 单段 + `ReduceInfo` |
 | **C** | 多语句（同一 nest，无循环） | body 是 `SeqStmt` 且无 serial | 单段、多 store |
-| **D** | 控制流 | `IfThenElse` / `Select` | 谓词化 store 或 `vsel` |
+| **D** | 控制流 | `IfThenElse` / `Select` | 谓词化 store、惰性 `if_then_else` → `vsel`；臂内访存挂装载守卫（D16） |
 | **E** | 单个 `T.serial` 段（pre/main/post） | `_absorb_serial_chain` + `_serial_is_clean` | 单段，向量轴 = serial 轴 |
 | **F** | 并列多个 `T.serial` 段 | `_try_build_program` ≥2 段 | `VectorProgram`（多段） |
 | **G** | 拒绝类 | 各阶段 `Unsupported` | 无计划，带诊断 |
+
+> 另有**设计层审计回归**（R1–R7）穿插在 A/B/E/G 中：谓词掩码宽度（R1）、均匀 bool 条件（R2）、
+> 条件归约（R3）、旧值重复出现（R4）、非 0 下界（R5）、跨迭代 WAW（R6）、归约段 pre/post
+> 均匀性（R7）。它们不是新的语句形状，而是横跨各形状的**契约问题**。D16（语句级分支臂内
+> 访存越界）同样不是新形状，而是 D 类（控制流）的**语义保真**问题：装载必须挂守卫，且
+> 守卫恒真的 chunk 段应回退普通 `vld`。
 
 ### 维度二：访存形态（沿候选向量轴的 Δ）
 
@@ -185,7 +192,7 @@ c[i] = a[b[0]] * 2.0
 for i in T.Parallel(100):
     c[i] = a[i]
 ```
-- 用例：`d10b_one_dimensional_tail`
+- 用例：`d10_one_dimensional_tail`
 - 计划：`Q=2, tail=36`
 - 发射：主循环 `range(1)` 用 `vld` + 全 lane；尾块单次循环用 `update_mask(36)` + 掩码 `vgather2`
 - 状态：支持（`vld` 无谓词形式，尾块只能退化成掩码 gather）
@@ -217,12 +224,18 @@ for i in T.Parallel(n):
 
 | 策略 | 触发 | 发射 |
 |---|---|---|
-| 展开 + 多链 | `chunks ≤ 4` | 编译期展开；`min(4, chunks)` 条链树形合并；`vcadd` 每块一次 |
+| 展开 + 树形合并 | `chunks ≤ 4` | 编译期展开；每个 chunk 一条独立链（各一次 `vcadd`），最后两两 `vadd` 合并 |
 | 真实循环 + `local.var` | `chunks > 4` | 主循环 `chunks-1` 轮 + 单次尾块；循环携带向量累加器 |
 | 符号 extent | `chunks is None` | 单循环，每轮运行时夹紧掩码 + 单位元填充 |
 
 收尾统一：`vadds/vmaxs/vmins` 并入旧值（只有 lane 0 有效，`PAT_VL1`）→ `ONEPT` 单点回写。
 单位元由元素 dtype 动态给出（Add→0，Max→dtype 最小值，Min→dtype 最大值）。
+
+> 旧实现里的 `_REDUCE_CHAINS`（=4）与展开阈值相等，「链内累加」分支不可达，已删除；
+> 行为不变（每 chunk 一条链 + 树形合并）。
+>
+> **条件归约**（`if cond: s[0] += a[i]`）**拒绝**：跨 lane 归约掩码只承载尾块谓词，
+> 用户谓词会被静默丢弃（R3）。
 
 ### B1 短归约
 ```python
@@ -341,9 +354,9 @@ for i in T.Parallel(M):
         u[i, j] = s[2 * i]
 ```
 - 用例：`d14b_partial_reduce_fallback`
-- 计划：`j` 打分更高，但 `_build_plan_for_axis` 的部分归约门禁拒绝 → **轴回退**到 `i`（690）
-- 发射：`for j`（128 轮）× 8 条向量指令，只有 8/64 lane 有效
-- 状态：支持但极低效（与 `d14_partial_reduce` 的差别只在于是否还有第二个干净 serial）
+- 计划：`j` 打分更高，但 `_build_plan_for_axis` 的部分归约门禁拒绝 → **轴回退**到 `i`
+- 发射：`for j` 保留为真实循环（每轮对 i 的 8 个有效 lane 做向量读写；extent M=8 < 64）
+- 状态：支持（语义正确；受并行轴 extent 限制，lane 利用率不高）
 
 ---
 
@@ -351,18 +364,42 @@ for i in T.Parallel(M):
 
 | 场景 | 形态 | 处理 | 用例 | 状态 |
 |---|---|---|---|---|
-| **D1** if/else 同址两臂 | `if cond: c[i]=x else: c[i]=y` | 合并成 `vsel(x, y, pred)`；两支都无条件求值（无分支发散） | `c1_ifelse` | 支持 |
-| **D2** 三元/`Select` | `c[i] = T.if_then_else(cond, x, y)` | 同上（`vcmp` + `vsel`） | `c1_ternary` | 支持 |
-| **D3** 单臂 if | `if cond: c[i] = x` | 谓词化 store：`vsts(..., mask=pred)`，无 else 分支 | `c1_single_arm` | 支持 |
+| **D1** if/else 同址两臂 | `if cond: c[i]=x else: c[i]=y` | 合并成**惰性** `if_then_else` → `vsel(x, y, pred)`；两臂访存各挂 `cond` / `¬cond` 守卫（地址可证安全时仍发普通 `vld`） | `c1_ifelse` | 支持 |
+| **D2** 三元/`Select` | `c[i] = T.if_then_else(cond, x, y)` | `T.if_then_else` 是惰性内建：两臂按守卫构造（`vcmp` + `vsel`）；`tirx.Select` 是急切求值，两臂都算（源码语义如此） | `c1_ternary` | 支持 |
+| **D3** 单臂 if | `if cond: c[i] = x` | 谓词化 store：`vsts(..., mask=pred)`；谓词同时是臂内访存的装载守卫 | `c1_single_arm` | 支持 |
 | **D4** if-else-if 嵌套 | `if a: c=1 else: if b: c=2` | 拒绝：`masked branch merging is not supported` | `d12_masked_branch` | 拒绝 |
+| **D5** 臂内越界访存 + 守卫恒真 chunk | `if i >= 32: c[i] = a[i-32]`；`if i < 96: c[i] = a[i+32]` | 装载守卫（不可证安全时发带掩码 `vgather2`）；守卫恒真的首/尾 chunk 段回退普通 `vld`，store 谓词同步省掉 `vcmps` | `d16_branch_load_oob`、`d16b_prefix_branch_load` | 支持 |
 
 要点：
 
 - D1/D2 的谓词来源分两种：逐 lane（`vcmp`/`vcmps`，直接用）与循环不变（广播成
   `update_mask(cond ? lanes : 0)`，整 chunk 同真同假）。
 - D3 的掩码可以与尾块掩码做 `pand` 合成。
+- **语句级 `if/else` 是惰性的**：合并结果必须是 `tirx.op.if_then_else`（`Call`），不能是
+  急切 `Select`；单臂的 store 谓词也要传给取值表达式。否则臂内 `a[i-32]` 会被无条件
+  发成 `vld a[-32]`（D16，旧实现即如此）。
+- 守卫只保证「条件成立时地址合法」；若源程序在条件成立时自身就越界，则不属于向量化
+  能修复的范围。
+- D5 的分段按**可证边界**做：`predicate_free_until/from` 由 `arith.Analyzer.can_prove`
+  在 `[0, u*lanes)` / `[c*lanes, extent)` 上证明，并复核该段地址可证安全；数据相关
+  条件与符号 extent 保持整段带掩码 gather（§10 第 17 项）。
 - D4 是**过保守**的限制：两条臂都写同一地址时，可以降成两条掩码写
   （`mask1` 写 1.0；`mask2 ∧ ¬mask1` 写 2.0），不需要读回 `c`。
+
+### 5.1 D5 的发射形态（前缀/后缀对称）
+
+```text
+# 后缀守卫：if i >= 32: c[i] = a[i-32]   (N=128, L=64, Q=2)
+[0,1)  vcmps(vci(0), 32, "ge") → vgather2(a[-32], vci(0), mask) → vsts(c[0], v, mask)
+[1,2)  vld(a[32]) → vsts(c[64], v, mask_all)          # 守卫恒真，无 vcmps
+
+# 前缀守卫：if i < 96: c[i] = a[i+32]
+[0,1)  vld(a[32]) → vsts(c[0], v, mask_all)
+[1,2)  vcmps(vci(64), 96, "lt") → vgather2(a[96], vci(0), mask) → vsts(c[64], v, mask)
+```
+
+同段内前后缀守卫共存时（如 512 元素、`i>=32` 写 c 且 `i<480` 写 d），切点为 `[1,7]`：
+chunk 0 只有 c 带守卫，chunk 1–6 两条都是 `vld`，chunk 7 只有 d 带守卫。
 
 ---
 
@@ -371,9 +408,11 @@ for i in T.Parallel(M):
 ### 6.1 吸收条件（`_serial_is_clean`）
 
 - serial 循环必须**直接内嵌**在 `T.Parallel` 体内；
+- 循环**下界必须可证为 0**（`_require_zero_min`，R5）：`T.serial(1, K)` 会被拒绝；
 - 循环体内沿循环变量 `Δ==0` 的写，只能是「同址回读的累积归约」；
 - 不允许跨迭代读（stencil `c[i,j-1]` 拒绝）；
-- 不允许共享标量累加器（`cnt[0] += 1` 拒绝）。
+- 不允许共享标量累加器（`cnt[0] += 1` 拒绝）；
+- 同一 buffer 的多条写必须**目的地址相同**（R6：`c[i,2*j]` 与 `c[i,j]` 会跨迭代相撞）。
 
 ### 6.2 计划形态
 
@@ -386,8 +425,9 @@ main_stmt   : serial 循环本身
 post_stmts  : serial 之后、与外层并行变量相关的语句
 ```
 
-- **plan**：`pre_stores / stores / post_stores`；**向量轴固定为 serial 轴**
-  （`plan._build_segment`，其它轴不尝试）；
+- **plan**：`pre_stores / stores / post_stores`；向量轴由**展平优先 + 打分**决定
+  （并行轴与 serial 轴都是候选；serial extent 小于 lanes 时通常选外层并行轴，
+  serial 循环保留为真实循环）
 - **emit**：`pre → chunk 循环 → post`，pre/post 在 chunk 循环之外、每个外层迭代
   执行一次，写用 `ONEPT`（值 `vdup` 广播）。
 
@@ -397,11 +437,11 @@ post_stmts  : serial 之后、与外层并行变量相关的语句
 |---|---|---|---|---|
 | **E1** S1 独立拷贝 | `for i in P: for j in serial: c[i,j]=a[i,j]*2` | `s1_serial_copy` | 展平 `k_i_j`(512)，8 个满 chunk | 支持（最优） |
 | **E2** S1 + 谓词 | 同上，体内 `if a[i,j]!=0` | `s1_serial_predicated` | 展平 + 掩码 store | 支持（同一 `a` 被读两次） |
-| **E3** S3 归约 | `for i in P: for j in serial: s[i]+=a[i,j]` | `s3_serial_reduce` | `axis=j, L=64, Q=1, tail=8`；`vcadd` + `vadds` + `ONEPT` | 支持（8/64 lane） |
-| **E4** S2 私有标量 | `acc=0; for j: acc+=a[i,j]; c[i]=acc` | `s2_serial_scalar` | pre=`acc=0`，post=`c[i]=acc`；归约沿 j | 支持（8/64 lane；acc 走 `local.var` 往返） |
-| **E5** M2 前置 + serial | `s[i]=0; for j: s[i]+=a[i,j]` | `m_serial_after_init` | pre 写 0 + 归约并入旧值 | 支持（init 0 可折叠进累加器初值） |
-| **E6** M3 serial + 后置 | `for j: s[i]+=a[i,j]; s[i]*=2` | `m_serial_before_post` | post `vdup(s[i]*2) + ONEPT` | 支持（`s[i]` 写两次） |
-| **E7** 夹心 | `s[i]=0; for j: ...; s[i]*=2` | `m_serial_middle` | E5 + E6 | 支持（`s[i]` 写三次） |
+| **E3** S3 归约 | `for i in P: for j in serial: s[i]+=a[i,j]` | `s3_serial_reduce` | `axis=i`；寄存器累加：`vld` 初值 + 8×(gather+vadd) + 一次 `NORM` 回写 | 支持（满 lane） |
+| **E4** S2 私有标量 | `acc=0; for j: acc+=a[i,j]; c[i]=acc` | `s2_serial_scalar` | `axis=i`；acc 提升成 `local.var` 向量寄存器 | 支持（满 lane；`vdup(0)` + 8×(gather+vadd) + 回写） |
+| **E5** M2 前置 + serial | `s[i]=0; for j: s[i]+=a[i,j]` | `m_serial_after_init` | pre 折叠成 `vdup(0)` 初值 | 支持（满 lane；循环内只剩 `gather+vadd`） |
+| **E6** M3 serial + 后置 | `for j: s[i]+=a[i,j]; s[i]*=2` | `m_serial_before_post` | post 在寄存器上算完，一次 `NORM` 回写 | 支持（不再每轮 `vld`/`vsts`） |
+| **E7** 夹心 | `s[i]=0; for j: ...; s[i]*=2` | `m_serial_middle` | E5 + E6 | 支持（整段只剩一次 `vsts`） |
 | **E8** M1 独立 store 组 | `c[i,0]=1.0; for j: c[i,j]=a[i,j]*2` | `m_serial_indep_group` | pre 均匀写 + 主体沿 j | 支持（pre 被 j=0 覆写 → 死写） |
 | **E9** pre 间接地址 | `c[b[0]]=1.0; for j: d[i,j]=a[i,j]*2` | `d11_indirect_pre` | pre 的间接地址 Δ==0 → `UNIFORM`，单次 `ONEPT` | 支持（该写沿 i 循环不变，可整体外提） |
 | **E10** 双归约 | 同一 serial 体两条 `s1[i]+=a`、`s2[i]+=b` | `d6_two_reduces` | 每条 store 各自展开、各起一条链 | 支持 |
@@ -411,7 +451,8 @@ post_stmts  : serial 之后、与外层并行变量相关的语句
 | **E14** 边界：共享标量 | `cnt[0]=0; for g_i: if ...: cnt[0]+=1; c=...` | `c6_complex` | `_serial_is_clean` 失败 → 拒绝 | 拒绝（未指出 `cnt[0]`） |
 
 > 说明：E1/E2 走「展平」通道（`_try_flatten`），因此没有 8/64 lane 问题；
-> E3–E12 走「向量轴 = serial 轴」，是当前最大的性能损失来源（见 §10）。
+> E3–E12 现在多数选**外层并行轴**并把 serial 循环保留为真实循环（§12 第 2 项），
+> 满 lane 读改写 + 寄存器累加，不再是性能损失来源。
 
 ---
 
@@ -425,7 +466,7 @@ post_stmts  : serial 之后、与外层并行变量相关的语句
 
 ### 7.2 与单段的差异
 
-- 每段**独立**选向量轴（当前写死为该段的 serial 轴）、独立 `Q/tail`、独立 SSA 前缀；
+- 每段**独立**选向量轴（展平优先 + 打分；并行轴与 serial 轴都是候选）、独立 `Q/tail`、独立 SSA 前缀；
 - `program.axes` 只含「共享的并行轴前缀」，在**最外层**统一包一次；
 - 段按**源码顺序**发射，段间依赖靠这个顺序保证。
 
@@ -461,7 +502,7 @@ post_stmts  : serial 之后、与外层并行变量相关的语句
 
 ---
 
-## 9. 全用例索引（58 个）
+## 9. 全用例索引（66 个）
 
 | # | 用例 | 场景 | 实际状态 |
 |---|---|---|---|
@@ -488,70 +529,87 @@ post_stmts  : serial 之后、与外层并行变量相关的语句
 | 21 | `c3_im2col` | C4（A7/D2 组合 + 轴回退） | OK（低效） |
 | 22 | `s1_serial_copy` | E1 | OK（最优） |
 | 23 | `s1_serial_predicated` | E2 | OK |
-| 24 | `s3_serial_reduce` | E3 | OK（8/64 lane） |
-| 25 | `s2_serial_scalar` | E4 | OK（8/64 lane） |
-| 26 | `m_serial_after_init` | E5 | OK（8/64 lane） |
-| 27 | `m_serial_before_post` | E6 | OK（8/64 lane） |
-| 28 | `m_serial_middle` | E7 | OK（8/64 lane） |
-| 29 | `m_serial_indep_group` | E8 | OK（8/64 lane，死写） |
-| 30 | `p_two_serial_independent` | F1 | OK（未展平） |
+| 24 | `s3_serial_reduce` | E3 | OK（满 lane，寄存器累加） |
+| 25 | `s2_serial_scalar` | E4 | OK（满 lane，私有标量提升） |
+| 26 | `m_serial_after_init` | E5 | OK（满 lane） |
+| 27 | `m_serial_before_post` | E6 | OK（满 lane） |
+| 28 | `m_serial_middle` | E7 | OK（满 lane） |
+| 29 | `m_serial_indep_group` | E8 | OK（满 lane，死写删除） |
+| 30 | `p_two_serial_independent` | F1 | OK（每段展平） |
 | 31 | `p_serial_reduce_then_use` | F2 | OK |
 | 32 | `p_serial_compose` | F3 | OK |
 | 33 | `p_serial_leading_stmt` | F4 | OK |
 | 34 | `d8_negative_stride` | A5b | OK |
 | 35 | `d8b_negative_stride_store` | A5c | OK |
 | 36 | `d9_symbolic_extent` | A13 | OK |
-| 37 | `d10_non_reduction_tail_overread` | E1（TIR 与 `s1_serial_copy` 相同） | OK（探针已失效） |
-| 38 | `d10b_one_dimensional_tail` | A12 | OK |
-| 39 | `d14b_partial_reduce_fallback` | C6 | OK（低效） |
-| 40 | `d11_indirect_pre` | E9 | OK（8/64 lane） |
-| 41 | `d11b_lane_invariant_indirect_load` | A11 | OK |
-| 42 | `c6_complex` | E14 | REJ |
-| 43 | `s_serial_stencil` | E13 | REJ |
-| 44 | `p_serial_one_unclean` | F5 | REJ |
-| 45 | `c_gm` | G2 | REJ |
-| 46 | `c4_true_random` | G1 | REJ |
-| 47 | `d9b_symbolic_extent_reduce` | B6 | **OK**（分组注释过期） |
-| 48 | `d14_partial_reduce` | G8 | REJ |
-| 49 | `d15_bool_store` | G3 | REJ |
-| 50 | `d1_product_reduce` | G4 | REJ |
-| 51 | `d2_plain_overwrite` | G5 | REJ |
-| 52 | `d3_int_max_reduce` | B5 | **OK**（分组注释过期） |
-| 53 | `d3_f16_max_reduce` | B5 | **OK**（分组注释过期） |
-| 54 | `d4_uniform_addend` | E12 | **OK**（分组注释过期） |
-| 55 | `d6_two_reduces` | E10 | **OK**（分组注释过期） |
-| 56 | `d6b_sum_max_reduce` | E11 | **OK**（分组注释过期） |
-| 57 | `d7_uniform_store_mixed` | C5 | **OK**（分组注释过期） |
-| 58 | `d12_masked_branch` | D4 | REJ |
+| 37 | `d10_one_dimensional_tail` | A12 | OK |
+| 38 | `d14b_partial_reduce_fallback` | C6 | OK（回退到并行轴） |
+| 39 | `d11_indirect_pre` | E9 | OK（pre 外提为标量写） |
+| 40 | `d11b_lane_invariant_indirect_load` | A11 | OK |
+| 41 | `c6_complex` | E14 | REJ |
+| 42 | `s_serial_stencil` | E13 | REJ |
+| 43 | `p_serial_one_unclean` | F5 | REJ |
+| 44 | `c_gm` | G2 | REJ |
+| 45 | `c4_true_random` | G1 | REJ |
+| 46 | `d9b_symbolic_extent_reduce` | B6 | **OK**（分组注释过期） |
+| 47 | `d14_partial_reduce` | G8 | REJ |
+| 48 | `d15_bool_store` | G3 | REJ |
+| 49 | `d1_product_reduce` | G4 | REJ |
+| 50 | `d2_plain_overwrite` | G5 | REJ |
+| 51 | `d3_int_max_reduce` | B5 | **OK**（分组注释过期） |
+| 52 | `d3_f16_max_reduce` | B5 | **OK**（分组注释过期） |
+| 53 | `d4_uniform_addend` | E12 | **OK**（分组注释过期） |
+| 54 | `d6_two_reduces` | E10 | **OK**（分组注释过期） |
+| 55 | `d6b_sum_max_reduce` | E11 | **OK**（分组注释过期） |
+| 56 | `d7_uniform_store_mixed` | C5 | **OK**（分组注释过期） |
+| 57 | `d12_masked_branch` | D4 | REJ |
+| 58 | `r1_predicate_width_f16` | A + D（条件 + 尾块） | OK（`pand` 用 b16） |
+| 59 | `r2_uniform_condition` | D3 + 循环不变条件 | OK（`update_mask`） |
+| 60 | `r3_masked_reduce` | B + G（R3） | REJ（条件归约） |
+| 61 | `r4_repeated_old_value` | B + G（R4） | REJ（旧值重复） |
+| 62 | `r5_serial_nonzero_min` | E + G（R5） | REJ（非 0 下界） |
+| 63 | `r6_serial_waw` | E + G（R6） | REJ（跨迭代 WAW） |
+| 64 | `r7_reduce_parallel_pre_fallback` | B + E（R7） | OK（轴回退到 `j`） |
+| 65 | `d16_branch_load_oob` | D5（后缀守卫） | OK（chunk 0 掩码 gather → chunk 1 `vld`） |
+| 66 | `d16b_prefix_branch_load` | D5（前缀守卫） | OK（chunk 0 `vld` → chunk 1 掩码 gather） |
 
-统计：**OK 48 / REJ 10**。
+统计：**OK 55 / REJ 11 / ERR 0**，共 **66** 例。
 
 ---
 
 ## 10. 已知限制与后续优化（按收益）
 
-1. **值层 CSE 键失效**：`emit._value_key` 用 `id(buffer)`，但同一 buffer 的不同
-   `BufferLoad` 携带不同 Buffer 对象 → 重复 `vld`（c1_ternary、c3_multi、
-   s1_serial_predicated）与重复谓词构造（c3_im2col 的 h 表达式 4 次）。
-   键改为 `buffer.data` 的等价身份即可全局收益。
-2. **E 类向量轴写死为 serial 轴**：serial extent < lanes 时只有 8/64（f16 8/128）利用率。
-   建议把 `min(extent, lanes)/lanes` 纳入 `_axis_score`，允许选外层并行轴、
-   把 serial 循环保留为真实循环（预计 8–26× 指令差）。
-3. **多段 program 未尝试展平**：`_try_build_program` 每段先试 `_try_flatten`
-   （F1/F3/F4 有 ~8× 收益）。
-4. **归约改 lane-wise 累加**：每 chunk 一次 `vcadd` → 循环内 `vadd` 累加 + 末尾一次
+> 状态：1–11 均已落地（见 §12）；12 起是本轮设计层审计新增的边界。
+
+1. ~~**值层 CSE 键失效**~~ → ✅ `_value_key` 已改用结构化 `_buffer_key`（不再用 `id(buffer)`）。
+2. ~~**E 类向量轴写死为 serial 轴**~~ → ✅ `_axis_score` 已乘 lane 利用率，E 类改选外层并行轴 + 寄存器累加。
+3. ~~**多段 program 未尝试展平**~~ → ✅ `_build_segment` 复用 `_plan_segment`（展平优先），F1/F3/F4 每段展平。
+4. **归约改 lane-wise 累加**（未做）：每 chunk 一次 `vcadd` → 循环内 `vadd` 累加 + 末尾一次
    `vcadd`（短归约 13→10 条，长归约 24→17 条，关键路径约减半）。
-5. **循环不变量提升**：常量 `vdup`、常量尾块 `update_mask`、`vci`（c1_single_arm、
-   c3_value_pow2、c4_tiled、c4_reverse、c0_broadcast、d11b）。
-6. **单次循环展开**：`chunks == 1`、尾块、`T.grid(n,1)` 都在发 `range(1)`。
-7. **Add 归约跳过单位元填充**：`MODE_ZEROING` 下 inactive lane 已是 0。
-8. **pre/post 走寄存器**：init 折叠进累加器初值、post 在寄存器里算完只写一次、
-   均匀写用标量 store 代替 `vdup + ONEPT`。
-9. **死写/循环不变写**：`m_serial_indep_group` 的 `c[i,0]`（被 j=0 覆写）、
-   `d11_indirect_pre` 的 `c[b[0]]`（沿 i 不变，可外提）。
-10. **符号 extent 拆主循环 + peel 尾块**：避免每个 chunk 都 `update_mask` + 掩码 gather。
-11. **诊断合并**：`_serial_is_clean` 的具体原因合并进顶层消息（G7）；D4 过保守，
-    可降级为两条掩码写。
+5. ~~**循环不变量提升**~~ → ✅ 常量 `vdup` / 常量尾块 `update_mask` 进 prologue；`vci` 按 lane_base 复用。
+6. ~~**单次循环展开**~~ → ✅ `chunks == 1`、尾块均发直线代码。
+7. ~~**Add 归约跳过单位元填充**~~ → ✅ `MODE_ZEROING` 下 inactive lane 已是 0，尾块掩码直接交给 `vcadd`。
+8. ~~**pre/post 走寄存器**~~ → ✅ init 折叠进累加器初值、post 在寄存器里算完只写一次、均匀写用标量 store。
+9. ~~**死写/循环不变写**~~ → ✅ `m_serial_indep_group` 的 `c[i,0]` 删除；`d11_indirect_pre` 的 `c[b[0]]` 外提。
+10. ~~**符号 extent 拆主循环 + peel 尾块**~~ → ✅ 非归约与归约都改为「整块主循环 + peel 尾块」。
+11. ~~**诊断合并**~~ → ✅ `_serial_is_clean` 原因进入顶层消息；成功路径也保留 `-> fallback`。
+12. **条件归约**（R3，拒绝）：`if cond: s += ...` 目前无向量形式；实现方式是用
+    `vsel(varying, identity, cond)` 把未选中 lane 填成归约单位元，再把用户谓词 ∧ 尾块谓词交给 `vcadd`。
+13. **非 0 循环下界**（R5，拒绝）：迭代域只记录 `(var, extent)`；给 `Axis` 增加 `min` 后即可支持
+    `T.serial(1, K)`（发射 `For(var, min, extent)`）。
+14. **跨迭代 WAW 别名**（R6，保守拒绝）：当前只允许「同 buffer 多写且目的地址相同」；
+    更精确的做法是对目的地址做注入性/区间分析（如 `2*j` 与 `2*j+1` 是安全的）。
+15. **非仿射 scatter 写的地址碰撞**：`PIECEWISE`/`INDIRECT` 写（`c[b[i]]`、`c[i//2]`）不检查
+    每 lane 地址是否互异——这与「同一 `T.Parallel` 内多迭代写同一地址」一样属于未定义行为，
+    需使用者保证。
+16. **D12（臂内再嵌 `if`）**：`masked branch merging is not supported`，可降级为两条掩码写。
+17. **守卫分块只对可证仿射边界生效**（D16）：`predicate_free_until/from` 用
+    `arith.Analyzer.can_prove` 在 `[0,u*lanes)` / `[c*lanes,extent)` 上证明，并复核该段
+    地址可证安全；数据相关条件（`if a[i] != 0`）、符号 extent 保持整段带掩码 `vgather2`。
+    lane 均匀标量读没有掩码形式时仍按 P0-3 在 build 期拒绝。
+18. **分块发射的代码膨胀**：每个切点多一段发射体；同段多条语句各有边界时切点数会上升，
+    超过上限（6 个）即回退到单一循环——正确性不变，只是重新付 `vgather2`。
+    后续可按收益把「切点选择」限制在 `Q` 较大的计划上（小 `Q` 直接展开更划算）。
 
 ---
 
@@ -569,8 +627,9 @@ flowchart TD
   subgraph PLAN["plan.py —— 计划期 P1 + P2"]
     BP["build_plan"]
     TBP["_try_build_program"]
+    PCHAIN["_absorb_parallel_chain<br/>_require_zero_min"]
     ABS["_absorb_serial_chain"]
-    CLEAN["_serial_is_clean"]
+    CLEAN["_serial_is_clean<br/>（含跨迭代 WAW 判据）"]
     SEG["_build_segment"]
     SPLIT["_split_nest"]
     PREP["_prepare_segment<br/>normalize / lanes / 逐轴分类"]
@@ -581,7 +640,8 @@ flowchart TD
     SCORE["_axis_score<br/>_axis_weight_sum"]
     DIAG["_axis_diagnostics<br/>_load_infos"]
     BUILDAX["_build_plan_for_axis"]
-    PSTORE["_plan_store"]
+    PSTORE["_plan_store<br/>谓词 → 装载守卫"]
+    GCUT["_guard_cuts<br/>guard_boundaries"]
     CLSRED["_classify_reduce"]
     PLANRED["_plan_reduce"]
     STRIP["_strip_reduce"]
@@ -602,6 +662,7 @@ flowchart TD
     BV["build_value"]
     LN["load_node"]
     IV["index_value"]
+    GFB["_guard_free_bounds<br/>_access_provably_in_bounds"]
   end
 
   subgraph EMIT["emit.py —— 发射期 P3"]
@@ -616,6 +677,7 @@ flowchart TD
     ECHUNK["_emit_reduce_chunk"]
     ETAIL["_emit_reduce_tail"]
     EEL["_emit_elementwise_chunks"]
+    ESTRIP["_strip_mine<br/>按 guard_boundaries 分段"]
     EST["_emit_store"]
     EMASK["_store_mask"]
     EWR["_emit_vector_write"]
@@ -645,11 +707,13 @@ flowchart TD
   BP --> ALIAS
   BP --> PREP
 
+  TBP --> PCHAIN
   TBP --> ABS
   TBP -->|"每段"| SEG
   SEG --> PREP
   SEG --> DIAG
-  SEG -->|"forced：serial 轴"| BUILDAX
+  SEG -->|"展平优先 + 轴回退"| BUILDAX
+  SPLIT --> PCHAIN
   SPLIT --> CLEAN
   ABS --> CLEAN
   CLEAN -.->|"False：不吸收，后续 normalize_body 拒绝"| NORM
@@ -657,19 +721,21 @@ flowchart TD
   FLAT --> FLAX
   FLAT -->|"合成轴重新规范化"| PREP
   FLAT --> ALIAS
-  RANK --> REDAX
   RANK --> SCORE
   DIAG --> SCORE
-  REDAX -.->|"命中：该轴唯一候选"| BUILDAX
+  BUILDAX -.->|"轴失败 → 下一根（诊断保留 -> fallback）"| RANK
 
   PREP --> NORM
   PREP --> CLS
   BUILDAX --> PSTORE
+  BUILDAX --> GCUT
   BUILDAX --> CLSRED
   PSTORE --> BV
   PSTORE --> IV
+  PSTORE --> GFB
   BV --> LN
   BV --> CLS
+  LN --> GFB
   IV --> BV
   CLS --> DIFF
   CLSRED --> REDAX
@@ -694,7 +760,8 @@ flowchart TD
   ELOOP --> ETAIL
   ECHUNK --> EMITTER
   ETAIL --> EMITTER
-  EEL --> EST
+  EEL --> ESTRIP
+  ESTRIP --> EST
   EST --> EMASK
   EST --> EWR
   EST -->|"strided / scatter"| EMITTER
@@ -737,12 +804,15 @@ flowchart LR
 ```mermaid
 flowchart TD
   BP["build_plan"] --> TBP["_try_build_program"]
+  TBP -->|"_absorb_parallel_chain"| PC["_require_zero_min<br/>（下界必须为 0）"]
   TBP -->|"SeqStmt 中 ≥2 个可吸收 serial 链"| ABS["_absorb_serial_chain ×N"]
   TBP -->|"否则返回 None"| SP["_split_nest"]
   ABS --> SEG["_build_segment ×N"]
   SEG --> P1["_prepare_segment"]
   SEG --> D1["_axis_diagnostics"]
-  SEG --> BA["_build_plan_for_axis(serial 轴)"]
+  SEG --> FL0["_try_flatten（优先）"]
+  FL0 --> BA["_build_plan_for_axis"]
+  SP --> PC
   SP --> P2["_prepare_segment"]
   P2 --> LI["_load_infos"]
   P2 --> FL["_try_flatten"]
@@ -751,7 +821,7 @@ flowchart TD
   RK --> LOOP["按 ranked 顺序逐个尝试"]
   LOOP --> BA
   BA -->|"成功"| OUT
-  BA -->|"Unsupported"| NEXT["记录错误，尝试下一个轴"]
+  BA -->|"Unsupported"| NEXT["记录错误（含 -> fallback），尝试下一个轴"]
   NEXT --> LOOP
   LOOP -->|"全部失败"| ERR["Unsupported<br/>no vectorizable axis"]
 ```
@@ -767,7 +837,7 @@ flowchart LR
   end
 
   subgraph BD["body.py"]
-    B1["normalize_body<br/>Seq / If / Store → StoreSpec"]
+    B1["normalize_body<br/>Seq / If / Store → StoreSpec<br/>同址 if/else → 惰性 if_then_else"]
     B2["_collect_aliases"]
   end
 
@@ -781,6 +851,7 @@ flowchart LR
     V1["build_value"]
     V2["load_node"]
     V3["index_value"]
+    V4["_guard_free_bounds<br/>守卫恒真首/尾 chunk 区间"]
   end
 
   P1 -->|"pre / main / post"| B1
@@ -792,6 +863,7 @@ flowchart LR
   V1 --> V2
   V3 --> V1
   V2 -.->|"读取 Δ 分类"| A1
+  V2 -.->|"守卫边界"| V4
   A1 --> A2
   A1 --> A3
   P3 -->|"剥离旧值后的值 DAG"| V1
@@ -806,9 +878,10 @@ flowchart TD
   EPRG -->|"逐段"| ESEG
   ESEG -->|"pre_stores"| EOUT["_emit_outer_store"]
   ESEG --> EEL["_emit_elementwise_chunks"]
-  EEL -->|"chunks == 1"| M1["直线单块"]
-  EEL -->|"常量尾块"| M2["整块循环 + 单次尾块"]
-  EEL -->|"符号 extent"| M3["运行时掩码单循环"]
+  EEL --> ESTRIP["_strip_mine<br/>按 guard_boundaries 分段"]
+  ESTRIP -->|"chunks == 1"| M1["直线单块"]
+  ESTRIP -->|"常量尾块"| M2["整块循环 + 单次尾块"]
+  ESTRIP -->|"符号 extent"| M3["运行时掩码单循环"]
   M1 --> EST["_emit_store"]
   M2 --> EST
   M3 --> EST
@@ -846,7 +919,7 @@ flowchart TD
 ```mermaid
 flowchart LR
   R["ValueNode.recipe"] --> C{"recipe"}
-  C -->|"vload"| L1["vld<br/>尾块 → 掩码 vgather2"]
+  C -->|"vload"| L1["vld<br/>尾块/守卫 → 掩码 vgather2<br/>守卫恒真 chunk → vld"]
   C -->|"vload_strided"| L2["vgather2 + vmuls 斜坡"]
   C -->|"gather"| L3["vgather2 + 每 lane 索引向量"]
   C -->|"uniform_load / uniform_expr / vbrc"| L4["vdup"]
@@ -871,20 +944,36 @@ flowchart LR
 | # | 优化 | 状态 | 行为变化 |
 |---|---|---|---|
 | 1 | `_value_key` 结构键 | 已落地 | 重复 `vld` 消失（c1_ternary 4→2、c3_multi 2→1）；c3_im2col 地址子式按 DAG 复用（44→29 行） |
-| 2 | 轴选择加入 lane 利用率 | 已落地 | `(64, 8)` 形态优先选并行轴 i：s3/d3/d4/d6/d6b/m_* 从 8/64 lane 的跨 lane 归约改为满 lane 读改写（约 8–26× 指令差）；S2 因私有标量未提升仍走 serial 轴并给出明确诊断 |
+| 2 | 轴选择加入 lane 利用率 | 已落地 | `(64, 8)` 形态优先选并行轴 i：s3/d3/d4/d6/d6b/m_* 从 8/64 lane 的跨 lane 归约改为满 lane 读改写（约 8–26× 指令差）；S2 经第 8 项的私有标量提升后同样走并行轴（见下行） |
 | 3 | 多段路径复用展平 | 已落地 | p_two_serial_independent / p_serial_compose 每段展平到 512（8×）；`program.axes` 在含展平段时置空，各段自包 |
 | 5 | 常量/不变量提升 | 已落地 | 常量 `vdup` / 常量尾块 `update_mask` 进 prologue；`vci` 按 lane_base 复用 |
 | 6 | 单次循环展开 | 已落地 | `chunks==1`、尾块、`T.grid(n,1)` 均发直线代码 |
 | 7 | Add 归约跳过单位元填充 | 已落地 | 尾块掩码直接交给 `vcadd`；仅 Max/Min 保留 `vsel` 填充 |
-| 8 | pre/main/post 寄存器化 | 部分落地 | 单位元 init 折叠（S2 不再并入旧值、pre 写删除）；均匀 pre/post 退化为标量 store；同层写后读转发（d7 省一条 `vld`）。跨 serial 循环的向量累加器提升**尚未实现**（S2 仍走 serial 轴；m_* 的 post 在循环后重读一次） |
-| 9 | 死写 / 循环不变 pre | 已落地 | m_serial_indep_group 的 `c[i,0]` 死写删除；d11 的 `c[b[0]]=1.0` 外提为一次标量写 |
+| 8 | pre/main/post 寄存器化 | 已落地 | ① 同址 `pre` 折叠成寄存器初值（不再写内存）；② 地址沿 serial 轴不变的同址读改写提升成 `local.var` **向量寄存器**：循环内只有 `vadd/vgather2`，循环后一次 `NORM`/`ONEPT` 回写（s3/m_serial_middle/d7/d6b/p_serial_reduce_then_use 段 0 均为「1 次装载 + 每轮 1 条 vadd + 1 次回写」）；③ 回写后 `post` 的同址读直接吃寄存器（`_promoted`），省一次 `ONEPT` 回读 + `vdup`；④ 均匀 pre/post 退化为标量 store；⑤ 同层写后读转发（d7 省一条 `vld`） |
+| 8b | S2 私有标量提升 | 已落地 | `_is_promotable_private_accumulator`：私有标量（`local*`）沿并行轴从「拒绝并回退 serial 轴」改为提升成 `local.var` 向量寄存器。条件是地址沿 inner 轴不变、同址读改写、唯一写者、且循环后的消费必须逐 lane（否则末值属 lane 选择语义，仍拒绝）。s2 由 `for i(64): vcadd`（8/64 lane）变为「`vdup(0)` + 8×(gather+vadd) + ONEPT + vsts」 |
+| 8c | 发射体 LICM | 已落地 | chunk 体内与 inner 轴无关的纯 SSA（地址分解、只读 buffer 装载）提到 inner 循环外：c3_im2col 12 轮提 4 条、c4_tiled 16 轮提 4 条；累加器寄存器按「本段会写」处理，不参与外提 |
+| 9 | 死写 / 循环不变 pre | 已落地 | m_serial_indep_group 的 `c[i,0]` 死写删除；d11 的 `c[b[0]]=1.0` 外提为一次标量写（会被折叠成累加器初值的 pre 除外） |
 | 10 | 符号 extent peel | 已落地 | d9/d9b 改为「`E//lanes` 整块主循环 + `if E%lanes` peel 尾块」 |
 | 11 | 均匀标量二元 | 已落地 | `uniform - vector` → `vadds(vector, -uniform)`，省 `vdup` |
 | 12 | 诊断质量 | 已落地 | `_serial_is_clean` 原因进入顶层消息（c6 指出 `cnt`、stencil 指出 `c`）；d12 消息说明嵌套 else-if 与替代写法 |
 | 13 | 测试维护 | 已落地 | 删除与 s1_serial_copy 重复的 d10 探针；d9b/d1/d2/d14 改判为 OK；浮点 Max/Min 单位元改用 ±inf |
+| R1 | 谓词运算掩码宽度 | 已落地 | `predicate_combine` / `predicate` 按**数据元素**宽度取 `pand/por/pnot` 的执行掩码；`_build` 的防御性谓词分支用 b8（全 256 lane）。f16 尾块 + 条件不再丢 lane 64–127 |
+| R2 | store 条件走 `predicate()` | 已落地 | `_store_mask` / `_emit_outer_store` 不再 `value()` bool 标量；均匀条件 → `update_mask(cond ? lanes : 0)`，不再 emit 期 `ValueError` |
+| R3 | 条件归约 | 已落地（拒绝） | `_plan_reduce` 对 `store.mask is not None` 显式拒绝，不再静默对全部 lane 求和 |
+| R4 | 归约旧值重复出现 | 已落地（拒绝） | `_strip_reduce` 统计剥离次数，> 1 即拒绝，不再丢一份旧值 |
+| R5 | 非 0 循环下界 | 已落地（拒绝） | `_require_zero_min` 在 `_absorb_parallel_chain` / `_split_nest` 检查；`T.serial(1, K)` 不再被错位成 0 基 |
+| R6 | 跨迭代 WAW 别名 | 已落地（拒绝） | `_serial_is_clean` 要求同 buffer 多写目的地址相同；`_try_flatten` 额外要求「同一 buffer 只有一条写」 |
+| R7 | 归约段 pre/post 均匀性 | 已落地 | 沿并行轴归约时补 build 期门禁，失败即轴回退（不再 build OK / emit Unsupported） |
+| R8 | 写后读转发失效 | 已落地 | `note_write` 作废该 buffer 的 `_forward` 项；scatter / 标量写 / 累加器回写之后不会命中陈旧向量值 |
+| C1 | 累加器提升决策上移 | 已落地 | `StorePlan.promote` 由 `_build_plan_for_axis` 一次算好；`emit` 不再自带 `arith.Analyzer` 重算（`accumulator_candidates` 删除） |
+| C2 | 死代码 / 死参数清理 | 已落地 | 删 `_REDUCE_CHAINS` 与不可达的链内累加分支；删 `is_global_ok`、`is_index_vector`、`rank_vector_axes(stores)`、`_strip_reduce(vector_axis)`；`_split_nest`/`_try_build_program` 共用 `_absorb_parallel_chain`；`_plan_segment` 的两个字符串开关合并为 `single: bool`。注：`_ValueContext.lanes` 曾一并删除，D16 的守卫边界证明与 `[lo,hi)` 地址复核需要它，已重新引入（`_guard_free_bounds` / `_access_provably_in_bounds` 使用） |
+| C3 | 段间 prologue 共享 | 已落地 | `_ProgramPrologue`：全 lane / lane0 掩码与步长斜坡在 program 层只绑一次（p_serial_reduce_then_use 由 2×pset + 2×ramp 降为 1+1）；依赖段内尾块掩码的斜坡仍留在段内 |
+| C4 | 段间寄存器直通 | 已落地 | 段 k 的累加器回写登记 `(buffer, 下标) -> (向量轴, 寄存器值)`；段 k+1 同址连续读直接复用（p_serial_reduce_then_use 段 1 的 `vld s` 消失）。只在「单 chunk、无尾块/谓词、同一向量轴、无未提层外层轴」时生效，任何写都会作废登记 |
+| D16 | 语句级分支的装载守卫 | 已落地 | 单臂 `if` 的 store 谓词作为取值表达式的守卫；同址 `if/else` 合并为**惰性** `tirx.op.if_then_else`（不再是急切 `Select`）。`a[i-32]` 这类不可证安全的臂内访存发带掩码 `vgather2`，不再越界 |
+| D16 | 按 chunk 边界回退 `vld` | 已落地 | `_guard_free_bounds` 算 `predicate_free_until/from`（前缀/后缀对称），`_guard_cuts` 汇总 `VectorPlan.guard_boundaries`；`_strip_mine` 分段、`_Emitter.guard_free` 逐段判定，守卫恒真段回退普通 `vld` 并省掉 store 的 `vcmps`。d16：chunk 0 gather / chunk 1 `vld`；d16b：chunk 0 `vld` / chunk 1 gather；前后缀共存时切点 `[1,7]` |
 
-**验证**：`testing/ascend/analysis/test_polyhedral_vectorize.py` 91 passed；
-`test_drive_plan.py` 57 例 → 50 OK / 7 REJ。
+**验证**：`testing/ascend/analysis/test_polyhedral_vectorize.py` **135 passed**；
+`test_drive_plan.py` **66 例 → 55 OK / 11 REJ / 0 ERR**。
 
 **修正记录**：多段路径早期版本把共享并行轴 `i` 提到 program 层，但各段的向量轴也是 `i`
 （已被吃成 lane 维），于是发出 `for i in range(64)` 把同一组 64-lane 操作重复 64 次
@@ -892,5 +981,4 @@ flowchart LR
 `program.axes=[]`，各段自包，并加了「不得出现 `for i`」的回归断言。
 
 **仍待上板确认**：c3_im2col 的掩码 gather 基址为 `data[0, -1, ...]`（依赖谓词 gather
-不访问 inactive lane）；d14b 的 `access_ptr(s[chunk*128], ...)` 形态在 chunks>1 时的
-地址计算。
+不访问 inactive lane）；`update_mask` 宽度只支持 b8/b16/b32，f64/int64 的尾块路径尚未验证。

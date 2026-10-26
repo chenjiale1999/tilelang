@@ -18,24 +18,58 @@ from dataclasses import dataclass
 
 from tvm import arith, tirx
 
-from tilelang.ascend.language.simd import _mask_bits, _vec_dtype, _vreg_lanes
+from tilelang.ascend.language.simd import _mask_bits, _vreg_lanes
 
 from .access import AccessClass, AccessInfo, Axis, _const_int, _free_vars, classify_access, finite_difference, linear_element_offset
 from .body import StoreSpec, _collect_aliases, normalize_body
-from .model import ReduceInfo, StorePlan, VectorPlan, VectorProgram
+from .model import ReduceInfo, StorePlan, VectorPlan, VectorProgram, accumulator_candidate, is_private_scope
 from .primitives import (
     _REDUCE_OPS,
     _REDUCE_RECIPE,
     _REDUCE_SCALAR_RECIPE,
     Unsupported,
     _elem_dtype,
+    _for_kind_name,
     _int,
     _reduce_identity,
     _same_buffer,
     _same_indices,
     _seq,
 )
-from .value import ValueNode, _ValueContext, build_value, index_value
+from .value import (
+    ValueNode,
+    _ValueContext,
+    _and_predicate,
+    _combine_free_from,
+    _combine_free_until,
+    _guard_free_bounds,
+    _reads_buffer,
+    _with_guard,
+    build_value,
+    index_value,
+)
+
+
+def _require_zero_min(loop: tirx.For, analyzer: arith.Analyzer) -> None:
+    """迭代域建模成 ``0 <= x < extent``，因此循环下界必须**可证为 0**。
+
+    ``Axis`` 只记录 ``(var, extent)``，发射时按 ``For(var, 0, extent)`` 重建；源程序的
+    非零下界（``T.serial(1, K)`` / ``T.Parallel(1, K)``）会被静默丢掉，变成从 0 开始
+    的**错位下标**（R5）。无法证明下界为 0 时明确拒绝。
+    """
+    if _const_int(loop.min, analyzer) != 0:
+        raise Unsupported(f"{_for_kind_name(loop.kind)} loop '{loop.loop_var.name}' must start at 0 to be vectorized (min={loop.min})")
+
+
+def _absorb_parallel_chain(stmt: tirx.Stmt, analyzer: arith.Analyzer) -> tuple[list[Axis], tirx.Stmt]:
+    """吸收**连续**的 ``T.Parallel`` 轴（单段路径与多段路径共用）。"""
+    axes: list[Axis] = []
+    current: tirx.Stmt = stmt
+    while isinstance(current, tirx.For) and current.kind == tirx.ForKind.PARALLEL:
+        _require_zero_min(current, analyzer)
+        axes.append(Axis(current.loop_var, current.extent, len(axes), tirx.ForKind.PARALLEL))
+        current = current.body
+    return axes, current
 
 
 def _split_nest(
@@ -61,8 +95,10 @@ def _split_nest(
     axes: list[Axis] = []
     serial_axis: Axis | None = None
     current: tirx.Stmt = stmt
+    axes, current = _absorb_parallel_chain(current, analyzer)
     while isinstance(current, tirx.For):
         kind = current.kind
+        _require_zero_min(current, analyzer)
         if kind == tirx.ForKind.SERIAL:
             clean, reason = _serial_is_clean(current, analyzer)
             if not clean:
@@ -126,6 +162,8 @@ def _absorb_serial_chain(loop: tirx.For, analyzer: arith.Analyzer, base_index: i
     axes: list[Axis] = []
     current: tirx.Stmt = loop
     while isinstance(current, tirx.For) and current.kind == tirx.ForKind.SERIAL:
+        if _const_int(current.min, analyzer) != 0:
+            return None  # 非零下界：交给单段路径给出精确拒绝（_require_zero_min）
         if not _serial_is_clean(current, analyzer)[0]:
             return None
         axes.append(Axis(current.loop_var, current.extent, base_index + len(axes), tirx.ForKind.SERIAL))
@@ -152,7 +190,6 @@ class _SegmentSpecs:
     main_infos: list[AccessInfo]
     post_specs: list[StoreSpec]
     post_infos: list[AccessInfo]
-    elem: str
     lanes: int
 
     @property
@@ -175,7 +212,6 @@ class _SegmentSpecs:
             self.post_infos,
             vector_axis,
             self.lanes,
-            self.elem,
             analyzer,
         )
 
@@ -202,6 +238,7 @@ def _prepare_segment(
         raise Unsupported("T.Parallel body has no store to vectorize")
     for spec in (*pre_specs, *main_specs, *post_specs):
         _require_supported_element(spec.buffer)
+    _require_uniform_element_width((*pre_specs, *main_specs, *post_specs))
 
     elem = _elem_dtype(main_specs[0].buffer.dtype)
     if lanes is None:
@@ -219,9 +256,91 @@ def _prepare_segment(
         main_infos=_infos(main_specs),
         post_specs=post_specs,
         post_infos=_infos(post_specs),
-        elem=elem,
         lanes=lanes,
     )
+
+
+def _plan_segment(
+    axes: list[Axis],
+    serial_axis: Axis | None,
+    pre_stmts: list[tirx.Stmt],
+    main_stmt: tirx.Stmt,
+    post_stmts: list[tirx.Stmt],
+    aliases: dict,
+    analyzer: arith.Analyzer,
+    lanes: int | None,
+    *,
+    single: bool,
+    base_notes: list[str],
+) -> tuple[VectorPlan, bool]:
+    """一段的规划主体：**先试展平通道**，再按轴打分逐个回退。
+
+    单段路径（:func:`build_plan`）与多段路径（:func:`_build_segment`）共用这一份实现
+    ——两条路径原先各维护一遍「展平 → 轴排序 → 逐个尝试」，诊断措辞与失败语义容易
+    漂移。``single`` 只影响诊断措辞（"nest"/"segment"）；``base_notes`` 是调用方已经
+    收集到的前置说明（如多段路径试过但失败的段级原因）。
+
+    返回 ``(plan, flattened)``；``flattened`` 表示合成轴已经把并行前缀吃掉，program
+    层不能再包一次。失败抛 ``Unsupported``（带全量逐轴诊断）。
+    """
+    flatten_word = "nest" if single else "segment"
+    specs = _prepare_segment(axes, serial_axis, pre_stmts, main_stmt, post_stmts, aliases, analyzer, lanes)
+    load_infos = _load_infos(axes, specs.all_specs, analyzer)
+    diagnostics = [*base_notes, *_axis_diagnostics(axes, specs.all_infos, load_infos, analyzer, specs.lanes)]
+
+    flattened, flatten_note = _try_flatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes, analyzer)
+    if flatten_note:
+        diagnostics.append(flatten_note)
+    if flattened is not None:
+        flat_axis = flattened.axes[0]
+        try:
+            plan = flattened.plan_for(flat_axis, analyzer)
+        except Unsupported as err:
+            diagnostics.append(f"flattened axis '{flat_axis.name}': {err}")
+        else:
+            plan.diagnostics = [
+                f"flattened {flatten_word} [{', '.join(axis.name for axis in axes)}] -> '{flat_axis.name}' "
+                f"(extent {flat_axis.extent}, full-lane chunks)",
+                *diagnostics,
+            ]
+            _note_guard_split(plan)
+            return plan, True
+
+    errors: list[str] = []
+    ranked = rank_vector_axes(axes, specs.all_infos, load_infos, analyzer, specs.lanes)
+    if not ranked:
+        raise Unsupported(
+            "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
+            diagnostics=diagnostics,
+        )
+    for axis in ranked:
+        try:
+            plan = specs.plan_for(axis, analyzer)
+        except Unsupported as err:
+            # 逐轴失败原因**成功时也要保留**（改进 7）：否则最终计划上看不出"为什么
+            # 没选分数最高的轴"，只剩另一根轴的 selected 行。
+            errors.append(f"axis '{axis.name}': {err}")
+            diagnostics.append(f"axis '{axis.name}': {err} -> fallback")
+            diagnostics.extend(f"  {note}" for note in (err.diagnostics or []))
+            continue
+        if single:
+            diagnostics.append(
+                f"selected vector axis '{axis.name}' (score={_axis_score(specs.all_infos, load_infos, axis, analyzer, specs.lanes)})"
+            )
+        else:
+            diagnostics.append(
+                f"segment vector axis '{axis.name}' (active={_active_lanes(axis, analyzer, specs.lanes)}/{specs.lanes}, 方案 §6 第三步)"
+            )
+        plan.diagnostics = diagnostics
+        _note_guard_split(plan)
+        return plan, False
+    raise Unsupported("no vectorizable axis: " + "; ".join(errors), diagnostics=diagnostics)
+
+
+def _note_guard_split(plan: VectorPlan) -> None:
+    """把守卫恒真区间的 chunk 切点记进诊断（成功路径也要保留，改进 7）。"""
+    if plan.guard_boundaries:
+        plan.diagnostics.append(f"guard-free chunk cuts at {plan.guard_boundaries}: masked gathers revert to plain vld")
 
 
 def _build_segment(
@@ -236,52 +355,21 @@ def _build_segment(
 ) -> tuple[VectorPlan, bool]:
     """为一段（一个 serial 链 + 其 ``pre``/``post``）规划出单段 :class:`VectorPlan`。
 
-    返回 ``(plan, flattened)``：``flattened`` 表示该段走了展平通道（合成轴已经把共享
-    并行前缀吃掉，program 层不能再包一次）。
-
-    候选轴按联合打分排序后**逐轴尝试**（不再写死 serial 轴）：serial extent 小于
-    向量寄存器时（``(64, 8)`` 的典型形态），沿并行轴向量化 + 保留 serial 循环的
-    收益远大于 8/64 lane 的跨 lane 归约。该段携带自己的诊断（改进 7），与单段
-    路径的 ``plan.diagnostics`` 同构。
-
-    与单段路径一致，**先试展平通道**（``_try_flatten``）：纯 elementwise 段
-    （``c[i,j] = a[i,j]*2``）展平成满 lane 连续轴后没有 8/64 lane 浪费。
+    与单段路径共用 :func:`_plan_segment`（展平优先 + 轴打分回退）；该段携带自己的
+    诊断（改进 7），与单段路径的 ``plan.diagnostics`` 同构。
     """
-    specs = _prepare_segment(axes, serial_axis, pre_stmts, main_stmt, post_stmts, aliases, analyzer, lanes)
-    load_infos = _load_infos(axes, specs.all_specs, analyzer)
-    diagnostics = _axis_diagnostics(axes, specs.all_infos, load_infos, analyzer, specs.lanes)
-
-    flattened, flatten_note = _try_flatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes, analyzer)
-    if flatten_note:
-        diagnostics.append(flatten_note)
-    if flattened is not None:
-        flat_axis = flattened.axes[0]
-        try:
-            plan = flattened.plan_for(flat_axis, analyzer)
-        except Unsupported as err:
-            diagnostics.append(f"flattened axis '{flat_axis.name}': {err}")
-        else:
-            plan.diagnostics = [
-                f"flattened segment [{', '.join(axis.name for axis in axes)}] -> '{flat_axis.name}' "
-                f"(extent {flat_axis.extent}, full-lane chunks)",
-                *diagnostics,
-            ]
-            return plan, True
-
-    errors: list[str] = []
-    for axis in rank_vector_axes(axes, specs.main_specs, specs.all_infos, load_infos, analyzer, specs.lanes):
-        try:
-            plan = specs.plan_for(axis, analyzer)
-        except Unsupported as err:
-            errors.append(f"axis '{axis.name}': {err}")
-            diagnostics.extend(f"  {note}" for note in (err.diagnostics or []))
-            continue
-        diagnostics.append(
-            f"segment vector axis '{axis.name}' (active={_active_lanes(axis, analyzer, specs.lanes)}/{specs.lanes}, 方案 §6 第三步)"
-        )
-        plan.diagnostics = diagnostics
-        return plan, False
-    raise Unsupported("no vectorizable axis in segment: " + "; ".join(errors), diagnostics=diagnostics)
+    return _plan_segment(
+        axes,
+        serial_axis,
+        pre_stmts,
+        main_stmt,
+        post_stmts,
+        aliases,
+        analyzer,
+        lanes,
+        single=False,
+        base_notes=[],
+    )
 
 
 def _try_build_program(
@@ -302,11 +390,7 @@ def _try_build_program(
     ——否则用户只能看到回落单段路径后那句泛化的「nested serial loop」。
     """
     notes = notes if notes is not None else []
-    parallel_axes: list[Axis] = []
-    current: tirx.Stmt = stmt
-    while isinstance(current, tirx.For) and current.kind == tirx.ForKind.PARALLEL:
-        parallel_axes.append(Axis(current.loop_var, current.extent, len(parallel_axes), tirx.ForKind.PARALLEL))
-        current = current.body
+    parallel_axes, current = _absorb_parallel_chain(stmt, analyzer)
     if not parallel_axes or not isinstance(current, tirx.SeqStmt):
         return None
 
@@ -349,11 +433,7 @@ def _try_build_program(
     # 展平段同理：合成轴已经把并行前缀吃掉了。
     consumed = [segment.vector_axis.index for segment in segments if segment.vector_axis.is_parallel]
     first_consumed = min(consumed) if consumed else None
-    hoisted = (
-        []
-        if flattened_any
-        else [axis for axis in parallel_axes if first_consumed is None or axis.index < first_consumed]
-    )
+    hoisted = [] if flattened_any else [axis for axis in parallel_axes if first_consumed is None or axis.index < first_consumed]
     program = VectorProgram(axes=hoisted, segments=segments)
     program.diagnostics = [
         f"multi-segment program: {len(segments)} segments, source order preserved"
@@ -387,6 +467,9 @@ def _serial_is_clean(loop: tirx.For, analyzer: arith.Analyzer) -> tuple[bool, st
     * **沿循环变量不变的写**（目的地址 ``Δ_var == 0``）：只有当它是**累积归约**
       （``s[i] = s[i] + a[i,j]``，取值同址回读）**且取值确实沿该轴变化**时才算合法；
       否则是 last-write-wins（``cnt[0] = a[i,j]`` / ``cnt[0] += 1``）→ 拒绝；
+    * **跨迭代写写别名**：同一 buffer 被多条 store 写、且目的地址互不相同时，不同迭代
+      可能写到同一个地址（``c[i,2*j]`` 与 ``c[i,j]``、或 ``c[i,j]`` 与 ``c[i,j+1]``），
+      标量顺序下的"后写覆盖"在向量化后不成立 → 拒绝；
     * **跨迭代读**：循环体内某 buffer 被写又被读，且该读不是「与某条写同址」的
       累积自读（stencil ``t[i,j] = t[i,j-1] + ...``）→ 拒绝。
 
@@ -406,13 +489,21 @@ def _serial_is_clean(loop: tirx.For, analyzer: arith.Analyzer) -> tuple[bool, st
     tirx.stmt_functor.post_order_visit(loop.body, visit)
 
     axis = Axis(var, loop.extent, 0, tirx.ForKind.SERIAL)
-    for store in stores:
-        offset = linear_element_offset(store.buffer, tuple(store.indices), analyzer)
+    offsets = [(store, linear_element_offset(store.buffer, tuple(store.indices), analyzer)) for store in stores]
+    for store, offset in offsets:
         if _const_int(finite_difference(offset, var, analyzer), analyzer) == 0:
             if not _is_cumulative_write(store):
                 return False, f"write to {store.buffer.name} is invariant along '{var.name}' but not a reduction"
             if not _value_varies_along(store.value, axis, analyzer):
                 return False, f"reduction into {store.buffer.name} does not vary along '{var.name}'"
+
+    for index, (first, first_offset) in enumerate(offsets):
+        for second, second_offset in offsets[index + 1 :]:
+            if _same_buffer(first.buffer, second.buffer) and not tirx.analysis.expr_deep_equal(first_offset, second_offset):
+                return False, (
+                    f"multiple writes to {first.buffer.name} at different addresses along '{var.name}' may alias "
+                    "across iterations (last-write-wins is not preserved by vectorization, R6)"
+                )
 
     write_sites = [(store.buffer, tuple(store.indices)) for store in stores]
     for load in loads:
@@ -457,7 +548,6 @@ def _load_infos(axes: list[Axis], specs: list[StoreSpec], analyzer: arith.Analyz
 
 def rank_vector_axes(
     axes: list[Axis],
-    stores: list[StoreSpec],
     store_infos: list[AccessInfo],
     load_infos: list[AccessInfo],
     analyzer: arith.Analyzer,
@@ -697,6 +787,12 @@ def _try_flatten(
             f"index vector (gather) — flattening would not remove it"
         )
     targets = [spec.buffer for spec in specs.main_specs]
+    for index, buffer in enumerate(targets):
+        if any(_same_buffer(buffer, other) for other in targets[:index]):
+            return None, (
+                f"flatten rejected: two statements write the same buffer '{buffer.name}' along the synthesized "
+                f"axis '{flat_axis.name}' (their addresses may overlap across k) — extent {total}"
+            )
     for spec in specs.main_specs:
         for expr in (spec.value, spec.mask):
             if expr is not None and _expr_reads_buffers(expr, targets):
@@ -738,72 +834,31 @@ def build_plan(stmt: tirx.Stmt, *, lanes: int | None = None) -> VectorProgram:
         axes, serial_axis, pre_stmts, main_stmt, post_stmts = _split_nest(stmt, analyzer, notes)
         pieces = [*pre_stmts, main_stmt, *post_stmts]
         aliases = _collect_aliases(_seq(pieces))
-        specs = _prepare_segment(axes, serial_axis, pre_stmts, main_stmt, post_stmts, aliases, analyzer, lanes)
+        plan, flattened = _plan_segment(
+            axes,
+            serial_axis,
+            pre_stmts,
+            main_stmt,
+            post_stmts,
+            aliases,
+            analyzer,
+            lanes,
+            single=True,
+            base_notes=notes,
+        )
     except Unsupported as err:
         # 回落路径在这一步就拒绝（典型：并列多 serial 循环 → 「nested serial loop」）时，
         # 也要把多段路径试过但失败的段级原因 / serial 不干净的具体原因带上（缺陷 B）。
-        if notes:
+        # ``_plan_segment`` 已经把 ``notes`` 放进 diagnostics，避免重复合并。
+        if notes and not (err.diagnostics and err.diagnostics[: len(notes)] == notes):
             raise Unsupported(f"{err} [{'; '.join(notes)}]", diagnostics=[*notes, *(err.diagnostics or [])]) from err
         raise
-    all_infos = specs.all_infos
-    load_infos = _load_infos(axes, specs.all_specs, analyzer)
-
-    # P1「合成连续轴」：最内层轴不足一个向量寄存器时（如 ``(64, 8)`` + 64 lane），
-    # 单轴向量化只能用 8/64 个 lane 并退化成带谓词的 ``vgather2`` 装载；把整条 nesting
-    # 展平成一个满 lane 连续的合成轴后是纯粹的 ``vld``/``vsts``。这是**增量通道**：
-    # 不适用时原样回落到单轴排序路径（诊断照旧）。
-    flattened, flatten_note = _try_flatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes, analyzer)
-    flatten_notes = [flatten_note] if flatten_note else []
-    if flattened is not None:
-        flat_axis = flattened.axes[0]
-        try:
-            plan = flattened.plan_for(flat_axis, analyzer)
-        except Unsupported as err:
-            flatten_notes.append(f"flattened axis '{flat_axis.name}': {err}")
-        else:
-            plan.diagnostics = [
-                f"flattened nest [{', '.join(axis.name for axis in axes)}] -> '{flat_axis.name}' "
-                f"(extent {flat_axis.extent}, full-lane chunks)",
-                *_axis_diagnostics(
-                    flattened.axes,
-                    flattened.all_infos,
-                    _load_infos(flattened.axes, flattened.all_specs, analyzer),
-                    analyzer,
-                    flattened.lanes,
-                ),
-            ]
-            program = VectorProgram(axes=[], segments=[plan])
-            program.diagnostics = [f"single-segment program: 1 segment, flattened axis '{flat_axis.name}'"]
-            return program
-
-    ranked = rank_vector_axes(axes, specs.main_specs, all_infos, load_infos, analyzer, specs.lanes)
-    # 改进 7：先记录每根轴的分类；多段路径试过但失败的原因一并带上（缺陷 B）。
-    diagnostics = [*notes, *flatten_notes, *_axis_diagnostics(axes, all_infos, load_infos, analyzer, specs.lanes)]
-    if not ranked:
-        raise Unsupported(
-            "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
-            diagnostics=diagnostics,
-        )
-
-    errors: list[str] = []
-    for vector_axis in ranked:
-        try:
-            plan = specs.plan_for(vector_axis, analyzer)
-        except Unsupported as err:
-            note = f"axis '{vector_axis.name}': {err}"
-            errors.append(note)
-            diagnostics.append(note)
-            continue
-        diagnostics.append(
-            f"selected vector axis '{vector_axis.name}' (score={_axis_score(all_infos, load_infos, vector_axis, analyzer, specs.lanes)})"
-        )
-        plan.diagnostics = diagnostics
-        program = VectorProgram(axes=_outer_axes(plan.axes, plan.vector_axis), segments=[plan])
-        # program 级诊断对单段/多段**恒非空**（对称）：调用方无需区分两条路径，
-        # 也不会出现「多段有摘要、单段恒空」的口径裂缝。
-        program.diagnostics = [f"single-segment program: 1 segment, vector axis '{vector_axis.name}'"]
-        return program
-    raise Unsupported("no vectorizable axis: " + "; ".join(errors), diagnostics=diagnostics)
+    program = VectorProgram(axes=[] if flattened else _outer_axes(plan.axes, plan.vector_axis), segments=[plan])
+    # program 级诊断对单段/多段**恒非空**（对称）：调用方无需区分两条路径，
+    # 也不会出现「多段有摘要、单段恒空」的口径裂缝。
+    detail = f"flattened axis '{plan.vector_axis.name}'" if flattened else f"vector axis '{plan.vector_axis.name}'"
+    program.diagnostics = [f"single-segment program: 1 segment, {detail}"]
+    return program
 
 
 def _outer_axes(axes: list[Axis], vector_axis: Axis) -> list[Axis]:
@@ -833,7 +888,6 @@ def _build_plan_for_axis(
     post_infos: list[AccessInfo],
     vector_axis: Axis,
     lanes: int,
-    elem: str,
     analyzer: arith.Analyzer,
 ) -> VectorPlan:
     # 方案 §6 第二步：``pre``/``post`` 是 serial 循环的兄弟语句，只有两种合法向量化：
@@ -841,8 +895,8 @@ def _build_plan_for_axis(
     #   * 沿**外层并行轴**（本次新增）：pre/post 变成与 serial 循环同级的一次向量写，
     #     发射结构为 ``for chunk: pre; for serial: main; post``。
     # 后者只在 serial 链恰好一层时成立（多层 serial 的 pre/post 归属会错位）。
+    along_serial = serial_axis is not None and vector_axis.var.same_as(serial_axis.var)
     if pre_specs or post_specs:
-        along_serial = serial_axis is not None and vector_axis.var.same_as(serial_axis.var)
         serial_count = sum(1 for axis in axes if not axis.is_parallel)
         if not along_serial and not (vector_axis.is_parallel and serial_count == 1):
             raise Unsupported(
@@ -857,9 +911,8 @@ def _build_plan_for_axis(
     ctx = _ValueContext(
         axes=axes,
         vector_axis=vector_axis,
-        lanes=lanes,
         analyzer=analyzer,
-        vector_dtype=_vec_dtype(elem),
+        lanes=lanes,
     )
 
     plan = VectorPlan(
@@ -872,14 +925,42 @@ def _build_plan_for_axis(
 
     def _plan_store(spec, info):
         kind, stride = info.axis_class(vector_axis)
-        value = build_value(spec.value, ctx)
         mask = build_value(spec.mask, ctx) if spec.mask is not None else None
+        # 语句级条件分支的臂内访存是**惰性**的：store 谓词同时也是取值表达式的装载守卫。
+        # 否则 ``if i >= 32: c[i] = a[i-32]`` 的值会在所有 lane 上急切求值，发成无掩码的
+        # ``vld a[-32]``（D16）。守卫进入 ``load_node`` 后仍由
+        # ``_access_provably_in_bounds`` 过滤：能证安全的普通访问照常发 ``vld``。
+        # ``mask_free_until/from`` 进一步给出守卫恒真的首/尾 chunk 区间：发射层在这两段
+        # 块里把带谓词的 ``vgather2`` 退回普通 ``vld``（前缀/后缀两种方向共用这一套写法）。
+        mask_free_until, mask_free_from = _guard_free_bounds(spec.mask, ctx) if spec.mask is not None else (0, None)
+        if mask is None:
+            value_ctx = ctx
+        elif ctx.guard is None:
+            # 没有外层守卫：本语句的条件就是完整守卫。
+            value_ctx = _with_guard(ctx, mask, mask_free_until, mask_free_from)
+        else:
+            value_ctx = _with_guard(
+                ctx,
+                _and_predicate(ctx.guard, mask),
+                _combine_free_until(ctx.guard_free_until, mask_free_until),
+                _combine_free_from(ctx.guard_free_from, mask_free_from),
+            )
+        value = build_value(spec.value, value_ctx)
         # 负步长与 PERMUTE / PIECEWISE / INDIRECT 共用「每 lane 索引向量」通道（缺陷 D8）。
         needs_index = kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT) or (
             kind == AccessClass.STRIDED and stride is not None and stride < 0
         )
         index = index_value(info, ctx) if needs_index else None
-        return StorePlan(spec=spec, access=info, value=value, mask=mask, kind=kind, index=index)
+        return StorePlan(
+            spec=spec,
+            access=info,
+            value=value,
+            mask=mask,
+            kind=kind,
+            index=index,
+            mask_free_until=mask_free_until,
+            mask_free_from=mask_free_from,
+        )
 
     for spec, info in zip(main_specs, main_infos):
         plan.stores.append(_plan_store(spec, info))
@@ -889,7 +970,6 @@ def _build_plan_for_axis(
         plan.post_stores.append(_plan_store(spec, info))
     # 沿 serial 轴向量化时，pre/post 与 chunk 循环同级、必须是 lane 均匀的语句；沿并行轴
     # 向量化时它们落在 chunk 循环体内，按普通向量 store 发射（可以有连续/步长等形态）。
-    along_serial = serial_axis is not None and vector_axis.var.same_as(serial_axis.var)
     if along_serial:
         for where, stores in (("before", plan.pre_stores), ("after", plan.post_stores)):
             for store in stores:
@@ -906,18 +986,38 @@ def _build_plan_for_axis(
         stencil = _cross_address_read([*pre_specs, *main_specs, *post_specs], vector_axis, analyzer)
         if stencil is not None:
             raise Unsupported(stencil)
-        # 并行轴上的 lane 均匀写若是**循环私有标量**（``T.alloc_var`` → ``local.var``），
-        # 源程序里每个并行迭代各有一份；沿并行轴向量化会让所有 lane 共享同一个标量，
-        # 必须先把私有标量提升成向量累加器（S2），当前明确拒绝并回退到 serial 轴。
+        # 累加器提升是**计划期**的单一决策（与归约判据 D13 同一原则）：发射层只消费
+        # ``StorePlan.promote``，不再自带 analyzer 重算一遍（避免两处口径漂移）。
         for store in plan.stores:
-            if store.kind == AccessClass.UNIFORM and not store.value.is_uniform and _is_private_scope(store.spec.buffer):
+            store.promote = accumulator_candidate(store, plan, analyzer)
+        # 并行轴上的 lane 均匀写若是**循环私有标量**（``T.alloc_var`` → ``local.var``），
+        # 源程序里每个并行迭代各有一份；沿并行轴向量化会让所有 lane 共享同一个标量。
+        # 只有「同址读改写 + 逐 lane 消费」的累加器形态能提升成向量寄存器（S2），
+        # 其余仍明确拒绝并回退到 serial 轴。
+        for store in plan.stores:
+            if (
+                store.kind == AccessClass.UNIFORM
+                and not store.value.is_uniform
+                and is_private_scope(store.spec.buffer)
+                and store.promote is None
+            ):
                 raise Unsupported(
                     f"store to private scalar '{store.spec.buffer.name}' varies along vector axis "
-                    f"'{vector_axis.name}': vectorizing the outer axis needs an accumulator promotion "
+                    f"'{vector_axis.name}': vectorizing the outer axis needs a promotable accumulator "
                     "(a per-iteration private scalar cannot be shared by all lanes) (方案 §2 Case II)"
                 )
     plan.reduce = _classify_reduce(plan, analyzer)
     if plan.reduce is not None:
+        # 归约路径把 pre/post 交给 ``_emit_outer_store``（chunk 循环外的一次单点写），
+        # 它要求 lane 均匀。沿并行轴向量化时上面的门禁并不检查这一点 → 会把
+        # 「build OK、emit Unsupported」的裂缝留给调用方（R7），这里补上。
+        for where, stores in (("before", plan.pre_stores), ("after", plan.post_stores)):
+            for store in stores:
+                if store.kind != AccessClass.UNIFORM:
+                    raise Unsupported(
+                        f"a statement {where} the serial loop must be uniform along the reduction vector axis "
+                        f"'{vector_axis.name}' (got {store.kind.value}) (方案 §6 第二步)"
+                    )
         _fold_identity_init(plan)
     _drop_dead_pre_stores(plan, analyzer)
     # 缺陷 A0：吸收的 serial 轴上，「部分归约」没有向量形式。lane 均匀的地址配逐 lane 变化的
@@ -927,6 +1027,8 @@ def _build_plan_for_axis(
         for store in plan.stores:
             if store.kind != AccessClass.UNIFORM or store.value.is_uniform:
                 continue
+            if vector_axis.is_parallel and store.promote is not None:
+                continue  # S2：逐 lane 私有的累加器，发射层提升成 local.var 向量寄存器
             if vector_axis.is_parallel:
                 raise Unsupported(
                     f"store to '{store.spec.buffer.name}' is lane-uniform along vector axis "
@@ -938,7 +1040,53 @@ def _build_plan_for_axis(
                 f"'{vector_axis.name}' but its value varies with it: a partial reduction mixed with "
                 "element-wise stores has no vector form (方案 §2 Case II)"
             )
+    plan.guard_boundaries = _guard_cuts(plan)
     return plan
+
+
+# chunk 切点上限：每个守卫最多贡献两个切点。超过上限时放弃分块（保持单一循环），
+# 避免为极多条件分支膨胀代码。
+_GUARD_CUT_LIMIT = 6
+
+
+def _guard_cuts(plan: VectorPlan) -> list[int]:
+    """守卫恒真区间的 chunk 切点（升序，只保留内部切点）。
+
+    每个守卫给出两段恒真区间 ``[0, free_until)`` 与 ``[free_from, chunks)``；把两个
+    端点都作为切点，发射层在相邻切点之间独立发射一段，段内再用
+    ``[chunk_min, chunk_max)`` 判定守卫是否已恒真。这样前缀/后缀、多条语句的多种
+    边界可以**共用同一套分段写法**，互不干扰。
+    """
+    if plan.chunks is None or plan.chunks <= 1:
+        return []
+    chunks = plan.chunks
+    cuts: set[int] = set()
+    stack: list[ValueNode] = []
+    stores = list(plan.stores)
+    if plan.vector_axis.is_parallel:
+        # 沿并行轴向量化时 pre/post 落在 chunk 循环体内，同样参与守卫边界计算；
+        # 沿 serial 轴时它们在循环外发射，chunk 边界对它们没有意义。
+        stores.extend(plan.pre_stores)
+        stores.extend(plan.post_stores)
+    for store in stores:
+        if store.mask is not None:
+            cuts.add(store.mask_free_until)
+            if store.mask_free_from is not None:
+                cuts.add(store.mask_free_from)
+        for root in (store.value, store.mask, store.index):
+            if root is not None:
+                stack.append(root)
+    while stack:
+        node = stack.pop()
+        if node.predicate is not None:
+            cuts.add(node.predicate_free_until)
+            if node.predicate_free_from is not None:
+                cuts.add(node.predicate_free_from)
+        stack.extend(node.args or ())
+    interior = sorted(cut for cut in cuts if 0 < cut < chunks)
+    if len(interior) > _GUARD_CUT_LIMIT:
+        return []
+    return interior
 
 
 def _classify_reduce(plan: VectorPlan, analyzer: arith.Analyzer) -> ReduceInfo | None:
@@ -956,6 +1104,12 @@ def _classify_reduce(plan: VectorPlan, analyzer: arith.Analyzer) -> ReduceInfo |
     为假，即 store 未全部 lane 均匀或取值也均匀），本函数返回 ``None``，走普通逐元素路径。
     """
     stores = plan.stores
+    if plan.vector_axis.is_parallel:
+        # 私有标量（``T.alloc_var`` / ``local``）每个并行迭代各一份：沿并行轴的
+        # 「lane 均匀写」不是跨 lane 归约，而是逐 lane 独立的累加器（发射层提升成
+        # ``local.var`` 寄存器，见 :func:`~.model.accumulator_candidate`）。
+        # 沿 serial 轴时相反——同一个私有标量被多个迭代累加，是真归约。
+        stores = [store for store in stores if not is_private_scope(store.spec.buffer)]
     if not stores:
         return None
     if not _is_reduce_axis(plan.vector_axis, [store.spec for store in stores], [store.access for store in stores], analyzer):
@@ -1046,6 +1200,15 @@ def _drop_dead_pre_stores(plan: VectorPlan, analyzer: arith.Analyzer) -> None:
 def _plan_reduce(store: StorePlan, vector_axis: Axis) -> ReduceInfo:
     """把一条 lane 均匀的 store 拆成 :class:`ReduceInfo`（不支持的形态在 **build 期** 拒绝）。"""
     buffer = store.spec.buffer
+    if store.mask is not None:
+        # 条件归约（``if cond: s[0] += a[i]``）目前没有向量形式：``vcadd/vcmax/vcmin``
+        # 的掩码只承载尾块谓词，用户谓词会在发射期被**静默丢弃**（对全部 lane 求和）。
+        # 在 build 期显式拒绝，保证「build 成功 ⇒ 语义正确」；未来可用
+        # ``vsel(varying, identity, cond)`` + 合并掩码实现（见设计文档）。
+        raise Unsupported(
+            f"conditional reduction into '{buffer.name}' is not supported yet: the cross-lane reduction mask only "
+            "carries the tail predicate, so the guard would be silently dropped (方案 §2 Case II / R3)"
+        )
     if not _reads_buffer(store.value, buffer):
         raise Unsupported(
             f"store to '{buffer.name}' is lane-uniform along axis '{vector_axis.name}' but its value does not read "
@@ -1054,7 +1217,7 @@ def _plan_reduce(store: StorePlan, vector_axis: Axis) -> ReduceInfo:
             "last-write-wins overwrite and has no vector form"
         )
     op = _reduce_op([store.spec])  # Add/Max/Min 之外显式拒绝（缺陷 D1）
-    varying, accumulated = _strip_reduce(store.value, op, store.spec, vector_axis)
+    varying, accumulated = _strip_reduce(store.value, op, store.spec)
     if not accumulated or varying is None:
         raise Unsupported(
             f"the old value of '{buffer.name}' must be a direct operand of the '{op}' reduction "
@@ -1063,11 +1226,12 @@ def _plan_reduce(store: StorePlan, vector_axis: Axis) -> ReduceInfo:
     return ReduceInfo(axis=vector_axis, op=op, recipe=_REDUCE_RECIPE[op], varying=varying, accumulate=True)
 
 
-def _strip_reduce(value: ValueNode, op: str, site: StoreSpec, vector_axis: Axis) -> tuple[ValueNode | None, bool]:
+def _strip_reduce(value: ValueNode, op: str, site: StoreSpec) -> tuple[ValueNode | None, int]:
     """在归约算子**脊**上剥离目标 buffer 的 lane 均匀旧值读取。
 
     返回 ``(varying, accumulated)``：``varying`` 是逐 lane 取值（lane 均匀加数**保留在内**，
-    因为跨 lane 归约本身就会正确处理它们）；``accumulated`` 表示剥到了旧值。剥离等价于
+    因为跨 lane 归约本身就会正确处理它们）；``accumulated`` 是旧值被剥离的**次数**
+    （正常累加写恰好 1 次；出现多次说明单个初值表达不了，调用方拒绝）。剥离等价于
     沿脊消去该算子的单位元（Add→0 / Max→-inf / Min→+inf），故与 ``dst op= x`` 同义。
 
     旧值必须与写入地址**同址**（``site.indices``）：``s[i] = s[i] + a[i,j]`` 的 ``s[i]``
@@ -1078,7 +1242,8 @@ def _strip_reduce(value: ValueNode, op: str, site: StoreSpec, vector_axis: Axis)
     """
     buffer = site.buffer
     spine = {op, _REDUCE_SCALAR_RECIPE[op]}
-    accumulated = False
+    accumulated = 0  # 旧值被剥离的**次数**：必须恰好 1 次才能折叠成一个初值
+    repeated: list[str] = []
 
     def strip(node: ValueNode) -> ValueNode | None:
         nonlocal accumulated
@@ -1088,7 +1253,11 @@ def _strip_reduce(value: ValueNode, op: str, site: StoreSpec, vector_axis: Axis)
             and _same_buffer(node.access.buffer, buffer)
             and _same_indices(tuple(node.access.indices), tuple(site.indices))
         ):
-            accumulated = True
+            accumulated += 1
+            if accumulated > 1:
+                # ``s[i] = s[i] + (s[i] + a[i,j])``：旧值出现两次，任何「一个初值 + 一次
+                # 跨 lane 归约」的发射都表达不了（会丢掉一份旧值）→ 拒绝（R4）。
+                repeated.append("old value appears more than once")
             return None
         if node.recipe in spine and len(node.args) == 2:
             kept = [child for child in (strip(node.args[0]), strip(node.args[1])) if child is not None]
@@ -1100,39 +1269,18 @@ def _strip_reduce(value: ValueNode, op: str, site: StoreSpec, vector_axis: Axis)
         return node
 
     varying = strip(value)
+    if repeated:
+        raise Unsupported(
+            f"the old value of '{buffer.name}' appears more than once inside the reduction expression "
+            "(方案 §2 Case II): only a single same-address old-value operand can be folded into the "
+            "reduction's initial value"
+        )
     if varying is not None and _reads_buffer(varying, buffer):
         raise Unsupported(
             f"the reduction body reads the destination buffer '{buffer.name}' outside the accumulate position "
             "(方案 §2 Case II): the old value must be a direct operand of the reduction operator"
         )
     return varying, accumulated
-
-
-def _reads_buffer(node: ValueNode, buffer) -> bool:
-    """值 DAG 是否在**任何位置**读取给定 buffer（含 ``uniform_expr`` 折叠的标量表达式）。"""
-    if node.access is not None and _same_buffer(node.access.buffer, buffer):
-        return True
-    if node.scalar is not None:
-        found: list[bool] = []
-
-        def visit(sub):
-            if isinstance(sub, tirx.BufferLoad) and _same_buffer(sub.buffer, buffer):
-                found.append(True)
-
-        tirx.stmt_functor.post_order_visit(node.scalar, visit)
-        if found:
-            return True
-    return any(_reads_buffer(arg, buffer) for arg in node.args)
-
-
-def _is_private_scope(buffer) -> bool:
-    """buffer 是否是**每次迭代私有**的标量/局部存储（``local`` / ``local.var``）。
-
-    这类存储（``T.alloc_var`` / ``T.alloc_local``）在源程序里每个并行迭代各有一份；
-    沿并行轴向量化会让所有 lane 共享同一份，必须先提升成向量寄存器。
-    """
-    scope = buffer.scope()
-    return scope == "local" or scope.startswith("local.")
 
 
 def _spec_cross_address_read(spec: StoreSpec, sites: list[tuple], vector_axis: Axis, analyzer: arith.Analyzer) -> str | None:
@@ -1184,3 +1332,21 @@ def _require_supported_element(buffer) -> None:
         _mask_bits(elem)
     except ValueError as err:
         raise Unsupported(f"store element dtype '{elem}' of buffer '{buffer.name}' is not supported: {err}") from err
+
+
+def _require_uniform_element_width(specs) -> None:
+    """一段共享一个 lane 数，因此所有写必须是**同一元素位宽**。
+
+    段级 ``lanes`` 由首个 store 的元素位宽派生，chunk 地址按 ``chunk * lanes`` 步进；
+    若同段里混入不同位宽的 store（如 f16 + int32），后者每个 chunk 只能覆盖
+    ``2048/位宽`` 个元素，会静默漏写一半或越界（P0-2）。这类写法应拆成两段，
+    或在 nest 之外显式做类型转换。
+    """
+    widths = {_mask_bits(_elem_dtype(spec.buffer.dtype)): spec.buffer for spec in specs}
+    if len(widths) <= 1:
+        return
+    detail = ", ".join(f"{buffer.name}:{_elem_dtype(buffer.dtype)} ({bits}bit)" for bits, buffer in sorted(widths.items()))
+    raise Unsupported(
+        f"mixed element widths in one vector segment ({detail}): every store of a segment must have the "
+        "same element bit width because the chunk stride is shared; split the nest or stage an explicit cast"
+    )

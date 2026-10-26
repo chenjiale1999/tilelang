@@ -167,6 +167,59 @@ def _recipes(node) -> list:
     return out
 
 
+def _eval_lane(node, lane: int, plan, env: dict | None = None, base: int = 0):
+    """把 :class:`ValueNode` DAG 在单条 lane 上求值（数值 golden 用）。
+
+    内存模型取**恒等**：一次装载返回它的元素偏移。这足以钉住"下标/取值算术"这一类
+    缺陷（符号翻转、偏移错位）——它们在只有结构断言的测试里看不出来。
+
+    ``env`` 给非向量轴变量赋值（如 ``{i: 3}``），``base`` 是该 chunk 的 lane 基址。
+    """
+
+    def offset(access, lane_value):
+        mapping = dict(env or {})
+        mapping[plan.vector_axis.var] = tirx.IntImm("int32", int(lane_value))
+        simplified = arith.Analyzer().simplify(tirx.stmt_functor.substitute(access.offset, mapping))
+        assert isinstance(simplified, (tirx.IntImm, tirx.FloatImm)), f"offset did not fold: {simplified}"
+        return int(simplified.value)
+
+    def scalar_value(expr):
+        if isinstance(expr, (int, float)):
+            return int(expr)
+        simplified = arith.Analyzer().simplify(expr)
+        if isinstance(simplified, (tirx.IntImm, tirx.FloatImm)):
+            return int(simplified.value)
+        simplified = arith.Analyzer().simplify(tirx.stmt_functor.substitute(simplified, dict(env or {})))
+        assert isinstance(simplified, (tirx.IntImm, tirx.FloatImm)), f"scalar did not fold: {simplified}"
+        return int(simplified.value)
+
+    def ev(n):
+        recipe = n.recipe
+        if recipe == "lane_index":
+            return base + lane
+        if recipe in ("imm", "uniform_expr"):
+            return scalar_value(n.scalar)
+        if recipe == "uniform_load":
+            return offset(n.access, 0)  # 沿向量轴不变：代入 0 即可
+        if recipe in ("vload", "vload_strided"):
+            return offset(n.access, base + lane)
+        if recipe == "gather":
+            return ev(n.args[0]) if n.args else offset(n.access, base + lane)
+        if recipe == "vbrc":
+            return ev(n.args[0])
+        if recipe == "vadds":
+            return ev(n.args[0]) + ev(n.args[1])
+        if recipe == "vadd":
+            return ev(n.args[0]) + ev(n.args[1])
+        if recipe == "vsub":
+            return ev(n.args[0]) - ev(n.args[1])
+        if recipe in ("vmul", "vmuls"):
+            return ev(n.args[0]) * ev(n.args[1])
+        raise AssertionError(f"no lane evaluator for recipe '{recipe}'")
+
+    return ev(node)
+
+
 # ---------------------------------------------------------------------------
 # the mathematical core: Δ(offset) decides everything
 # ---------------------------------------------------------------------------
@@ -330,6 +383,132 @@ def test_if_single_arm_is_predicated_store():
     assert "tl.simd.vcmp" in ops and "tl.simd.update_mask" not in ops
 
 
+def test_statement_if_arm_load_is_guarded():
+    """D16：语句级单臂 if 的臂内访存也是惰性的。``a[i-32]`` 在 lane 0..31 越界，
+    装载必须挂上 store 谓词（发带掩码的 ``vgather2``），而不是整 lane ``vld a[-32]``。
+    守卫在 chunk 1（``i ∈ [64,128)``）恒真 → 只有 chunk 0 付 ``vgather2``。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i >= 32:
+                    c[i] = a[i - 32]
+
+    plan = _single_segment(k)
+    store = plan.stores[0]
+    assert store.mask is not None
+    assert store.value.recipe == "vload" and store.value.predicate is not None
+    assert plan.guard_boundaries == [1]  # chunk 1 起守卫恒真
+    ops = _emitted_ops(emit_plan(plan))
+    assert ops.count("tl.simd.vgather2") == 1  # chunk 0：越界风险段，带掩码
+    assert ops.count("tl.simd.vld") == 1  # chunk 1：守卫恒真，回到普通 vld
+    assert ops.count("tl.simd.vcmps") == 1  # 谓词只在带守卫的 chunk 0 计算
+
+
+def test_statement_if_prefix_guard_is_dropped_before_boundary():
+    """D16 镜像：**前缀**恒真守卫。``if i < 96: c[i] = a[i+32]`` 的 ``a[i+32]`` 只在
+    ``i < 96`` 时安全（``i >= 96`` 会读到 ``a[128..159]``），守卫在 chunk 0 恒真 →
+    chunk 0 退回普通 ``vld``，chunk 1 仍走带掩码的 ``vgather2``。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i < 96:
+                    c[i] = a[i + 32]
+
+    plan = _single_segment(k)
+    store = plan.stores[0]
+    assert store.mask is not None
+    assert store.value.recipe == "vload" and store.value.predicate is not None
+    assert plan.guard_boundaries == [1]  # chunk 0 守卫恒真
+    ops = _emitted_ops(emit_plan(plan))
+    assert ops.count("tl.simd.vld") == 1  # chunk 0：守卫恒真，普通 vld
+    assert ops.count("tl.simd.vgather2") == 1  # chunk 1：越界风险段，带掩码
+    assert ops.count("tl.simd.vcmps") == 1  # 谓词只在带守卫的 chunk 1 计算
+
+
+def test_guard_boundaries_cut_prefix_and_suffix_independently():
+    """前缀与后缀守卫同段共存：两个切点 ``[1, 7]`` 把 8 个 chunk 切成三段。
+
+    ``c`` 的后缀守卫（``i >= 32``）从 chunk 1 起恒真，``d`` 的前缀守卫
+    （``i < 480``）到 chunk 6 为止恒真；两段恒真区间互补，只有 chunk 0 与 chunk 7
+    各需要一次带掩码的 ``vgather2``。
+    """
+    M = 512
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), C: T.Tensor((M,), "float32"), D: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            c = T.alloc_shared((M,), "float32")
+            d = T.alloc_shared((M,), "float32")
+            for i in T.Parallel(M):
+                if i >= 32:
+                    c[i] = a[i - 32]
+                if i < 480:
+                    d[i] = a[i + 32]
+
+    plan = _single_segment(k)
+    assert plan.guard_boundaries == [1, 7]
+    ops = _emitted_ops(emit_plan(plan))
+    # chunk 0：c 带守卫 + d 恒真；chunk 1..6：两条都恒真；chunk 7：c 恒真 + d 带守卫。
+    assert ops.count("tl.simd.vgather2") == 2
+    assert ops.count("tl.simd.vld") == 4
+    assert ops.count("tl.simd.vcmps") == 2
+
+
+def test_statement_if_else_merge_keeps_branch_laziness():
+    """D16：同址 if/else 合并成**惰性** ``if_then_else``（不是急切 ``Select``），
+    真臂的越界读带条件守卫；常量 else 臂无装载。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i >= 32:
+                    c[i] = a[i - 32]
+                else:
+                    c[i] = 0.0
+
+    plan = _single_segment(k)
+    value = plan.stores[0].value
+    assert value.recipe == "vsel"
+    assert value.args[1].recipe == "vload" and value.args[1].predicate is not None
+    ops = _emitted_ops(emit_plan(plan))
+    assert ops.count("tl.simd.vgather2") == 1
+    assert ops.count("tl.simd.vld") == 1
+
+
+def test_statement_if_safe_load_stays_unmasked():
+    """D16 的细化：臂内地址**可证安全**时不加守卫，仍发普通 ``vld``（无性能回退）。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if a[i] != 0.0:
+                    c[i] = a[i]
+
+    plan = _single_segment(k)
+    assert plan.stores[0].value.recipe == "vload" and plan.stores[0].value.predicate is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vld" in ops and "tl.simd.vgather2" not in ops
+
+
 def test_ternary():
     N = 128
 
@@ -344,10 +523,80 @@ def test_ternary():
 
     plan = _single_segment(k)
     assert plan.stores[0].value.recipe == "vsel"
+    # P0-3：两个臂的地址都能证明在 buffer 内 → 不需要谓词化，仍发普通 ``vld``。
+    assert plan.stores[0].value.args[1].predicate is None
+    assert plan.stores[0].value.args[2].predicate is None
     ops = _emitted_ops(emit_plan(plan))
     # a lane-varying condition compares per lane (vcmp); it is *not* broadcast.
     assert "tl.simd.vcmp" in ops
     assert "tl.simd.update_mask" not in ops
+    assert "tl.simd.vgather2" not in ops
+
+
+def test_lazy_conditional_with_unsafe_load_is_predicated():
+    """P0-3：``if_then_else(i > 0, a[i-1], 0)`` 的 ``a[i-1]`` 在 lane 0 越界，
+    所以真臂的装载必须带条件守卫（发带谓词的 ``vgather2``），而不是整 lane ``vld``。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = T.if_then_else(i > 0, a[i - 1], 0.0)
+
+    plan = _single_segment(k)
+    value = plan.stores[0].value
+    assert value.recipe == "vsel" and not value.is_uniform
+    true_arm = value.args[1]
+    assert true_arm.recipe == "vload" and true_arm.predicate is not None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vgather2" in ops  # 带守卫的装载通道
+    assert "tl.simd.vcmps" in ops  # 条件本身（i > 0）
+
+
+def test_lazy_conditional_with_unpredicable_uniform_load_is_rejected():
+    """P0-3：惰性条件臂里的**lane 均匀**间接读无法谓词化（没有带掩码的标量读），
+    build 期必须明确拒绝，而不是发一个无条件标量读。"""
+    N = 128
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((N,), "float32"),
+        D: T.Tensor((16,), "float32"),
+        IDX: T.Tensor((1,), "int32"),
+        C: T.Tensor((N,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            d = T.alloc_shared((16,), "float32")
+            idx = T.alloc_shared((1,), "int32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = T.if_then_else(a[i] > 0.0, d[idx[0]], 0.0)
+
+    with pytest.raises(Unsupported, match="cannot be predicated"):
+        _plan(k)
+
+
+def test_lazy_conditional_with_safe_uniform_load_is_allowed():
+    """P0-3 的细化：臂里的标量读地址**可证安全**时不必拒绝，也没必要带守卫。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), B: T.Tensor((16,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            b = T.alloc_shared((16,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = T.if_then_else(a[i] > 0.0, b[0] + 1.0, 0.0)
+
+    plan = _single_segment(k)
+    value = plan.stores[0].value
+    assert value.args[1].is_uniform  # b[0] + 1 折叠成标量 + vdup
+    assert "tl.simd.vsel" in _emitted_ops(emit_plan(plan))
 
 
 def test_ternary_with_loop_invariant_condition_broadcasts_predicate():
@@ -458,14 +707,94 @@ def test_operand_rank_mismatch_broadcasts_outer_load():
     plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     value = plan.stores[0].value
-    # SIMD 层没有 vsubs：``uniform - vector`` 折叠成 ``vadds(vector, -uniform)``，
-    # 标量取负是标量开销（省掉一条 vdup）。
-    assert value.recipe == "vadds"
-    assert value.args[0].recipe == "vload"
-    assert value.args[1].recipe == "uniform_expr"
+    # SIMD 层没有 vsubs：``uniform - vector`` 只能发 ``vsub(vdup(uniform), vector)``。
+    # 只有 ``vector - scalar`` 才允许折叠成 ``vadds(vector, -scalar)``——反向折叠会
+    # 得到 ``vector - scalar``（符号相反，P0-1）。
+    assert value.recipe == "vsub"
+    assert value.args[0].recipe == "vbrc"
+    assert value.args[0].args[0].recipe == "uniform_load"
+    assert value.args[1].recipe == "vload"
+    # 数值 golden：i=3 时 lane j 必须是 3 - j（而不是 j - 3）。
+    i_var = plan.axes[0].var
+    got = [_eval_lane(value, lane, plan, env={i_var: 3}) for lane in range(8)]
+    assert got == [3 - lane for lane in range(8)]
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vadds" in ops and "tl.simd.vld" in ops
-    assert "tl.simd.vdup" not in ops and "tl.simd.vsub" not in ops
+    assert "tl.simd.vsub" in ops and "tl.simd.vdup" in ops and "tl.simd.vld" in ops
+    assert "tl.simd.vadds" not in ops
+
+
+def test_vector_minus_scalar_still_folds_to_vadds():
+    """P0-1 的反向护栏：``vector - scalar`` 仍然要折叠成 ``vadds(vector, -scalar)``
+    （标量取负是标量开销），不能被上一处修复误伤。"""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[i] - 1.0
+
+    plan = _single_segment(k)
+    value = plan.stores[0].value
+    assert value.recipe == "vadds"
+    assert value.args[0].recipe == "vload" and value.args[1].recipe == "uniform_expr"
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vadds" in ops and "tl.simd.vsub" not in ops
+
+
+def test_mixed_element_width_segment_is_rejected():
+    """P0-2：一段共享一个 lane 数（chunk 步长 = lanes）。f16 与 int32 混写时后者的
+    向量寄存器只有一半 lane，会静默漏写/越界 → build 期必须拒绝。"""
+    N = 128
+
+    @T.prim_func
+    def k(
+        AF: T.Tensor((N,), "float16"),
+        AI: T.Tensor((N,), "int32"),
+        CF: T.Tensor((N,), "float16"),
+        CI: T.Tensor((N,), "int32"),
+    ):
+        with T.Kernel(1):
+            af = T.alloc_shared((N,), "float16")
+            ai = T.alloc_shared((N,), "int32")
+            cf = T.alloc_shared((N,), "float16")
+            ci = T.alloc_shared((N,), "int32")
+            for i in T.Parallel(N):
+                cf[i] = af[i]
+                ci[i] = ai[i]
+
+    with pytest.raises(Unsupported, match="mixed element widths"):
+        _plan(k)
+
+
+def test_same_width_mixed_element_types_derive_per_load_dtype():
+    """P0-2：f32 / int32 位宽相同可以同段；但每个值节点的 dtype 必须取**被访问
+    buffer** 的元素类型（int32 的装载不能声称 ``float32x64``）。"""
+    N = 128
+
+    @T.prim_func
+    def k(
+        AF: T.Tensor((N,), "float32"),
+        AI: T.Tensor((N,), "int32"),
+        CF: T.Tensor((N,), "float32"),
+        CI: T.Tensor((N,), "int32"),
+    ):
+        with T.Kernel(1):
+            af = T.alloc_shared((N,), "float32")
+            ai = T.alloc_shared((N,), "int32")
+            cf = T.alloc_shared((N,), "float32")
+            ci = T.alloc_shared((N,), "int32")
+            for i in T.Parallel(N):
+                cf[i] = af[i]
+                ci[i] = ai[i]
+
+    plan = _single_segment(k)
+    assert plan.lanes == 64
+    assert [store.value.dtype for store in plan.stores] == ["float32x64", "int32x64"]
+    ops = _emitted_ops(emit_plan(plan))
+    assert ops.count("tl.simd.vld") == 2 and ops.count("tl.simd.vsts") == 2
 
 
 def test_reduction_detected():
@@ -845,6 +1174,9 @@ def test_reversal_is_permute_gather():
     plan = _single_segment(k)
     value = plan.stores[0].value
     assert value.recipe == "gather" and value.detail == AccessClass.PERMUTE.value
+    # 数值 golden：chunk 0 的每 lane 下标必须正好是 127, 126, ...（P0-1：不能是 i-127）。
+    assert [_eval_lane(value, lane, plan) for lane in range(4)] == [127, 126, 125, 124]
+    assert [_eval_lane(value, lane, plan, base=64) for lane in range(4)] == [63, 62, 61, 60]
     assert "tl.simd.vgather2" in _emitted_ops(emit_plan(plan))
 
 
@@ -1032,8 +1364,8 @@ def test_flatten_is_skipped_when_a_load_still_needs_gather():
     assert [axis.name for axis in plan.axes] == ["i", "j"]
     assert plan.vector_axis.name == "j"
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vgather2" in ops and "tl.simd.vadds" in ops
-    assert "tl.simd.vdup" not in ops  # uniform 取负后直接走标量-向量指令
+    assert "tl.simd.vgather2" in ops and "tl.simd.vsub" in ops
+    assert "tl.simd.vdup" in ops  # uniform 侧取负不适用：``g[i] - g[j]`` 是 scalar - vector
 
 
 def test_direct_serial_reduction_absorbed():
@@ -1062,9 +1394,11 @@ def test_direct_serial_reduction_absorbed():
 
 
 def test_direct_serial_private_scalar_absorbed():
-    """S2（§6 第二步）：迭代私有**标量**累加器。``acc``(local.var) 的 init/store 把 serial
-    循环夹在中间 —— init 作为 ``pre`` 段、写回 ``c[i]`` 作为 ``post`` 段，二者在 chunk
-    循环**之外**每个并行迭代各执行一次；主体沿 serial 轴 j 走 vcadd 归约。"""
+    """S2（§6 第二步）：迭代私有**标量**累加器，沿并行轴向量化。
+
+    ``acc``(local.var) 每个并行迭代各有一份 → 提升成 ``local.var`` **向量寄存器**：
+    ``pre`` 的 ``acc = 0`` 折叠成 ``vdup`` 初值，主体每轮只做 ``vadd``，循环结束一次
+    ``ONEPT`` 回写私有标量，``post`` 的 ``c[i] = acc`` 直接复用寄存器。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1080,16 +1414,18 @@ def test_direct_serial_private_scalar_absorbed():
                 c[i] = acc
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
-    # pre = acc[0] = 0.0 是 Add 的单位元 → 折叠成累加器初值（pre 写被删除，不再并入旧值）。
-    assert plan.pre_stores == []
-    assert plan.reduce.accumulate is False
+    assert plan.vector_axis.name == "i"  # 每 lane 一份私有累加器，沿并行轴向量化
+    assert plan.reduce is None  # 不是跨 lane 归约
+    assert [s.kind for s in plan.stores] == [AccessClass.UNIFORM]
+    assert [s.spec.buffer.name for s in plan.pre_stores] == ["acc"]
     assert [s.spec.buffer.name for s in plan.post_stores] == ["c"]
-    assert [s.kind for s in plan.post_stores] == [AccessClass.UNIFORM]
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
-    assert "tl.simd.vadds" not in ops  # 单位元初值 → 不需要并入旧值
+    assert "tl.simd.vadd" in ops
+    assert "tl.simd.vcadd" not in ops  # 私有标量不做跨 lane 归约
+    assert "tl.simd.vld" not in ops  # 初值来自 pre 折叠，主体旧值来自寄存器
+    # ONEPT 回写私有标量（段外可见）+ 写回 c[i]；post 直接吃寄存器（不再 vdup 回读）。
+    assert ops.count("tl.simd.vsts") == 2
+    assert 'scope="local.var"' in str(emit_plan(plan))
 
 
 def test_serial_shared_scalar_rejected():
@@ -1214,7 +1550,12 @@ def test_serial_sandwiched_statements_absorbed():
     assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vadd" in ops and "tl.simd.vmuls" in ops
-    assert ops.count("tl.simd.vsts") >= 3  # pre + 主体 + post
+    # 累加器寄存器化：同址 pre 折成 ``vdup`` 寄存器初值，主体每轮只更新寄存器
+    # （不再每轮 vld + vsts），post 直接读寄存器 → 整段只剩一次回写。
+    assert ops.count("tl.simd.vsts") == 1
+    assert "tl.simd.vld" not in ops
+    text = str(emit_plan(plan))
+    assert 'scope="local.var"' in text and "acc" in text
 
 
 def test_serial_independent_store_group_absorbed():
@@ -2077,13 +2418,16 @@ def test_defect_d8_negative_stride_below_minus_one():
                 c[i] = a[126 - 2 * i]
 
     try:
-        stmt = emit_plan(_single_segment(k))
+        plan = _single_segment(k)
+        stmt = emit_plan(plan)
     except Unsupported:
         return
     ops = _emitted_ops(stmt)
     # 正确契约：要么拒绝，要么不得用「无符号 lane 斜坡 × 负步长」表达负步长访问。
     assert not _negative_immediate_muls(stmt)
     assert "tl.simd.vgather2" in ops
+    # 数值 golden：lane 0..3 的下标必须是 126, 124, 122, 120（P0-1：不能整体取反）。
+    assert [_eval_lane(plan.stores[0].value, lane, plan) for lane in range(4)] == [126, 124, 122, 120]
 
 
 def test_defect_d8_negative_stride_store_is_scattered():
@@ -2099,12 +2443,15 @@ def test_defect_d8_negative_stride_store_is_scattered():
                 c[126 - 2 * i] = a[i]
 
     try:
-        stmt = emit_plan(_single_segment(k))
+        plan = _single_segment(k)
+        stmt = emit_plan(plan)
     except Unsupported:
         return
     ops = _emitted_ops(stmt)
     assert not _negative_immediate_muls(stmt)
     assert "tl.simd.vscatter" in ops
+    # 数值 golden（写侧）：scatter 索引 lane 0..3 必须是 126, 124, 122, 120。
+    assert [_eval_lane(plan.stores[0].index, lane, plan) for lane in range(4)] == [126, 124, 122, 120]
 
 
 def test_defect_d9_symbolic_extent_is_not_silently_truncated():
@@ -2201,8 +2548,10 @@ def test_long_reduction_keeps_a_real_chunk_loop_with_a_mutable_accumulator():
     assert str(accumulators[0].dtype) == "float32x64"
     kinds = _for_kinds(stmt)
     assert kinds.count(tirx.ForKind.SERIAL) == 2  # 外层并行轴 i + chunk 循环
-    chunk_loops = [extent for extent in _for_extents(stmt) if isinstance(extent, tirx.IntImm) and int(extent.value) == 7]
-    assert chunk_loops, "expected a 7-iteration full-chunk loop (chunks-1, tail == 0)"
+    # tail == 0 时 chunk 循环必须覆盖**全部** chunks 块（旧实现只跑 chunks-1 块，
+    # 静默漏掉最后一块；strip-mine 收敛后由同一个骨架保证）。
+    chunk_loops = [extent for extent in _for_extents(stmt) if isinstance(extent, tirx.IntImm) and int(extent.value) == plan.chunks]
+    assert chunk_loops, f"expected a {plan.chunks}-iteration full-chunk loop (tail == 0)"
 
 
 def test_symbolic_extent_reduction_uses_a_runtime_chunk_loop():
@@ -2423,3 +2772,296 @@ def test_masked_branch_merging_is_rejected():
 
     with pytest.raises(Unsupported, match="masked branch merging"):
         build_plan(_first_parallel(k))
+
+
+# ---------------------------------------------------------------------------
+# 设计层审计回归（R1–R7）
+#
+# 与上面的 D* 缺陷不同，这一组是「统一模型 / 发射契约」层面的问题：多为
+# **build 成功但语义错误**（静默错发）或 **build 成功、emit 崩溃**。每个用例钉住
+# 修复后的正确契约：要么拒绝，要么发射出与标量语义等价的形态。
+# ---------------------------------------------------------------------------
+
+
+def test_predicate_combine_follows_the_data_element_width():
+    """R1：谓词-谓词运算（pand/por/pnot）的执行掩码必须跟随**数据元素**粒度。
+
+    ``(100,)`` float16 → lanes = 128、``tail = 100``。用户谓词（``vcmp``，b16）与尾块
+    谓词（``update_mask``，b16）做 ``pand`` 时若用固定 b32（64 lane），lane 64..127 会被
+    清零，尾块只写一半。修复后掩码宽度只剩 b16。
+    """
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float16"), B: T.Tensor((M,), "float16"), C: T.Tensor((M,), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float16")
+            b = T.alloc_shared((M,), "float16")
+            c = T.alloc_shared((M,), "float16")
+            for i in T.Parallel(M):
+                if a[i] > b[i]:
+                    c[i] = a[i]
+
+    segment = _single_segment(k)
+    assert segment.lanes == 128 and segment.tail == 100
+    stmt = emit_plan(segment)
+    assert "tl.simd.pand" in _emitted_ops(stmt)
+    widths = {int(arg.value) for arg in _call_args(stmt, "tl.simd.pset") if isinstance(arg, tirx.IntImm)}
+    assert widths == {16}, f"predicate ops must run at the data element width (b16), got {widths}"
+
+
+def test_lane_uniform_store_condition_is_broadcast_as_a_predicate():
+    """R2：``if a[0] > 0.0: c[i] = a[i]`` 的条件沿向量轴均匀，是 **bool 标量**。
+
+    旧实现把它交给 ``_Emitter.value`` 当数据向量 ``vdup``，而 bool 没有谓词宽度 →
+    发射期 ``ValueError``。正确路径是 ``predicate()``：``update_mask(cond ? lanes : 0)``。
+    """
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), C: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            c = T.alloc_shared((M,), "float32")
+            for i in T.Parallel(M):
+                if a[0] > 0.0:
+                    c[i] = a[i]
+
+    statement = emit_plan(_single_segment(k))  # build 成功 ⇒ emit 成功
+    ops = _emitted_ops(statement)
+    assert "tl.simd.update_mask" in ops
+    assert "tl.simd.vdup" not in ops, "a bool condition must not be broadcast as data"
+    # 条件掩码与尾块掩码的合取仍然成立（尾块 100 < 128）。
+    assert "tl.simd.pand" in ops
+
+
+def test_conditional_reduction_is_rejected():
+    """R3：``if cond: s[0] += a[i]`` 的跨 lane 归约掩码只承载尾块谓词。
+
+    旧实现**静默丢掉**用户谓词、对全部 lane 求和（结果错误）；现在 build 期显式拒绝。
+    """
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                if i < 64:
+                    s[0] = s[0] + a[i]
+
+    with pytest.raises(Unsupported, match="conditional reduction"):
+        _single_segment(k)
+
+
+def test_repeated_old_value_inside_a_reduction_is_rejected():
+    """R4：``s[0] = s[0] + (s[0] + a[i,j])`` 的旧值出现两次。
+
+    ``_strip_reduce`` 沿归约脊把两处旧值都剥掉，只留一个初值 → 会丢掉一份 ``s[0]``。
+    现在按「剥离次数必须恰好 1」显式拒绝。
+    """
+    M, K = 4, 128
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                for j in T.serial(K):
+                    s[0] = s[0] + (s[0] + a[i, j])
+
+    with pytest.raises(Unsupported, match="appears more than once"):
+        _single_segment(k)
+
+
+def test_serial_loop_with_non_zero_lower_bound_is_rejected():
+    """R5：迭代域建模成 ``0 <= x < extent``，``T.serial(1, K)`` 的下界会被丢掉。
+
+    旧实现发射 ``for j in range(K-1)``（从 0 开始），下标整体错位一格。现在明确拒绝。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(1, KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    with pytest.raises(Unsupported, match="must start at 0"):
+        _single_segment(k)
+
+
+def test_multiple_writes_to_one_buffer_at_different_addresses_are_rejected():
+    """R6：同一 serial 体内 ``c[i,2*j]`` 与 ``c[i,j]`` 会在不同迭代写到同一地址。
+
+    标量顺序下的「后写覆盖」在向量化后不成立（lane 间写序未定义）；``_serial_is_clean``
+    现在按「同一 buffer 的多条写必须目的地址相同」保守拒绝，原因进入诊断。
+    """
+    MS, KS = 4, 128
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, 2 * KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, 2 * KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, 2 * j] = a[i, j]
+                    c[i, j] = 2.0
+
+    with pytest.raises(Unsupported, match="nested serial loop") as excinfo:
+        _single_segment(k)
+    assert any("may alias" in note for note in excinfo.value.diagnostics)
+
+
+def test_parallel_axis_reduction_with_non_uniform_pre_falls_back():
+    """R7：沿**并行轴**做归约时，``pre``/``post`` 由 ``_emit_outer_store`` 发射并要求 lane 均匀。
+
+    旧实现只在「沿 serial 轴」分支检查该门禁，于是 ``t[i] = 1.0``（沿 i 连续）+
+    沿 i 的归约在 build 期通过、emit 期抛 ``Unsupported``。现在 build 期拒绝该轴，
+    规划器回退到 serial 轴 ``j``（正确的归约），并且诊断里保留回退原因。
+    """
+    M, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((KS, M), "float32"), Tt: T.Tensor((M,), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((KS, M), "float32")
+            t = T.alloc_shared((M,), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                t[i] = 1.0
+                for j in T.serial(KS):
+                    s[0] = s[0] + a[j, i]
+
+    program = _plan(k)
+    segment = program.segments[0]
+    assert segment.vector_axis.name == "j"
+    assert any("-> fallback" in note for note in segment.diagnostics)
+    emit_plan(program)  # build 成功 ⇒ emit 成功
+
+
+def test_multi_segment_shares_prologue_and_passes_the_accumulator_register():
+    """多段 program 的两类段间冗余：重复的 chunk 无关绑定、以及「回写后立刻重读」。
+
+    段 0 把 ``s[i] += a[i,j]`` 累加进 ``local.var`` 寄存器并回写内存；段 1 立刻
+    ``c[i,l] = s[i]*2``。修复后：
+
+    * 全 lane 掩码与步长斜坡各只绑一次（``pset`` / ``vci`` 各 1 条）；
+    * 段 1 的 ``vld s`` 直通段 0 的累加器寄存器（``vld`` 只剩段 0 的初值装载）。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] + a[i, j]
+                for l in T.serial(KS):
+                    c[i, l] = s[i] * 2.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram) and len(program.segments) == 2
+    ops = _emitted_ops(emit_plan(program))
+    assert ops.count("tl.simd.pset") == 1, "全 lane 掩码应在 program 层只绑一次"
+    assert ops.count("tl.simd.vci") == 1, "同一 stride 的步长斜坡应跨段复用"
+    assert ops.count("tl.simd.vld") == 1, "段 1 的 s 读应直通段 0 的累加器寄存器"
+
+
+def test_multi_segment_carry_is_not_used_across_chunks():
+    """反例：段 0/1 都展平成 8 个 chunk（lane 基址逐 chunk 变化）时**不能**直通。
+
+    ``p_serial_compose`` 的每一段各自跑 ``chunk_s<k>`` 循环；段 1 读段 0 写的 ``c``
+    必须重新 ``vld``（两次）——直通只允许「单 chunk、lane 基址恒 0」的段。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        C: T.Tensor((MS, KS), "float32"),
+        D: T.Tensor((MS, KS), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            d = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, j] = a[i, j] * 2.0
+                for l in T.serial(KS):
+                    d[i, l] = c[i, l] + 1.0
+
+    program = _plan(k)
+    assert program.segments[0].chunks == 8 and program.segments[1].chunks == 8
+    ops = _emitted_ops(emit_plan(program))
+    assert ops.count("tl.simd.pset") == 1, "掩码共享仍然生效"
+    assert ops.count("tl.simd.vld") == 2, "多 chunk 段之间不得直通寄存器"
+
+
+def test_carry_is_invalidated_by_an_intermediate_write():
+    """段间直通必须被中间写作废：``s[i] = 0.0`` 之后的重读不能再吃旧寄存器。
+
+    段 0 的归约回写登记了 ``s[i]`` 的寄存器值；段 1 的 pre 覆写 ``s[i] = 0.0``
+    会 ``note_write`` 掉该 buffer 的全部直通项，因此段 2 的 ``vld s`` 必须真实存在。
+    """
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] + a[i, j]
+                s[i] = 0.0
+                for l in T.serial(KS):
+                    c[i, l] = s[i] * 2.0
+
+    program = _plan(k)
+    ops = _emitted_ops(emit_plan(program))
+    # 段 0 的累加器初值装载 + 中间覆写后段 2 的真实重读。
+    assert ops.count("tl.simd.vld") == 2, "中间写之后不得继续复用段 0 的寄存器"
+
+
+def test_carry_tracks_the_newest_producer():
+    """链式归约：段 1 的累加器初值可直通段 0 的寄存器，但消费段必须用段 1 的值。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(
+        A: T.Tensor((MS, KS), "float32"),
+        B: T.Tensor((MS, KS), "float32"),
+        S: T.Tensor((MS,), "float32"),
+        C: T.Tensor((MS, KS), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = s[i] + a[i, j]
+                for j in T.serial(KS):
+                    s[i] = s[i] + b[i, j]
+                for l in T.serial(KS):
+                    c[i, l] = s[i] * 2.0
+
+    program = _plan(k)
+    assert len(program.segments) == 3
+    stmt = emit_plan(program)
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vld") == 1, "段 1 的初值与段 2 的读都应由直通/最新寄存器满足"
+    assert "accs1_0[0]" in str(stmt), "消费段必须使用段 1 回写的寄存器（最新生产者）"

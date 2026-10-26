@@ -2,11 +2,16 @@
           
 ## 0. 基线（本轮实测）
 
-- 实现：[polyhedral/](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral) 包，10 个模块共 **2678 行**（最大 `plan.py` 793 行）
-- 模块：`primitives` / `access` / `body` / `value` / `plan` / `emit` / `render` / `driver` / `__init__`
-- 测试：`87 passed`（0 xfail）
-- 复现：`python tilelang/ascend/analysis/test_drive_plan.py --tir &> log_poly.log` → **45 OK / 11 REJ / 0 ERR**，log 2493 行（拆分前后逐字节一致）
+- 实现：[polyhedral/](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral) 包，10 个模块
+- 模块：`primitives` / `access` / `body` / `value` / `model` / `plan` / `emit` / `render` / `driver` / `__init__`
+- 测试：`96 passed`（0 xfail）
+- 复现：`python tilelang/ascend/analysis/test_drive_plan.py --tir &> log_poly.log` → **50 OK / 7 REJ / 0 ERR**，log 2598 行
 - ruff：`check` / `format --check` 全绿
+
+> 本轮已修：P0-1（`scalar - vector` 符号翻转）、P0-2（同段混合元素位宽 + load 节点 dtype）、
+> P0-3（`if_then_else` 惰性分支的 predicated load）、P0-4（累加器提升推广到 inner parallel 轴）、
+> 以及三份 strip-mine / 两份 flatten / 两份累加器判据的收敛（顺带修掉长归约 tail==0
+> 只跑 `chunks-1` 块的漏算）。
 
 ---
 
@@ -17,7 +22,7 @@
 | 编号 | 问题 | 证据 | 影响 | 建议 |
 |---|---|---|---|---|
 | **A1** | **`bool` 作"数据"操作数仍是 build OK → emit `ValueError`**（唯一会抛非 `Unsupported` 的路径） | `d[i] = T.Cast("float32", c[i])`（`c: bool`）：build OK，emit 抛 `ValueError: Cannot infer default mask width for dtype 'boolx256'`。根因：`build_value` 的 `Cast` → `vcvt`，`_build` 里 `_mask_bits(src.dtype)` 遇到 bool 向量；而 [`_require_supported_element`](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/plan.py) 只校验 **store** 侧 | 契约裂缝（D11 同族），调用方无法优雅兜底 | 在 `build_value` 对「bool 作为数据操作数」（Cast / 算术 / FloorDiv 等）显式 `Unsupported`；bool 只允许出现在**谓词**位置 |
-| **A2** | **`ValueNode.dtype` 统一取"store 的元素类型"**，而非被访问 buffer 的元素类型 | [`load_node`](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/value.py) 一律用 `ctx.vector_dtype`；`bool` 载入节点因此声称 `float32x64`，实际 TIR 是 `boolx256` | 混合元素类型时节点的类型/掩码宽度与实际寄存器不一致；当前靠各 recipe 里"再算一次宽度"掩盖，A1 就是它暴露出来的 | `load_node` 用 `_vec_dtype(buffer 元素类型)` 派生 dtype，并让 recipe 使用节点 dtype（需回归 f16→f32、int32→f32 等场景） |
+| **A2** | **`ValueNode.dtype` 统一取"store 的元素类型"**，而非被访问 buffer 的元素类型 | [`load_node`](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/value.py) 一律用 `ctx.vector_dtype`；`bool` 载入节点因此声称 `float32x64`，实际 TIR 是 `boolx256` | 混合元素类型时节点的类型/掩码宽度与实际寄存器不一致 | ✅ **已修**（P0-2）：`load_node` / `_elementwise` / `vsel` 都按**自身元素类型**派生向量 dtype；同段不同**位宽**在 build 期显式拒绝 |
 | **A3** | A0 门禁只覆盖**被吸收的 serial 轴**；并行向量轴上的"lane 均匀地址 + 变化取值"仍是 `ONEPT` 取 lane 0 | [`_build_plan_for_axis`](file:///home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/plan.py) | 该形态在 `T.Parallel` 下写同一地址本身就跨迭代竞争（语义未定义），因此视为边界而非缺陷 | 文档写明；若将来要求"确定性 last-write-wins"，需额外拒绝 |
 | **A4** | 多段路径失败时，顶层消息是泛化的 "nested serial loop"，真实原因（A0 / 段级拒绝）只在 `diagnostics` | `log_poly.log` 中 `d14_partial_reduce` 的 `[REJ]` 首行是 nested serial loop，下一行 diag 才是 partial reduction | 诊断可读性 | 顶层 `Unsupported` 消息优先使用第一条段级原因 |
 | **A5** | `_require_supported_element` 只查 store；**load/谓词** dtype 未校验 | 同 A1 | 见 A1 | 与 A1 一并处理 |

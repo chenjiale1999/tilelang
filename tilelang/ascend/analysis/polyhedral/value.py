@@ -17,10 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from tvm import arith, tirx
+from tvm.ir import Range
 
 from tilelang.ascend.language.simd import _vec_dtype
 
-from .access import AccessClass, AccessInfo, Axis, _const_int, classify_access
+from .access import AccessClass, AccessInfo, Axis, _const_int, _free_vars, classify_access
 from .primitives import (
     _BINARY_RECIPE,
     _BOOL_BINARY_RECIPE,
@@ -35,12 +36,24 @@ from .primitives import (
     _call_tail,
     _elem_dtype,
     _is_atomic_name,
+    _same_buffer,
+    _same_indices,
 )
 
 
 @dataclass
 class ValueNode:
-    """一个值节点：recipe 是原语名，args 是操作数。"""
+    """一个值节点：recipe 是原语名，args 是操作数。
+
+    ``predicate`` 是**装载守卫**：该值只在谓词为真的 lane 上有效（P0-3）。它只出现在
+    ``if_then_else`` 这类惰性条件的分支里——分支里的访存只有在条件成立时才应当发生；
+    发射层把这个谓词合进 ``vgather2`` 的掩码，未选中 lane 不访问内存。
+
+    ``predicate_free_until`` / ``predicate_free_from`` 给出该守卫**恒为真**的首/尾
+    chunk 区间（见 :func:`_guard_free_bounds`）：``chunk < predicate_free_until`` 或
+    ``chunk >= predicate_free_from`` 的块可以省掉掩码，把带谓词的 ``vgather2``
+    退回普通 ``vld``。
+    """
 
     recipe: str
     dtype: str
@@ -48,6 +61,9 @@ class ValueNode:
     access: AccessInfo | None = None
     scalar: tirx.PrimExpr | None = None
     detail: str = ""
+    predicate: ValueNode | None = None
+    predicate_free_until: int = 0
+    predicate_free_from: int | None = None
 
     @property
     def is_uniform(self) -> bool:
@@ -75,16 +91,249 @@ def _dtype_of(expr) -> str:
     return str(dtype)
 
 
+def _vec_of(dtype_like) -> str:
+    """元素类型（或带 ``.dtype`` 的表达式）→ 向量寄存器类型。
+
+    lane 数由**该元素类型自身**的位宽唯一决定，而不是整段共享一个 ``vector_dtype``：
+    同一段里 f32 / int32 混用时（位宽相同、元素类型不同），每个值节点必须是自己的
+    元素类型，否则掩码宽度/向量类型与实际寄存器不一致（P0-2）。
+    """
+    dtype = dtype_like if isinstance(dtype_like, str) else _dtype_of(dtype_like)
+    return _vec_dtype(_elem_dtype(dtype))
+
+
+# -- 值 DAG 上的「同址 / 跨址读」查询（plan 与 emit 共用，累加器判据的唯一来源） ----
+
+
+def _reads_buffer(node: ValueNode, buffer) -> bool:
+    """值 DAG 是否在**任何位置**读取给定 buffer（含 ``uniform_expr`` 折叠的标量表达式）。"""
+    if node.access is not None and _same_buffer(node.access.buffer, buffer):
+        return True
+    if node.scalar is not None:
+        found: list[bool] = []
+
+        def visit(sub):
+            if isinstance(sub, tirx.BufferLoad) and _same_buffer(sub.buffer, buffer):
+                found.append(True)
+
+        tirx.stmt_functor.post_order_visit(node.scalar, visit)
+        if found:
+            return True
+    return any(_reads_buffer(arg, buffer) for arg in node.args)
+
+
+def same_address_load(node: ValueNode, buffer, indices):
+    """在值 DAG 里找「读同一 buffer、同一地址」的装载节点（累积写的旧值来源）。"""
+    if (
+        node.recipe in ("vload", "uniform_load")
+        and node.access is not None
+        and _same_buffer(node.access.buffer, buffer)
+        and _same_indices(tuple(node.access.indices), tuple(indices))
+    ):
+        return node
+    for arg in node.args or ():
+        found = same_address_load(arg, buffer, indices)
+        if found is not None:
+            return found
+    return None
+
+
+def reads_other_address(node: ValueNode, buffer, indices) -> bool:
+    """值 DAG 里是否读了 ``buffer`` 上**不同于** ``indices`` 的地址。
+
+    累加器把「同址读改写」搬进寄存器后，同层其它语句若读该 buffer 的**别的**地址，
+    会读到尚未回写的旧内存值（如 ``for j: s[0] += a[i,j]; c[i] = s[1]``）。同址读由
+    发射层 memo 转发到寄存器，是安全的。
+    """
+    if (
+        node.recipe in ("vload", "uniform_load")
+        and node.access is not None
+        and _same_buffer(node.access.buffer, buffer)
+        and not _same_indices(tuple(node.access.indices), tuple(indices))
+    ):
+        return True
+    return any(reads_other_address(arg, buffer, indices) for arg in node.args or ())
+
+
 @dataclass
 class _ValueContext:
     axes: list[Axis]
     vector_axis: Axis
-    lanes: int
     analyzer: arith.Analyzer
-    vector_dtype: str
+    # 惰性条件分支的装载守卫（P0-3）：``if_then_else`` 的每个分支只在条件成立时求值，
+    # 分支里的访存必须挂上这个谓词，发射层才能把未选中 lane 从 gather 里屏蔽掉。
+    guard: ValueNode | None = None
+    # 该守卫恒为真的首/尾 chunk 区间：``[0, guard_free_until)`` 与
+    # ``[guard_free_from, chunks)``。``until == 0`` / ``from is None`` 表示对应方向证不出。
+    guard_free_until: int = 0
+    guard_free_from: int | None = None
+    # 向量寄存器 lane 数：按 chunk 边界做守卫证明时用来换算迭代域。
+    lanes: int = 0
 
 
-def build_value(expr, ctx: _ValueContext, is_global_ok: bool = False) -> ValueNode:
+def _with_guard(
+    ctx: _ValueContext,
+    guard: ValueNode | None,
+    free_until: int = 0,
+    free_from: int | None = None,
+) -> _ValueContext:
+    if guard is None:
+        return ctx
+    return _ValueContext(
+        axes=ctx.axes,
+        vector_axis=ctx.vector_axis,
+        analyzer=ctx.analyzer,
+        guard=guard,
+        guard_free_until=free_until,
+        guard_free_from=free_from,
+        lanes=ctx.lanes,
+    )
+
+
+def _combine_free_until(lhs: int, rhs: int) -> int:
+    """两个守卫恒真区间的**前缀**合取：取较小者。"""
+    return min(lhs, rhs)
+
+
+def _combine_free_from(lhs: int | None, rhs: int | None) -> int | None:
+    """两个守卫恒真区间的**后缀**合取：任一证不出就整体证不出。"""
+    if lhs is None or rhs is None:
+        return None
+    return max(lhs, rhs)
+
+
+def _prove_guard(expr, ctx: _ValueContext, lo: int, hi: int) -> bool:
+    probe = arith.Analyzer()
+    probe.bind(ctx.vector_axis.var, Range(lo, hi))
+    return probe.can_prove(expr)
+
+
+def _guard_free_bounds(expr, ctx: _ValueContext) -> tuple[int, int | None]:
+    """守卫 ``expr`` 恒真的首/尾 chunk 区间 ``([0, until), [from, chunks))``。
+
+    只做充分证明：在 ``axis.var ∈ [0, u*lanes)`` / ``[c*lanes, extent)`` 上 ``can_prove``。
+    整段都恒真的情形不参与（``until`` 最多到 ``chunks-1``、``from`` 从 ``chunks-1`` 起），
+    因为那时 :func:`_access_provably_in_bounds` 会直接丢掉守卫，不需要分块。
+    """
+    extent = _const_int(ctx.vector_axis.extent, ctx.analyzer)
+    lanes = ctx.lanes
+    if extent is None or lanes <= 0 or extent <= lanes:
+        return 0, None
+    chunks = (extent + lanes - 1) // lanes
+    until = 0
+    while until + 1 < chunks and _prove_guard(expr, ctx, 0, (until + 1) * lanes):
+        until += 1
+    frm: int | None = None
+    for c in range(chunks - 1, 0, -1):
+        if not _prove_guard(expr, ctx, c * lanes, extent):
+            break
+        frm = c
+    return until, frm
+
+
+def _uniform_guarded(expr, ctx: _ValueContext) -> ValueNode:
+    """全均匀子表达式 → 标量求值一次（``vdup``）。
+
+    若当前处在惰性条件分支里（``ctx.guard`` 非空），这个标量表达式可能包含访存；
+    标量读**没有掩码形式**，无法保证「条件不成立就不访问」。此时逐个校验地址能否
+    证明在所有 lane 内：能证就照常折叠成标量；证不了就明确拒绝（P0-3）。
+    """
+    if ctx.guard is not None:
+        unpredicable: list[str] = []
+
+        def visit(node):
+            if not isinstance(node, tirx.BufferLoad) or unpredicable:
+                return
+            info = classify_access(node.buffer, tuple(node.indices), ctx.axes, ctx.analyzer, is_store=False)
+            if not _access_provably_in_bounds(info, ctx):
+                unpredicable.append(node.buffer.name)
+
+        tirx.stmt_functor.post_order_visit(expr, visit)
+        if unpredicable:
+            raise Unsupported(
+                f"lane-uniform load of '{unpredicable[0]}' under a lane-varying lazy conditional cannot be "
+                "predicated: a scalar load has no masked form (方案 §1 Case II / P0-3)"
+            )
+    return _uniform(expr)
+
+
+def _negate_predicate(node: ValueNode) -> ValueNode:
+    """谓词取反：均匀条件折叠成标量 ``Not``，逐 lane 谓词发 ``pnot``。"""
+    if node.is_uniform:
+        return ValueNode("uniform_expr", node.dtype, scalar=tirx.Not(node.scalar), detail="negated predicate")
+    if node.recipe == "pnot":
+        return node.args[0]
+    return ValueNode("pnot", _MASK_DTYPE, [node])
+
+
+def _and_predicate(lhs: ValueNode | None, rhs: ValueNode | None) -> ValueNode | None:
+    """两个条件谓词的合取（``None`` 表示无守卫）。"""
+    if lhs is None:
+        return rhs
+    if rhs is None:
+        return lhs
+    if lhs.is_uniform and rhs.is_uniform:
+        return ValueNode("uniform_expr", lhs.dtype, scalar=tirx.And(lhs.scalar, rhs.scalar), detail="predicate conjunction")
+    return ValueNode("pand", _MASK_DTYPE, [lhs, rhs])
+
+
+def _element_count(buffer) -> int | None:
+    total = 1
+    for dim in buffer.shape:
+        value = _const_int(dim)
+        if value is None:
+            return None
+        total *= value
+    return total
+
+
+def _access_provably_in_bounds(info: AccessInfo, ctx: _ValueContext, lo: int = 0, hi: int | None = None) -> bool:
+    """该访问在所有 lane / 所有外层迭代上是否**可证**落在 buffer 内。
+
+    只用来决定「惰性条件分支里的 load 要不要谓词化」：能证安全就照常发 ``vld``，
+    避免把常见的 ``select(cond, a[i], b[i])`` 退化成带谓词的 gather；证不了就必须
+    带守卫。证不了 ≠ 越界——非条件上下文里的普通 load 仍按设计前提（源程序地址
+    安全）发射。
+
+    ``lo`` / ``hi`` 把向量轴的迭代域收缩到 ``[lo, hi)``（chunk 边界守卫证明用：只有
+    守卫恒真且地址可证安全的 block 才能回到 ``vld``）。``hi`` 为空时取轴 extent。
+    """
+    if info.indirect:
+        return False
+    numel = _element_count(info.buffer)
+    base = _const_int(info.buffer.elem_offset, ctx.analyzer)
+    if numel is None or base is None:
+        return False
+
+    def axis_of(var):
+        # 用 ``same_as`` 而不是对象身份：TVM 对同一个底层 Var 可能给出不同的 Python
+        # 包装对象（与 simd.py 里 ``id`` vs ``same_as`` 的坑同源）。
+        for axis in ctx.axes:
+            if axis.var.same_as(var):
+                return axis
+        return None
+
+    analyzer = arith.Analyzer()
+    for var in _free_vars(info.offset):
+        axis = axis_of(var)
+        if axis is None:
+            return False
+        extent = _const_int(axis.extent, ctx.analyzer)
+        if extent is None:
+            return False
+        if axis.var.same_as(ctx.vector_axis.var):
+            start = lo if lo > 0 else 0
+            end = extent if hi is None else min(hi, extent)
+            if end <= start:
+                return False
+            analyzer.bind(var, Range(start, end))
+        else:
+            analyzer.bind(var, Range(0, extent))
+    bound = analyzer.const_int_bound(analyzer.simplify(info.offset))
+    return bound.min_value >= base and bound.max_value < base + numel
+
+
+def build_value(expr, ctx: _ValueContext) -> ValueNode:
     """把标量表达式 lift 成向量值节点（与代码结构无关的递归）。
 
     决策仍然只依赖「沿向量轴的差分」：
@@ -97,7 +346,7 @@ def build_value(expr, ctx: _ValueContext, is_global_ok: bool = False) -> ValueNo
     """
     if isinstance(expr, tirx.BufferLoad):
         info = classify_access(expr.buffer, tuple(expr.indices), ctx.axes, ctx.analyzer, is_store=False)
-        return load_node(info, ctx, is_global_ok)
+        return load_node(info, ctx)
     if isinstance(expr, tirx.Var):
         if ctx.vector_axis.var.same_as(expr):
             # 向量轴变量 == lane id：``vci``（元素类型取轴变量自身的整型）。
@@ -110,44 +359,42 @@ def build_value(expr, ctx: _ValueContext, is_global_ok: bool = False) -> ValueNo
         return ValueNode("imm", _dtype_of(expr), scalar=expr)
 
     if isinstance(expr, tirx.Call):
-        return _build_call(expr, ctx, is_global_ok)
+        return _build_call(expr, ctx)
 
     node_name = type(expr).__name__
     name_l = node_name.lower()
     if node_name in ("FloorDiv", "FloorMod") and _arity(expr) == 2:
-        return _floordiv_mod(node_name, expr, ctx, is_global_ok)
+        return _floordiv_mod(node_name, expr, ctx)
     if name_l in _COMPARE_PRED and _arity(expr) == 2:
-        args = [build_value(expr.a, ctx, is_global_ok), build_value(expr.b, ctx, is_global_ok)]
+        args = [build_value(expr.a, ctx), build_value(expr.b, ctx)]
         return _compare(args, _COMPARE_PRED[name_l], ctx, expr)
     if name_l in _BINARY_RECIPE and _arity(expr) == 2:
-        args = [build_value(expr.a, ctx, is_global_ok), build_value(expr.b, ctx, is_global_ok)]
+        args = [build_value(expr.a, ctx), build_value(expr.b, ctx)]
         return _elementwise(_BINARY_RECIPE[name_l], expr, args, ctx)
     if name_l in _UNARY_RECIPE and _arity(expr) == 1:
-        args = [build_value(expr.a, ctx, is_global_ok)]
+        args = [build_value(expr.a, ctx)]
         return _elementwise(_UNARY_RECIPE[name_l], expr, args, ctx)
     if name_l in _BOOL_BINARY_RECIPE and _arity(expr) == 2:
-        args = [build_value(expr.a, ctx, is_global_ok), build_value(expr.b, ctx, is_global_ok)]
-        return _bool_node(_BOOL_BINARY_RECIPE[name_l], expr, args)
+        args = [build_value(expr.a, ctx), build_value(expr.b, ctx)]
+        return _bool_node(_BOOL_BINARY_RECIPE[name_l], expr, args, ctx)
     if name_l in _BOOL_UNARY_RECIPE and _arity(expr) == 1:
-        args = [build_value(expr.a, ctx, is_global_ok)]
-        return _bool_node(_BOOL_UNARY_RECIPE[name_l], expr, args)
+        args = [build_value(expr.a, ctx)]
+        return _bool_node(_BOOL_UNARY_RECIPE[name_l], expr, args, ctx)
 
     if isinstance(expr, tirx.Select):
-        args = [
-            build_value(expr.condition, ctx, is_global_ok),
-            build_value(expr.true_value, ctx, is_global_ok),
-            build_value(expr.false_value, ctx, is_global_ok),
-        ]
+        # ``tirx.Select`` 是**急切**求值（两臂都算）：条件不限制臂的合法性，
+        # 只把当前守卫（外层惰性条件）传下去。
+        args = [build_value(expr.condition, ctx), build_value(expr.true_value, ctx), build_value(expr.false_value, ctx)]
         if all(arg.is_uniform for arg in args):
-            return _uniform(expr)
-        return _select_node(args, ctx)
+            return _uniform_guarded(expr, ctx)
+        return _select_node(args, ctx, expr)
 
     if node_name == "Cast":
-        arg = build_value(expr.value, ctx, is_global_ok)
+        arg = build_value(expr.value, ctx)
         if arg.is_uniform:
-            return _uniform(expr)
+            return _uniform_guarded(expr, ctx)
         # 目标元素类型（去掉 lane 维），发射时交给 ``T.simd.vcvt`` 决定返回 lane 数。
-        return ValueNode("vcvt", ctx.vector_dtype, [arg], detail=str(_dtype_of(expr)).split("x", 1)[0])
+        return ValueNode("vcvt", _vec_of(expr), [arg], detail=str(_dtype_of(expr)).split("x", 1)[0])
 
     raise Unsupported(f"unsupported value expression: {node_name} ({expr})")
 
@@ -157,7 +404,7 @@ def _uniform(expr) -> ValueNode:
     return ValueNode("uniform_expr", _dtype_of(expr), scalar=expr, detail="lane-uniform")
 
 
-def _select_node(args: list, ctx: _ValueContext) -> ValueNode:
+def _select_node(args: list, ctx: _ValueContext, expr) -> ValueNode:
     """``select(cond, a, b)`` → ``vsel``。
 
     条件有两种来源，发射端分别处理（见 ``emit._Emitter._build`` 的 ``vsel`` 分支）：
@@ -168,12 +415,12 @@ def _select_node(args: list, ctx: _ValueContext) -> ValueNode:
       标量层，也不需要逐 lane 比较。这正是 §1 Case II 的三元写法。
     """
     detail = "uniform-cond select" if args[0].is_uniform else "predicated select"
-    return ValueNode("vsel", ctx.vector_dtype, args, detail=detail)
+    return ValueNode("vsel", _vec_of(expr), args, detail=detail)
 
 
-def _bool_node(recipe: str, expr, args: list) -> ValueNode:
+def _bool_node(recipe: str, expr, args: list, ctx: _ValueContext) -> ValueNode:
     if all(arg.is_uniform for arg in args):
-        return _uniform(expr)
+        return _uniform_guarded(expr, ctx)
     return ValueNode(recipe, _MASK_DTYPE, args)
 
 
@@ -185,7 +432,7 @@ def _compare(args: list, predicate: str, ctx: _ValueContext, expr) -> ValueNode:
     """
     lhs_uniform, rhs_uniform = args[0].is_uniform, args[1].is_uniform
     if lhs_uniform and rhs_uniform:
-        return _uniform(expr)
+        return _uniform_guarded(expr, ctx)
     if lhs_uniform:
         return ValueNode("vcmps", _MASK_DTYPE, [args[1], args[0]], detail=_COMPARE_FLIP[predicate])
     if rhs_uniform:
@@ -219,31 +466,35 @@ def _negate_uniform(node: ValueNode) -> ValueNode | None:
 def _elementwise(recipe: str, expr, args: list, ctx: _ValueContext) -> ValueNode:
     """二元/一元逐元素算子：若一侧 lane 均匀，优先用标量-向量指令。"""
     if all(arg.is_uniform for arg in args):
-        return _uniform(expr)
+        return _uniform_guarded(expr, ctx)
     if len(args) == 2:
         lhs_uniform, rhs_uniform = args[0].is_uniform, args[1].is_uniform
-        if lhs_uniform and not rhs_uniform and recipe == "vsub":
-            negated = _negate_uniform(args[0])
+        # ``vector - scalar`` → ``vadds(vector, -scalar)``：标量取负是标量开销，省掉
+        # 一条 ``vdup``。**反向不能这样折叠**——``vadds`` 是 ``vector + scalar``，
+        # 用它表达 ``scalar - vector`` 会得到 ``vector - scalar``（符号相反）。
+        # ``scalar - vector`` 走下面的通用回退：``vsub(vdup(scalar), vector)``。
+        if recipe == "vsub" and rhs_uniform and not lhs_uniform:
+            negated = _negate_uniform(args[1])
             if negated is not None:
-                return ValueNode("vadds", ctx.vector_dtype, [args[1], negated], detail="scalar vsub->vadds(-)")
+                return ValueNode("vadds", _vec_of(expr), [args[0], negated], detail="vector - scalar -> vadds(-)")
         if lhs_uniform or rhs_uniform:
             scalar_recipe = _VEC_SCALAR_BINARY.get(recipe)
             if scalar_recipe is not None:
                 ordered = [args[1], args[0]] if lhs_uniform else [args[0], args[1]]
-                return ValueNode(scalar_recipe, ctx.vector_dtype, ordered, detail=f"scalar {recipe}->{scalar_recipe}")
+                return ValueNode(scalar_recipe, _vec_of(expr), ordered, detail=f"scalar {recipe}->{scalar_recipe}")
             if lhs_uniform:
-                return ValueNode(recipe, ctx.vector_dtype, [broadcast(args[0], ctx), args[1]])
-            return ValueNode(recipe, ctx.vector_dtype, [args[0], broadcast(args[1], ctx)])
-    return ValueNode(recipe, ctx.vector_dtype, args)
+                return ValueNode(recipe, _vec_of(expr), [broadcast(args[0], ctx), args[1]])
+            return ValueNode(recipe, _vec_of(expr), [args[0], broadcast(args[1], ctx)])
+    return ValueNode(recipe, _vec_of(expr), args)
 
 
 def broadcast(node: ValueNode, ctx: _ValueContext) -> ValueNode:
     if node.recipe == "vbrc":
         return node
-    return ValueNode("vbrc", ctx.vector_dtype, [node], detail="broadcast uniform")
+    return ValueNode("vbrc", _vec_of(node.dtype), [node], detail="broadcast uniform")
 
 
-def _floordiv_mod(node_name: str, expr, ctx: _ValueContext, is_global_ok: bool) -> ValueNode:
+def _floordiv_mod(node_name: str, expr, ctx: _ValueContext) -> ValueNode:
     """``FloorDiv`` / ``FloorMod`` 作*值*算子（方案 §5.4(a)）。
 
     SIMD 层没有整型 ``vdiv`` / ``vmod``（``vdiv`` 是浮点 SFU），所以对**2 的幂**
@@ -256,10 +507,10 @@ def _floordiv_mod(node_name: str, expr, ctx: _ValueContext, is_global_ok: bool) 
     非常量除数需要硬件整型除法内建——两者都**明确拒绝**而不静默降级。
     两侧都 lane 均匀时整式退化成一个标量，不产生向量指令。
     """
-    numer = build_value(expr.a, ctx, is_global_ok)
-    denom = build_value(expr.b, ctx, is_global_ok)
+    numer = build_value(expr.a, ctx)
+    denom = build_value(expr.b, ctx)
     if numer.is_uniform and denom.is_uniform:
-        return _uniform(expr)
+        return _uniform_guarded(expr, ctx)
 
     divisor = _const_int(expr.b, ctx.analyzer)
     if divisor is None or divisor <= 0 or not denom.is_uniform:
@@ -297,37 +548,98 @@ def index_value(info: AccessInfo, ctx: _ValueContext) -> ValueNode:
     index_ctx = _ValueContext(
         axes=ctx.axes,
         vector_axis=ctx.vector_axis,
-        lanes=ctx.lanes,
         analyzer=ctx.analyzer,
-        vector_dtype=_vec_dtype("int32"),
+        guard=ctx.guard,
+        guard_free_until=ctx.guard_free_until,
+        guard_free_from=ctx.guard_free_from,
+        lanes=ctx.lanes,
     )
     return build_value(info.offset, index_ctx)
 
 
-def load_node(info: AccessInfo, ctx: _ValueContext, is_global_ok: bool) -> ValueNode:
+def load_node(info: AccessInfo, ctx: _ValueContext) -> ValueNode:
     """把一次已分类的访问变成值节点（连续/广播/步长/置换/分片/间接）。
 
     常数 Δ 走连续 / 广播 / 步长；非常数 Δ 与间接下标统一走**每 lane 索引向量**
-    通道（:attr:`AccessClass.is_index_vector`），发射成 ``vgather2``。真正无结构的
+    通道（``PERMUTE`` / ``PIECEWISE`` / ``INDIRECT``，以及负步长 ``STRIDED``），
+    发射成 ``vgather2``。真正无结构的
     ``TRUE_RANDOM`` 明确拒绝并带上 ``access.index_vector_reason`` 的诊断。
+
+    节点 dtype 取**被访问 buffer 自身的元素类型**（而不是整段共享的那个），这样
+    同段内 f32 / int32 混用时掩码宽度与寄存器类型仍与访问一致（P0-2）。
     """
-    if info.in_global and not is_global_ok:
+    if info.in_global:
         raise Unsupported(
             "global-memory operand inside T.Parallel (方案 §0 Case II): needs an explicit UB staging copy before the parallel nest"
         )
+    # 惰性条件分支里的访问只有在条件成立时才合法：能证安全就不必带守卫（保持常见的
+    # ``select(cond, a[i], b[i])`` 仍发 vld），否则把条件挂到装载节点上（P0-3）。
+    # ``free_until`` / ``free_from`` 是守卫恒真的首/尾 chunk 区间；只有**守卫恒真且该段
+    # 地址同样可证安全**时才能在这段里省掉掩码（发射层据此回退普通 ``vld``）。
+    guard = ctx.guard
+    free_until = ctx.guard_free_until
+    free_from = ctx.guard_free_from
+    if guard is not None:
+        if _access_provably_in_bounds(info, ctx):
+            guard = None
+            free_until, free_from = 0, None
+        else:
+            if free_until <= 0 or not _access_provably_in_bounds(info, ctx, hi=free_until * ctx.lanes):
+                free_until = 0
+            if free_from is None or not _access_provably_in_bounds(info, ctx, lo=free_from * ctx.lanes):
+                free_from = None
+    vec_dtype = _vec_of(info.buffer.dtype)
     kind, stride = info.axis_class(ctx.vector_axis)
     if kind == AccessClass.CONTIGUOUS:
-        return ValueNode("vload", ctx.vector_dtype, access=info)
+        return ValueNode(
+            "vload",
+            vec_dtype,
+            access=info,
+            predicate=guard,
+            predicate_free_until=free_until,
+            predicate_free_from=free_from,
+        )
     if kind == AccessClass.UNIFORM:
+        if guard is not None:
+            raise Unsupported(
+                f"lane-uniform load of '{info.buffer.name}' under a lane-varying lazy conditional cannot be "
+                "predicated: a scalar load has no masked form (方案 §1 Case II / P0-3)"
+            )
         return ValueNode("uniform_load", _dtype_of_scalar(info), access=info, detail="lane-uniform")
     if kind == AccessClass.STRIDED:
         if stride is not None and stride < 0:
             # 负步长（Δ ≤ -2）：无符号 lane 斜坡乘负步长表达不了负方向（缺陷 D8），改走
             # ``vgather2`` 的每 lane 索引向量——它的补码表示本就支持负偏移。
-            return ValueNode("gather", ctx.vector_dtype, [index_value(info, ctx)], access=info, detail=f"stride={stride} (index vector)")
-        return ValueNode("vload_strided", ctx.vector_dtype, access=info, detail=f"stride={stride}")
+            return ValueNode(
+                "gather",
+                vec_dtype,
+                [index_value(info, ctx)],
+                access=info,
+                detail=f"stride={stride} (index vector)",
+                predicate=guard,
+                predicate_free_until=free_until,
+                predicate_free_from=free_from,
+            )
+        return ValueNode(
+            "vload_strided",
+            vec_dtype,
+            access=info,
+            detail=f"stride={stride}",
+            predicate=guard,
+            predicate_free_until=free_until,
+            predicate_free_from=free_from,
+        )
     if kind in (AccessClass.PERMUTE, AccessClass.PIECEWISE, AccessClass.INDIRECT):
-        return ValueNode("gather", ctx.vector_dtype, [index_value(info, ctx)], access=info, detail=kind.value)
+        return ValueNode(
+            "gather",
+            vec_dtype,
+            [index_value(info, ctx)],
+            access=info,
+            detail=kind.value,
+            predicate=guard,
+            predicate_free_until=free_until,
+            predicate_free_from=free_from,
+        )
     raise Unsupported(
         f"non-affine access with respect to axis '{ctx.vector_axis.name}': "
         f"the per-lane index vector is not constructible ({info.reason or 'unknown reason'})"
@@ -338,28 +650,48 @@ def _dtype_of_scalar(info: AccessInfo) -> str:
     return str(info.buffer.dtype)
 
 
-def _build_call(expr: tirx.Call, ctx: _ValueContext, is_global_ok: bool) -> ValueNode:
+def _build_call(expr: tirx.Call, ctx: _ValueContext) -> ValueNode:
     tail = _call_tail(expr)
     if _is_atomic_name(tail):
         raise Unsupported("atomic op inside T.Parallel is not supported (方案 §5)")
     if tail in ("if_then_else", "select"):
-        args = [build_value(expr.args[i], ctx, is_global_ok) for i in range(3)]
+        condition = build_value(expr.args[0], ctx)
+        # ``T.if_then_else`` 是**惰性**内建：臂只在条件成立时求值，因此臂里的访存
+        # 必须带条件谓词（P0-3）。``select`` 内建是急切求值，不额外加守卫。
+        if tail == "if_then_else":
+            cond_until, cond_from = _guard_free_bounds(expr.args[0], ctx)
+            neg_until, neg_from = _guard_free_bounds(tirx.Not(expr.args[0]), ctx)
+            # 没有外层守卫时本条件就是完整守卫；有外层守卫时两个方向分别取交。
+            if ctx.guard is None:
+                then_until, then_from = cond_until, cond_from
+                else_until, else_from = neg_until, neg_from
+            else:
+                then_until = _combine_free_until(ctx.guard_free_until, cond_until)
+                then_from = _combine_free_from(ctx.guard_free_from, cond_from)
+                else_until = _combine_free_until(ctx.guard_free_until, neg_until)
+                else_from = _combine_free_from(ctx.guard_free_from, neg_from)
+            then_ctx = _with_guard(ctx, _and_predicate(ctx.guard, condition), then_until, then_from)
+            else_ctx = _with_guard(ctx, _and_predicate(ctx.guard, _negate_predicate(condition)), else_until, else_from)
+        else:
+            then_ctx = else_ctx = ctx
+        args = [condition, build_value(expr.args[1], then_ctx), build_value(expr.args[2], else_ctx)]
         if all(arg.is_uniform for arg in args):
-            return _uniform(expr)
-        return _select_node(args, ctx)
+            # 整式沿向量轴均匀：保留原始标量表达式（``?:`` 的惰性由 codegen 保证）。
+            return _uniform_guarded(expr, ctx)
+        return _select_node(args, ctx, expr)
     if tail in _COMPARE_PRED and len(expr.args) == 2:
-        args = [build_value(arg, ctx, is_global_ok) for arg in expr.args]
+        args = [build_value(arg, ctx) for arg in expr.args]
         return _compare(args, _COMPARE_PRED[tail], ctx, expr)
     if tail in _BOOL_BINARY_RECIPE and len(expr.args) == 2:
-        args = [build_value(arg, ctx, is_global_ok) for arg in expr.args]
+        args = [build_value(arg, ctx) for arg in expr.args]
         return _bool_node(_BOOL_BINARY_RECIPE[tail], expr, args)
     if tail in _BOOL_UNARY_RECIPE and len(expr.args) == 1:
-        args = [build_value(expr.args[0], ctx, is_global_ok)]
+        args = [build_value(expr.args[0], ctx)]
         return _bool_node(_BOOL_UNARY_RECIPE[tail], expr, args)
     if tail in _BINARY_RECIPE and len(expr.args) == 2:
-        args = [build_value(arg, ctx, is_global_ok) for arg in expr.args]
+        args = [build_value(arg, ctx) for arg in expr.args]
         return _elementwise(_BINARY_RECIPE[tail], expr, args, ctx)
     if tail in _UNARY_RECIPE and len(expr.args) == 1:
-        args = [build_value(expr.args[0], ctx, is_global_ok)]
+        args = [build_value(expr.args[0], ctx)]
         return _elementwise(_UNARY_RECIPE[tail], expr, args, ctx)
     raise Unsupported(f"unsupported intrinsic call in T.Parallel body: {tail}")

@@ -16,14 +16,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .access import AccessClass, AccessInfo, Axis
+from tvm import arith
+
+from .access import AccessClass, AccessInfo, Axis, _const_int, finite_difference
 from .body import StoreSpec
-from .value import ValueNode
+from .primitives import _same_buffer, _same_indices
+from .value import ValueNode, _reads_buffer, reads_other_address, same_address_load
 
 
 @dataclass
 class StorePlan:
-    """一条写的完整计划：写什么、写在哪、用什么谓词/索引向量、是否归约。"""
+    """一条写的完整计划：写什么、写在哪、用什么谓词/索引向量、是否归约。
+
+    ``promote`` 是**计划期**给出的累加器提升决策：非空表示这条同址读改写可以在发射期
+    提升成 ``local.var`` 向量寄存器，值是它读取的「同址旧值」节点。发射层只消费这个
+    字段，不再自己调用 :func:`accumulator_candidate` 重算——判据只有一处（与归约判据
+    D13 同一原则），且不需要在发射期再造一个 ``arith.Analyzer``。
+    """
 
     spec: StoreSpec
     access: AccessInfo
@@ -32,6 +41,10 @@ class StorePlan:
     kind: AccessClass = AccessClass.CONTIGUOUS
     index: ValueNode | None = None  # 分片/置换/间接写的每 lane 索引向量（scatter）
     reduce: ReduceInfo | None = None  # 归约段里**逐 store** 的归约描述（方案 §2 Case II）
+    promote: ValueNode | None = None  # 累加器提升（同址旧值）；None = 不提升
+    # 用户谓词恒真的首/尾 chunk 区间下界：发射层在这两段块里用全 lane 掩码，省掉 `vcmps`。
+    mask_free_until: int = 0
+    mask_free_from: int | None = None
 
 
 @dataclass
@@ -73,6 +86,10 @@ class VectorPlan:
     pre_stores: list[StorePlan] = field(default_factory=list)
     post_stores: list[StorePlan] = field(default_factory=list)
     reduce: ReduceInfo | None = None
+    # 守卫恒真区间的 chunk 切点（升序，见 ``plan._guard_cuts``）：发射层在相邻切点之间
+    # 分段发射，每段用 ``[chunk_min, chunk_max)`` 判定哪些守卫已恒真、可退回普通 ``vld``。
+    # 空列表 = 不切分。
+    guard_boundaries: list[int] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
 
 
@@ -97,3 +114,73 @@ class VectorProgram:
     axes: list[Axis]
     segments: list[VectorPlan] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 累加器判据 —— plan（**允许**私有标量）与 emit（**提升**成寄存器）的唯一来源
+# ---------------------------------------------------------------------------
+
+
+def is_private_scope(buffer) -> bool:
+    """buffer 是否是**每次迭代私有**的标量/局部存储（``local`` / ``local.var``）。
+
+    这类存储（``T.alloc_var`` / ``T.alloc_local``）在源程序里每个并行迭代各有一份；
+    沿并行轴向量化会让所有 lane 共享同一份，必须先提升成向量寄存器。
+    """
+    scope = buffer.scope()
+    return scope == "local" or scope.startswith("local.")
+
+
+def accumulator_candidate(store: StorePlan, plan: VectorPlan, analyzer: arith.Analyzer) -> ValueNode | None:
+    """该写能否提升成 ``local.var`` 向量寄存器累加器；能则返回同址旧值节点。
+
+    这是「读改写沿内层轴不变」的唯一判据，plan 与 emit 共用：
+
+    * plan 用它**允许**私有标量（``T.alloc_var``）沿并行轴向量化（S2）；
+    * emit 用它把共享/私有 RMW 从每轮 ``vld``+``vsts`` 提升成寄存器更新。
+
+    条件：无谓词；目标连续（共享）或私有标量；地址沿向量轴之后的所有 inner 轴不变；
+    取值同址回读（RMW）；该 buffer 在本段只有这一条主写；同层其它写不读它的其它地址；
+    同址 pre 写不能带谓词（带谓词就无法折叠成寄存器初值）。
+
+    私有标量还要求循环后有**逐 lane** 消费者：没有消费者时末值可见性由"哪条 lane
+    最后写内存"决定，与标量逐迭代语义不同。
+    """
+    if store.mask is not None:
+        return None
+    buffer = store.spec.buffer
+    private = is_private_scope(buffer)
+    if store.kind == AccessClass.UNIFORM:
+        if not private:
+            return None
+    elif store.kind != AccessClass.CONTIGUOUS:
+        return None
+    inner = [axis for axis in plan.axes if axis.index > plan.vector_axis.index]
+    if not inner:
+        return None
+    if any(_const_int(finite_difference(store.access.offset, axis.var, analyzer), analyzer) != 0 for axis in inner):
+        return None
+    old = same_address_load(store.value, buffer, store.spec.indices)
+    if old is None:
+        return None
+    if sum(1 for other in plan.stores if _same_buffer(other.spec.buffer, buffer)) != 1:
+        return None
+    if any(other is not store and reads_other_address(other.value, buffer, store.spec.indices) for other in plan.stores):
+        return None
+    if any(
+        pre.mask is not None and _same_buffer(pre.spec.buffer, buffer) and _same_indices(tuple(pre.spec.indices), tuple(store.spec.indices))
+        for pre in plan.pre_stores
+    ):
+        return None
+    if not private:
+        return old
+    consumers = [other for other in (*plan.stores, *plan.post_stores) if other is not store and _reads_buffer(other.value, buffer)]
+    if not consumers or any(other.kind == AccessClass.UNIFORM for other in consumers):
+        return None
+    if any(
+        post.kind == AccessClass.UNIFORM and not post.value.is_uniform
+        for post in plan.post_stores
+        if _same_buffer(post.spec.buffer, buffer)
+    ):
+        return None
+    return old

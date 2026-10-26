@@ -48,6 +48,10 @@ _ELEMENTWISE_UNARY = {
 # 通过 vdup 广播后走向量-向量指令。
 _VEC_SCALAR_BINARY = {"vadd": "vadds", "vmul": "vmuls", "vmax": "vmaxs", "vmin": "vmins"}
 
+# 反向表：标量-向量指令 → 逐元素向量指令。标量操作数若已被提升成向量寄存器
+# （如 ``local.var`` 累加器的旧值），发射层退回向量-向量形式。
+_SCALAR_TO_VECTOR_BINARY = {scalar: vector for vector, scalar in _VEC_SCALAR_BINARY.items()}
+
 # 比较算子 → 谓词。含一个 lane 均匀操作数时走 ``vcmps``（标量形式）。
 _COMPARE = {
     "LT": "lt",
@@ -87,8 +91,11 @@ _MASK_DTYPE = "boolx256"
 # 所有 ``T.simd.*`` 向量指令的执行模式参数（零化目标被动掩码外的车道）。
 _MODE = "MODE_ZEROING"
 
-# 谓词运算自身的执行掩码宽度（全 1，与数据元素宽度无关）。
-_PREDICATE_MASK_BITS = 32
+# 谓词-谓词运算（pand/por/pnot）自身的执行掩码宽度。取**最细粒度 b8**（256 lane），
+# 这样任何元素位宽下都不会截断：谓词位只有在其来源比较/掩码的粒度内有效，超出的位
+# 本来是 0（MODE_ZEROING），多算无害；反之用固定 b32（64 lane）会静默截断 f16（128
+# lane）/ int8（256 lane）的谓词（R1）。真正需要精确粒度时调用方应传数据元素的 bits。
+_PREDICATE_MASK_BITS = 8
 
 # lane 内均匀、无需向量寄存器的值（标量即可）。
 _UNIFORM_RECIPES = ("imm", "uniform_load", "uniform_expr")

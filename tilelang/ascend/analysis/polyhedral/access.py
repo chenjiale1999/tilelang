@@ -67,16 +67,6 @@ class AccessClass(str, enum.Enum):
     INDIRECT = "indirect"  # 下标本身含 BufferLoad（gather/scatter）
     TRUE_RANDOM = "true_random"  # Δ 非常数且不可构造 → 拒绝
 
-    @property
-    def is_index_vector(self) -> bool:
-        """是否必须由「每 lane 索引向量」通道发射（gather/scatter）。"""
-        return self in (
-            AccessClass.STRIDED,
-            AccessClass.PERMUTE,
-            AccessClass.PIECEWISE,
-            AccessClass.INDIRECT,
-        )
-
 
 def _const_int(expr, analyzer: arith.Analyzer | None = None) -> int | None:
     """把表达式识别成整型常数。

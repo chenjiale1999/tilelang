@@ -5,7 +5,7 @@
 * ``SeqStmt`` → 顺序展开（§3 多行语句天然支持）；
 * ``BufferStore`` → 一条写；
 * ``IfThenElse`` 单臂 → 谓词化写（``mask &= cond``）；
-* ``IfThenElse`` 双臂且两臂写同一位置 → 合并成 ``select(cond, a, b)``；
+* ``IfThenElse`` 双臂且两臂写同一位置 → 合并成惰性 ``if_then_else(cond, a, b)``；
 * 其它（**非直接内嵌 / 不干净**的内层 serial loop、原子调用、跨迭代标量状态）
   → 明确拒绝（干净的 serial 循环已在规划层被吸收成轴）。
 """
@@ -123,7 +123,10 @@ def normalize_body(
         if len(then_stores) == 1 and len(else_stores) == 1:
             then_spec, else_spec = then_stores[0], else_stores[0]
             if then_spec.buffer.same_as(else_spec.buffer) and _same_indices(then_spec.indices, else_spec.indices):
-                merged = tirx.Select(condition, then_spec.value, else_spec.value)
+                # 语句级 if/else 的两臂是**惰性**的：用 ``if_then_else``（而非急切求值的
+                # ``Select``）承载合并结果，臂内访存才会挂上条件守卫。否则
+                # ``if i >= 32: c[i] = a[i-32]`` 会被发成无掩码的 ``vld a[-32]``（D16）。
+                merged = tirx.op.if_then_else(condition, then_spec.value, else_spec.value)
                 for spec in (then_spec, else_spec):
                     if spec.mask is not None:
                         raise Unsupported(

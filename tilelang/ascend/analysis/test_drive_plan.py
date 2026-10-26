@@ -1062,6 +1062,181 @@ def d14b_partial_reduce_fallback():
     return k
 
 
+def d16_branch_load_oob():
+    """D16（已修）：语句级 if/else 的臂内访存是**惰性**的，装载带条件守卫。
+
+    ``if i >= 32: c[i] = a[i-32]`` 规范化成谓词化 store（``mask = i >= 32``），
+    store 谓词同时作为取值表达式的装载守卫；``a[i-32]`` 的偏移下界为 -32（不可证
+    安全），于是 chunk 0 发带掩码的 ``vgather2``（lane 0..31 被屏蔽，不再越界），
+    而守卫在 chunk 1（``i ∈ [64,128)`` 恒真）已可证 → 回到普通 ``vld``。
+    双臂同址 if/else 合并成惰性 ``if_then_else``（而不是急切 ``Select``），同理。
+    """
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i >= 32:
+                    c[i] = a[i - 32]
+
+    return k
+
+
+def d16b_prefix_branch_load():
+    """D16 镜像（已修）：**前缀**恒真守卫同样按 chunk 边界回退 ``vld``。
+
+    ``if i < 96: c[i] = a[i+32]`` 的 ``a[i+32]`` 只在 i<96 时安全（i≥96 会越界到
+    a[128..159]）；守卫在 chunk 0（``i ∈ [0,64)``）恒真 → 发普通 ``vld``，
+    chunk 1 才需要带掩码的 ``vgather2``。前缀/后缀共用同一套守卫边界与分块发射。
+    """
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i < 96:
+                    c[i] = a[i + 32]
+
+    return k
+
+
+# ---------------------------------------------------------------------------
+# 设计层审计回归（R1–R7）——「统一模型 / 发射契约」层面的问题，多为 build 成功但
+# 语义错误（静默错发）或 build 成功、emit 崩溃。修复后：拒绝，或发射等价形态。
+# ---------------------------------------------------------------------------
+
+
+def r1_predicate_width_f16():
+    """R1（已修）：f16 尾块 + 条件使 store 掩码 = 用户谓词 ∧ 尾块谓词。
+
+    旧实现用固定 b32 做 ``pand``（只覆盖 64 lane），f16 的 lane 64..127 被清零 →
+    尾块只写一半。现按数据元素宽度 b16 取掩码。"""
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float16"), B: T.Tensor((M,), "float16"), C: T.Tensor((M,), "float16")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float16")
+            b = T.alloc_shared((M,), "float16")
+            c = T.alloc_shared((M,), "float16")
+            for i in T.Parallel(M):
+                if a[i] > b[i]:
+                    c[i] = a[i]
+
+    return k
+
+
+def r2_uniform_condition():
+    """R2（已修）：循环不变条件（``a[0] > 0``）沿向量轴均匀，是 bool 标量。
+
+    旧实现把它 ``vdup`` 成数据向量 → emit 期 ``Cannot infer default mask width for
+    dtype 'bool'``；现走 ``predicate()`` 的 ``update_mask(cond ? lanes : 0)``。"""
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), C: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            c = T.alloc_shared((M,), "float32")
+            for i in T.Parallel(M):
+                if a[0] > 0.0:
+                    c[i] = a[i]
+
+    return k
+
+
+def r3_masked_reduce():
+    """R3（已修，改为拒绝）：条件归约 ``if i < 64: s[0] += a[i]`` 的用户谓词会被
+    跨 lane 归约静默丢弃（对全部 lane 求和）→ build 期显式拒绝。"""
+    M = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                if i < 64:
+                    s[0] = s[0] + a[i]
+
+    return k
+
+
+def r4_repeated_old_value():
+    """R4（已修，改为拒绝）：``s[0] = s[0] + (s[0] + a[i,j])`` 的旧值出现两次，
+    单一初值表达不了（会丢掉一份旧值）→ build 期显式拒绝。"""
+    M, K = 4, 128
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                for j in T.serial(K):
+                    s[0] = s[0] + (s[0] + a[i, j])
+
+    return k
+
+
+def r5_serial_nonzero_min():
+    """R5（已修，改为拒绝）：``T.serial(1, KS)`` 的下界被迭代域建模丢弃（发射成
+    从 0 开始的循环）→ 明确拒绝。"""
+    MS, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(1, KS):
+                    c[i, j] = a[i, j] * 2.0
+
+    return k
+
+
+def r6_serial_waw():
+    """R6（已修，改为拒绝）：同一 serial 体内 ``c[i,2*j]`` 与 ``c[i,j]`` 跨迭代写到
+    同一地址，标量的"后写覆盖"在向量化后不成立 → 拒绝吸收该 serial 轴。"""
+    MS, KS = 4, 128
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, 2 * KS), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            c = T.alloc_shared((MS, 2 * KS), "float32")
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    c[i, 2 * j] = a[i, j]
+                    c[i, j] = 2.0
+
+    return k
+
+
+def r7_reduce_parallel_pre_fallback():
+    """R7（已修）：沿并行轴归约 + 非均匀 pre（``t[i] = 1.0``）在 build 期拒绝该轴，
+    回退到 serial 轴 ``j``（正确的归约），不再出现 build OK / emit Unsupported。"""
+    M, KS = 64, 8
+
+    @T.prim_func
+    def k(A: T.Tensor((KS, M), "float32"), Tt: T.Tensor((M,), "float32"), S: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((KS, M), "float32")
+            t = T.alloc_shared((M,), "float32")
+            s = T.alloc_shared((1,), "float32")
+            for i in T.Parallel(M):
+                t[i] = 1.0
+                for j in T.serial(KS):
+                    s[0] = s[0] + a[j, i]
+
+    return k
+
+
 CASES = [
     # --- 向量化成功（OK）的用例 ---
     ("c0_copy", c0_copy),
@@ -1123,6 +1298,17 @@ CASES = [
     ("d6b_sum_max_reduce", d6b_sum_max_reduce),  # D6：混合归约各自 recipe
     ("d7_uniform_store_mixed", d7_uniform_store_mixed),  # D7：build+emit 均 OK
     ("d12_masked_branch", d12_masked_branch),  # D12：未声明的拒绝路径（特征化）
+    # --- 设计层审计回归（R1–R7）：修复后 = 拒绝 / 发射等价形态 ---
+    ("r1_predicate_width_f16", r1_predicate_width_f16),  # R1：谓词运算掩码跟随元素宽度（b16）
+    ("r2_uniform_condition", r2_uniform_condition),  # R2：均匀 bool 条件走 update_mask
+    ("r3_masked_reduce", r3_masked_reduce),  # R3：条件归约拒绝
+    ("r4_repeated_old_value", r4_repeated_old_value),  # R4：旧值重复出现拒绝
+    ("r5_serial_nonzero_min", r5_serial_nonzero_min),  # R5：非 0 下界拒绝
+    ("r6_serial_waw", r6_serial_waw),  # R6：跨迭代写写别名拒绝
+    ("r7_reduce_parallel_pre_fallback", r7_reduce_parallel_pre_fallback),  # R7：轴回退到 serial 轴
+    # --- 已修：语句级分支的臂内访存越界（装载守卫 + chunk 边界回退 vld） ---
+    ("d16_branch_load_oob", d16_branch_load_oob),  # D16 后缀：chunk 0 带掩码，chunk 1 回退 vld
+    ("d16b_prefix_branch_load", d16b_prefix_branch_load),  # D16 前缀：chunk 0 回退 vld，chunk 1 带掩码
 ]
 
 
