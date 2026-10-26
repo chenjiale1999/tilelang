@@ -561,7 +561,7 @@ String RenderVSimdCaptureReport(const std::vector<VSimdCaptureInfo> &infos) {
       out << "\n";
     }
     if (!info.local_views.empty()) {
-      out << "    local_buffers:";
+      out << "    local_views:";
       for (const auto &view : info.local_views)
         out << " " << view.first->name << " -> " << view.second->name;
       out << "\n";

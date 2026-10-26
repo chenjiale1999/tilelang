@@ -105,6 +105,7 @@ struct AccessInfo : vsimd::AccessInfo {
 struct NestInfo {
   std::vector<LoopInfo> loops;
   std::vector<AccessInfo> accesses;
+  std::vector<std::pair<Buffer, Buffer>> local_views;
   Legality status{Legality::kLegal};
   std::vector<std::string> messages;
   size_t total_accesses{0};
@@ -575,6 +576,43 @@ public:
         acc.is_write = src.is_write;
         nest.accesses.push_back(std::move(acc));
       }
+      for (const Buffer &view : parallel_nest.local_views) {
+        Buffer base;
+        for (const AccessInfo &acc : nest.accesses) {
+          if (acc.buffer->data.same_as(view->data) &&
+              !acc.buffer.same_as(view)) {
+            base = acc.buffer;
+            break;
+          }
+        }
+        nest.local_views.emplace_back(view, base);
+      }
+      // T.view may be declared outside the Parallel loop, so NestCollector's
+      // local_views list can be empty. Recover the alias from access buffers
+      // with the same data var: the written buffer is the view, the read
+      // buffer is the base.
+      for (const AccessInfo &acc : nest.accesses) {
+        if (!acc.is_write)
+          continue;
+        for (const AccessInfo &other : nest.accesses) {
+          if (other.is_write ||
+              !acc.buffer->data.same_as(other.buffer->data) ||
+              acc.buffer.same_as(other.buffer)) {
+            continue;
+          }
+          bool exists = false;
+          for (const auto &entry : nest.local_views) {
+            if (entry.first.same_as(acc.buffer) &&
+                entry.second.same_as(other.buffer)) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists)
+            nest.local_views.emplace_back(acc.buffer, other.buffer);
+          break;
+        }
+      }
       AnalyzeNest_(&nest);
       overall = std::max(overall, nest.status);
       body << "  nest " << nest_index++ << ": domain=";
@@ -601,6 +639,15 @@ public:
              << " injective=" << (acc.injective ? "yes" : "no");
         if (!acc.injective_reason.empty())
           body << " (" << acc.injective_reason << ")";
+        body << "\n";
+      }
+      if (!nest.local_views.empty()) {
+        body << "    local_views:";
+        for (const auto &view : nest.local_views) {
+          body << " " << view.first->name;
+          if (view.second.defined())
+            body << " -> " << view.second->name;
+        }
         body << "\n";
       }
       for (const std::string &msg : nest.messages)

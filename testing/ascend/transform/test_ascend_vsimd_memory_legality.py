@@ -121,6 +121,7 @@ def test_view_alias_legal():
 
     report = _report(main)
     assert "status=LEGAL" in report
+    assert "local_views: view -> base" in report
 
 
 def test_versioned_buffer_legal():

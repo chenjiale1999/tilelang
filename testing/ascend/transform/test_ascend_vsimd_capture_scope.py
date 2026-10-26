@@ -82,7 +82,7 @@ def test_view_local_buffer():
 
     report = _report(main)
     assert "status=CLOSED" in report
-    assert "local_buffers:" in report
+    assert "local_views:" in report
     assert "v -> base" in report
     assert "v -> base" in _info(main)[0]["local_views"]
 
