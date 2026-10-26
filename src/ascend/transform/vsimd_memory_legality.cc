@@ -540,13 +540,13 @@ public:
       : facts_(facts), out_(out), assumptions_(assumptions),
         bindings_(bindings), thread_bounds_(thread_bounds) {}
 
-  void AnalyzeVF(const SBlock &vf, int index) {
+  std::string AnalyzeVF(const SBlock &vf, int index) {
     ManualDetector manual;
     manual(vf);
     if (manual.manual) {
       *out_ << "VF#" << index << " status=OPAQUE\n";
       *out_ << "  message: manual SIMD / nd2nz / local.var\n";
-      return;
+      return "OPAQUE";
     }
 
     NestCollector collector;
@@ -554,12 +554,12 @@ public:
     if (collector.unsupported) {
       *out_ << "VF#" << index << " status=UNSUPPORTED\n";
       *out_ << "  message: " << collector.unsupported_reason << "\n";
-      return;
+      return "UNSUPPORTED";
     }
     if (collector.nests.empty()) {
       *out_ << "VF#" << index << " status=OPAQUE\n";
       *out_ << "  message: no T.Parallel nest\n";
-      return;
+      return "OPAQUE";
     }
 
     Legality overall = Legality::kLegal;
@@ -655,8 +655,7 @@ public:
     }
     *out_ << "VF#" << index << " status=" << StatusName(overall) << "\n";
     *out_ << body.str();
-    if (overall == Legality::kLegal)
-      return;
+    return StatusName(overall);
   }
 
 private:
@@ -1144,6 +1143,7 @@ private:
 class VFVisitor : public StmtExprVisitor {
 public:
   std::ostringstream out;
+  std::vector<std::string> statuses;
 
   void Run(const PrimFunc &func) {
     FunctionCollector collector;
@@ -1156,7 +1156,8 @@ public:
     if (op->name_hint == "SIMD_VF") {
       LegalityAnalyzer analyzer(*facts_, &out, assumptions_, bindings_,
                                 thread_bounds_);
-      analyzer.AnalyzeVF(ffi::GetRef<SBlock>(op), vf_index_++);
+      statuses.push_back(
+          analyzer.AnalyzeVF(ffi::GetRef<SBlock>(op), vf_index_++));
       return;
     }
     StmtExprVisitor::VisitStmt_(op);
@@ -1218,6 +1219,13 @@ String AnalyzeVSimdMemoryLegality(const PrimFunc &func) {
   if (report.empty())
     report = "no SIMD_VF blocks\n";
   return String(report);
+}
+
+std::vector<std::string>
+AnalyzeVSimdMemoryStatuses(const PrimFunc &func) {
+  VFVisitor visitor;
+  visitor.Run(func);
+  return visitor.statuses;
 }
 
 } // namespace tl

@@ -9,6 +9,9 @@
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/stmt.h>
 
+#include <string>
+#include <vector>
+
 namespace tvm {
 namespace tl {
 
@@ -21,6 +24,13 @@ namespace tl {
  * (tl.simd.*, local.var, nd2nz helpers) are reported as opaque.
  */
 TVM_DLL ffi::String AnalyzeVSimdMemoryLegality(const tirx::PrimFunc &func);
+
+/*!
+ * \brief Return per-VF statuses in the same order as the report:
+ * LEGAL / ILLEGAL / UNPROVEN / UNSUPPORTED / OPAQUE.
+ */
+TVM_DLL std::vector<std::string>
+AnalyzeVSimdMemoryStatuses(const tirx::PrimFunc &func);
 
 } // namespace tl
 } // namespace tvm

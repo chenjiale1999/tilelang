@@ -47,6 +47,16 @@ def AscendAnalyzeSimdVFCaptureInfo(func):
     return _ffi_api.AscendAnalyzeSimdVFCaptureInfo(func)  # type: ignore
 
 
+def AscendAnalyzeVSimdRegionReport(func):
+    """Return the PR-C minimal 1-D region lift/dump for a PrimFunc."""
+    return _ffi_api.AscendAnalyzeVSimdRegionReport(func)  # type: ignore
+
+
+def AscendAnalyzeVSimdRegion():
+    """Debug pass: print the PR-C minimal 1-D region lift (read-only)."""
+    return _ffi_api.AscendAnalyzeVSimdRegion()  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -273,6 +283,8 @@ __all__ = [
     "AscendAnalyzeSimdVFCapture",
     "AscendAnalyzeSimdVFCaptureReport",
     "AscendAnalyzeSimdVFCaptureInfo",
+    "AscendAnalyzeVSimdRegion",
+    "AscendAnalyzeVSimdRegionReport",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",
