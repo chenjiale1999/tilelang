@@ -123,8 +123,7 @@ public:
       return;
     }
     if (stmt.as<BufferStoreNode>() || stmt.as<SeqStmtNode>() ||
-        stmt.as<DeclBufferNode>() || stmt.as<BindNode>() ||
-        stmt.as<EvaluateNode>()) {
+        stmt.as<DeclBufferNode>() || stmt.as<EvaluateNode>()) {
       StmtExprVisitor::VisitStmt(stmt);
       return;
     }
