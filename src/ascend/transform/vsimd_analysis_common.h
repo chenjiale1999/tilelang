@@ -110,6 +110,40 @@ public:
   bool unsupported{false};
   std::string unsupported_reason;
 
+  explicit NestCollector(bool allow_control_flow = false)
+      : allow_control_flow_(allow_control_flow) {}
+
+  // Positive statement grammar for a liftable T.Parallel body. Unknown
+  // statements are rejected instead of being silently ignored; this prevents
+  // effects or declarations from disappearing during region expansion.
+  // Future CF1-CF3 support must extend this allowlist explicitly.
+  void VisitStmt(const Stmt &stmt) final {
+    if (depth_ == 0) {
+      StmtExprVisitor::VisitStmt(stmt);
+      return;
+    }
+    if (stmt.as<BufferStoreNode>() || stmt.as<SeqStmtNode>() ||
+        stmt.as<DeclBufferNode>() || stmt.as<BindNode>() ||
+        stmt.as<EvaluateNode>()) {
+      StmtExprVisitor::VisitStmt(stmt);
+      return;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      if (loop->kind == ForKind::kParallel ||
+          (allow_control_flow_ && loop->kind == ForKind::kSerial)) {
+        StmtExprVisitor::VisitStmt(stmt);
+        return;
+      }
+    }
+    if (allow_control_flow_ && stmt.as<IfThenElseNode>()) {
+      StmtExprVisitor::VisitStmt(stmt);
+      return;
+    }
+    unsupported = true;
+    unsupported_reason =
+        "unsupported statement inside T.Parallel: " + stmt->GetTypeKey();
+  }
+
   void VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
       bool outer = depth_ == 0;
@@ -235,6 +269,7 @@ public:
 
 private:
   int depth_{0};
+  bool allow_control_flow_{false};
   std::vector<LoopInfo> loops_;
   std::vector<AccessInfo> accesses_;
   std::vector<Buffer> local_views_;
