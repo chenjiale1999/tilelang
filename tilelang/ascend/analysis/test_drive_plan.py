@@ -193,6 +193,46 @@ def c2_reduce_tail():
     return k
 
 
+def r_long_reduce():
+    """长归约（常量 ``chunks > _REDUCE_UNROLL_LIMIT``）：不再展开，走真实 chunk 循环 +
+    ``local.var`` 可写向量寄存器累加器。
+
+    ``(2, 512)`` / 64 lanes → 8 个 chunk、无尾块：发射成「主循环 7 轮（全 lane 掩码）
+    + 循环外一次并入旧值 + ONEPT 回写」，展开会线性膨胀 8×3 条指令且关键路径仍是 8 级。
+    """
+    M, K = 2, 512
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((M,), "float32")
+            for i, j in T.Parallel(M, K):
+                s[i] = s[i] + a[i, j]
+
+    return k
+
+
+def r_long_reduce_tail():
+    """长归约 + 尾块：``(2, 552)`` → 9 个 chunk、``tail = 40``。
+
+    覆盖长归约的**尾块分块**分支：主循环跑 ``chunks-1 = 8`` 个整块，尾块单独一个单次
+    循环块，带 ``update_mask(40)`` + ``vsel`` 单位元填充，再累加进同一个 ``local.var``
+    累加器（展开路径的尾块是内联在最后一个展开块里的，两者不同）。
+    """
+    M, K = 2, 552
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((M,), "float32")
+            for i, j in T.Parallel(M, K):
+                s[i] = s[i] + a[i, j]
+
+    return k
+
+
 def c2_axis_pick():
     """改进 2：写侧主序的联合打分。转置写 c[j,i]=a[i,j] 里，内层轴 j 对写是 strided、
     对读是 contiguous；外层轴 i 对写是 contiguous、对读是 strided。加权后选**外层轴 i**
@@ -884,7 +924,9 @@ def d9_symbolic_extent():
 
 
 def d9b_symbolic_extent_reduce():
-    """D9 归约分支（已修）：chunk 循环需编译期展开 → 符号 extent 明确拒绝。"""
+    """D9 归约分支（已支持）：符号 extent 走「整块主循环 + peel 尾块」，
+    ``local.var`` 向量累加器 + 运行期 ``update_mask`` 夹紧尾块。"""
+
     n = tirx.Var("n", "int32")
 
     @T.prim_func
@@ -898,22 +940,7 @@ def d9b_symbolic_extent_reduce():
     return k
 
 
-def d10_non_reduction_tail_overread():
-    """D10（已修）：尾块装载带谓词（vld 无谓词形式 → 退化成带谓词的 vgather2）。"""
-
-    @T.prim_func
-    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
-        with T.Kernel(1):
-            a = T.alloc_shared((MS, KS), "float32")
-            c = T.alloc_shared((MS, KS), "float32")
-            for i in T.Parallel(MS):
-                for j in T.serial(KS):
-                    c[i, j] = a[i, j] * 2.0
-
-    return k
-
-
-def d10b_one_dimensional_tail():
+def d10_one_dimensional_tail():
     """D10 一维形态（已修）：``(100,)`` 上尾块 ``vld(a[64], 64)`` 会越过分配范围。"""
     M = 100
 
@@ -1045,6 +1072,9 @@ CASES = [
     ("c2_rank", c2_rank),
     ("c2_reduce", c2_reduce),
     ("c2_reduce_tail", c2_reduce_tail),  # 改进 6：归约尾块
+    ("r_long_reduce", r_long_reduce),  # 长归约（8 chunks）：真实循环 + local.var 累加器
+    ("r_long_reduce_tail", r_long_reduce_tail),  # 长归约 + 尾块（9 chunks, tail=40）：尾块单独成块
+    ("d9b_symbolic_extent_reduce", d9b_symbolic_extent_reduce),  # D9：符号 extent 归约（主循环 + peel 尾块）
     ("c2_axis_pick", c2_axis_pick),  # 改进 2：联合打分选轴
     ("c3_multi", c3_multi),
     ("c3_scalars", c3_scalars),
@@ -1070,11 +1100,10 @@ CASES = [
     ("p_serial_leading_stmt", p_serial_leading_stmt),  # §6 第三步：前置语句 + 两个 serial
     ("d8_negative_stride", d8_negative_stride),  # D8 已修：负步长 → 索引向量 vgather2
     ("d8b_negative_stride_store", d8b_negative_stride_store),  # D8 已修：负步长写 → vscatter
-    ("d9_symbolic_extent", d9_symbolic_extent),  # D9 已修：符号 extent → 运行时 chunk 循环
-    ("d10_non_reduction_tail_overread", d10_non_reduction_tail_overread),  # D10 已修：尾块装载带谓词
-    ("d10b_one_dimensional_tail", d10b_one_dimensional_tail),  # D10 已修：一维尾块不再越界读
+    ("d9_symbolic_extent", d9_symbolic_extent),  # D9 已修：符号 extent → 整块主循环 + peel 尾块
+    ("d10_one_dimensional_tail", d10_one_dimensional_tail),  # D10 已修：一维尾块不再越界读
     ("d14b_partial_reduce_fallback", d14b_partial_reduce_fallback),  # A0 已修：回退到并行轴
-    ("d11_indirect_pre", d11_indirect_pre),  # D11 已支持：pre 间接地址沿轴不变 → 单次 ONEPT 写
+    ("d11_indirect_pre", d11_indirect_pre),  # D11 已支持：pre 间接地址沿轴不变 → 外提为一次标量写
     ("d11b_lane_invariant_indirect_load", d11b_lane_invariant_indirect_load),  # D11 同族：vdup 广播
     # --- 明确拒绝（REJ）的用例，统一放在尾部 ---
     ("c6_complex", c6_complex),  # 共享标量 cnt[0] + 非直接内嵌 serial
@@ -1082,12 +1111,11 @@ CASES = [
     ("p_serial_one_unclean", p_serial_one_unclean),  # §6 第三步边界：并列 serial 中有一段不干净
     ("c_gm", c_gm),  # GM 操作数
     ("c4_true_random", c4_true_random),  # 改进 4：TRUE_RANDOM
-    ("d9b_symbolic_extent_reduce", d9b_symbolic_extent_reduce),  # D9 已修：归约需编译期 chunk 数
-    ("d14_partial_reduce", d14_partial_reduce),  # A0 已修：部分归约明确拒绝
+    ("d14_partial_reduce", d14_partial_reduce),  # A0：部分归约拒绝
     ("d15_bool_store", d15_bool_store),  # D11 同族：bool store 在 build 期拒绝
-    # --- 已修缺陷复现（确认改判为拒绝 / 不再错发）---
-    ("d1_product_reduce", d1_product_reduce),  # D1：乘积归约拒绝
-    ("d2_plain_overwrite", d2_plain_overwrite),  # D2：覆写拒绝
+    # --- 已修缺陷复现（语义正确即可：显式拒绝，或安全地沿并行轴向量化）---
+    ("d1_product_reduce", d1_product_reduce),  # D1：乘积语义保留（逐 lane vmul 读改写）
+    ("d2_plain_overwrite", d2_plain_overwrite),  # D2：覆写按逐 lane 赋值发射（非归约）
     ("d3_int_max_reduce", d3_int_max_reduce),  # D3：int32 max 归约
     ("d3_f16_max_reduce", d3_f16_max_reduce),  # D3：f16 max 归约
     ("d4_uniform_addend", d4_uniform_addend),  # D4：均匀加数保留

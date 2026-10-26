@@ -126,7 +126,11 @@ def normalize_body(
                 merged = tirx.Select(condition, then_spec.value, else_spec.value)
                 for spec in (then_spec, else_spec):
                     if spec.mask is not None:
-                        raise Unsupported("masked branch merging is not supported")
+                        raise Unsupported(
+                            "masked branch merging is not supported: one arm of this same-address if/else is itself "
+                            "predicated (e.g. a nested else-if), so there is no single select condition; "
+                            "rewrite it as two consecutive masked stores"
+                        )
                 result.append(StoreSpec(then_spec.buffer, then_spec.indices, merged, mask))
                 return result
 

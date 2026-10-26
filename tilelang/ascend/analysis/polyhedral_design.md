@@ -158,7 +158,7 @@ emit_plan(plan)
   ├─ VectorProgram → 逐段 _emit_segment_stmts（源序），program.axes 统一包一次（段内按变量身份跳过）
   ├─ 单独 VectorPlan → 等价的「自己包全部非向量轴」发射路径（护栏测试比对两者逐节点一致）
   ├─ reduce is None → _Emitter 逐 store 发射；重建 chunk 循环 + 外层 serial 循环
-  └─ reduce != None → _emit_reduce：编译期展开 chunk，SSA 串累加器
+  └─ reduce != None → _emit_reduce：`chunks <= 4` 编译期展开 + 多路累加器；否则真实循环 + `local.var` 累加器
   ▶ TIR (SeqStmt / For)
 ```
 
@@ -470,8 +470,8 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 > ✅ **缺陷 D9（已修，回归基线见 §4.2）**：符号 extent 时 `chunks = tail = None`，旧发射端
 > `range(plan.chunks or 1)` 退化为**只发一个 chunk 且无尾掩码**（`n > lanes` 时静默少算）。
 > 现改为：非归约路径发**运行时 chunk 循环** `ceildiv(extent, lanes)` + 运行时夹紧的尾块掩码；
-> 归约路径的 chunk 循环是编译期展开的，符号 extent **在 build 期明确拒绝**
-> （`a reduction needs a compile-time vector-axis extent`），不再伪造成 1 个 chunk。
+> 归约路径同样发运行时 chunk 循环（累加器落成 `local.var` 可写向量寄存器，见 §3.8），
+> 不再有任何「静默伪造成 1 个 chunk」的形态。
 
 **系统常量**：
 
@@ -485,23 +485,54 @@ return all(arg.is_uniform for arg in self.args)     # 递归传播
 
 ### 3.8 归约发射（最特别的部分）
 
+归约按 chunk 数分**两种策略**（阈值 `emit._REDUCE_UNROLL_LIMIT = 4`、链数
+`emit._REDUCE_CHAINS = 4`）；两条路径的尾块处理与收尾相同。
+
+**A. 短归约（`chunks <= 4`）：编译期展开 + 多路累加器**
+
 ```
-mask = pset(bits, "PAT_ALL")
-acc  = vdup(identity, elem, mask)               # vadd→0, vmax→-inf, vmin→+inf
-fill = tail ? vdup(identity, elem, mask) : None # 尾块填充寄存器（改进 6）
 for ck in range(chunks):                        # 编译期展开，不是运行时 for！
     if tail and ck == last:                     # 尾块：装载带谓词（vgather2），再填单位元
         x = vgather2(src_addr(ck), vci(0), tail_mask)   # 不越过 buffer 尾部（D10）
         x = vsel(x, fill, tail_mask)
     else:
         x = vld(src_addr(ck), "NORM")           # 整 chunk
-    red = vcadd(x, mask)                        # 跨 lane 归约，结果只在 lane0
-    acc = vadd(acc, red, mask)
-if 累加写: old = vld(dst_addr, "BRC_B{bits}"); acc = vadd(acc, old, mask)
-vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
+    red[ck % K] = 首块 ? vcadd(x, mask) : vadd(red[ck % K], vcadd(x, mask))
+acc = red[0 .. K) 树形合并                       # K = min(4, chunks)
+if 累加写: old = 标量读 dst; acc = vadds/vmaxs/vmins(acc, old, lane0_mask)   # 无 BRC 广播
+vsts(dst_addr, acc, lane0_mask, "ONEPT_B{bits}")
 ```
 
-**为什么必须编译期展开？**「跨迭代的寄存器值」在纯 SSA（`Bind`，无 PHI / 可变变量）里无法表达——不能写 `acc = acc ...` 引用上一轮。于是把 chunk 循环**在 Python 层展开**，用不同名字的 `vadd` 串起来。这与 C++ pass 的定型方案一致。
+- **链首直接取 `vcadd` 结果**，因此不需要 `vdup` 单位元（`chunks=1` 时退化成「一次 vcadd + 回写」）；
+- **多路累加器**把 `vcadd` 的串行依赖从 `chunks` 级压到 `ceil(log2 K)` 级，指令条数不变；
+- **归约后的算术一律收窄到 lane 0**：`vcadd/vcmax/vcmin` 只有 lane 0 有效（硬件模板用
+  `PAT_VL1` 合并），故链合并/累加/回写都用 `pset(bits, "PAT_VL1")`，不再对 63 个无效车道运算；
+- **旧值按标量并入**：累加写 `dst op= x` 的旧值直接标量读一次进 `vadds/vmaxs/vmins`，
+  省掉一条 `vld(..., BRC_B*)` 广播装载（仅归约结果被拓宽时退回广播）；
+- 直线代码无循环控制开销，后端可把下一块的 `vld` 提前调度。
+
+**B. 长归约（`chunks > 4`）与符号 extent：真实 chunk 循环 + `local.var` 累加器**
+
+```
+acc = AllocBuffer(1, elem x lanes, scope="local.var")   # 可写向量寄存器（codegen 发 vector_f32）
+acc[0] = vdup(identity, elem, mask)
+for ck in range(full or ceildiv(extent, lanes)):        # 真实运行时循环
+    x = vld(src_addr(ck), "NORM")                       # 符号 extent 时改带谓词装载 + vsel 填单位元
+    acc[0] = vadd(acc[0], vcadd(x, mask), lane0_mask)
+final = acc[0]
+if 累加写: old = 标量读 dst; final = vadds/vmaxs/vmins(final, old, lane0_mask)
+vsts(dst_addr, final, lane0_mask, "ONEPT_B{bits}")
+```
+
+- 常量 extent：主循环跑 `chunks-1` 个整块（全 lane 掩码），尾块单独一个**单次**循环块；
+- 符号 extent：单条循环，每轮 `update_mask(min(E - ck*lanes, lanes))` 夹紧 + `vsel` 填单位元；
+- `local.var` 的向量 dtype 由 codegen 直接声明为向量寄存器（`vector_f32`），
+  `acc[0] = ...` / `acc[0]` 读写即寄存器读改写。
+
+**为什么短归约展开？** 展开去掉循环控制、给后端跨块调度空间，收益集中在 chunk 数少、
+单段指令预算充足时；chunk 数大时指令体积线性膨胀而收益占比下降，故改用循环 + 可变寄存器
+（`tirx.AllocBuffer` + `BufferStore`/`BufferLoad`，即 `T.simd.alloc_var` 的语义）。
+两条路径都由同一判据驱动，因此**符号 extent 不再被拒绝**（D9 归约分支已解除）。
 
 配套细节：
 
@@ -761,7 +792,6 @@ pre/post store = 用户谓词（不叠加尾块谓词，它们不随 chunk 变�
 | 旧值不在累加位置 | 旧值被缩放 / 嵌套 / 跨址（stencil） | `must be a direct operand ... accumulate position` |
 | 归约体在非累加位置读 dst | 剥离后 `varying` 仍读目标 buffer | `the reduction body reads the destination buffer ... outside the accumulate position` |
 | 部分归约 | 吸收的 serial 轴上，lane 均匀写 + 取值逐 lane 变化，但整段不是归约 | `a partial reduction mixed with element-wise stores has no vector form` |
-| 归约 + 符号 extent | `chunks is None` 且 `plan.reduce != None` | `a reduction needs a compile-time vector-axis extent ...` |
 | 条件归约（缺口） | 归约 store 带 mask（`if cond: s[0] += ...`） | 当前**不拒绝**（见 §3.12.4，需修） |
 
 #### 3.13.6 E. 语句结构 / serial 类拒绝
@@ -809,7 +839,6 @@ pre/post store = 用户谓词（不叠加尾块谓词，它们不随 chunk 变�
 | `p_serial_one_unclean` | E. 多段不干净 | 一段不可吸收 → 回落单段 → nested loop |
 | `c_gm` | A. 内存域 | GM 操作数需 staging |
 | `c4_true_random` | B. 索引不可构造 | `i//3` 非 2 的幂 |
-| `d9b_symbolic_extent_reduce` | D. 归约 + 符号 extent | chunk 需编译期展开 |
 | `d14_partial_reduce` | D. 部分归约 | serial 轴上 lane 均匀写 + 变化取值 |
 | `d15_bool_store` | A. 元素类型 | `bool` 无谓词宽度 |
 | `d1_product_reduce` | D. 归约算子 | `Mul` 不在白名单 |
@@ -900,7 +929,7 @@ pre/post store = 用户谓词（不叠加尾块谓词，它们不随 chunk 变�
 | D4/D5 | `d4_uniform_addend` / `test_defect_d4_uniform_addend_inside_reduction_is_not_dropped` | `[OK ]`，`1.0` 被丢弃 | 静默错误结果 | ✅ **已修**（`_strip_reduce` 沿脊递归，均匀加数保留在 `varying`） |
 | D6 | `d6_two_reduces`、`d6b_sum_max_reduce` / `test_defect_d6_two_reductions_in_one_nest_are_both_emitted`、`test_defect_d6b_mixed_reductions_keep_their_own_recipe` | `[OK ]`，只发射第一条归约 | 静默丢写 | ✅ **已修**（逐 store `ReduceInfo`，各自发射累加链 + 一次 `ONEPT vsts`） |
 | D8 | `d8_negative_stride`、`d8b_negative_stride_store` / `test_defect_d8_negative_stride_below_minus_one`、`test_defect_d8_negative_stride_store_is_scattered` | `[OK ]`，`vmuls(<uint32 ramp>, -2)` | 静默错误结果 | ✅ **已修**（负步长 → 索引向量 `vgather2`/`vscatter`；读+写两侧） |
-| D9 | `d9_symbolic_extent`、`d9b_symbolic_extent_reduce` / `test_defect_d9_symbolic_extent_is_not_silently_truncated`、`test_symbolic_extent_reduction_is_rejected` | `[OK ]`，`chunks=None` → `range(1)` | 静默少算 | ✅ **已修**（非归约发运行时 `ceildiv` chunk 循环；归约 build 期拒绝） |
+| D9 | `d9_symbolic_extent`、`d9b_symbolic_extent_reduce` / `test_defect_d9_symbolic_extent_is_not_silently_truncated`、`test_symbolic_extent_reduction_uses_a_runtime_chunk_loop` | `[OK ]`，`chunks=None` → `range(1)` | 静默少算 | ✅ **已修**（非归约与归约都发运行时 `ceildiv` chunk 循环；归约用 `local.var` 累加器，尾块掩码运行时夹紧） |
 | D10 | `d10_non_reduction_tail_overread` / `test_defect_d10_non_reduction_tail_load_is_bounded`、`test_defect_d10_one_dimensional_tail_load_is_bounded` | `[OK ]`，`vld(access_ptr(a[i,0],64))` 越界（基线 L1322） | 越界读 | ✅ **已修**（尾块拆块 + 装载带谓词，三条 load 通道 + 归约尾块全覆盖） |
 | D11 | `d11_indirect_pre`、`d11b_lane_invariant_indirect_load` / `test_defect_d11_build_success_implies_emit_success_for_sibling_statement`、`test_lane_invariant_indirect_load_is_uniform`、`test_bool_store_is_rejected_at_build_time` | `[REJ]` 「outside the serial loop must be uniform … (got indirect)」（每 lane 索引向量通道）；`bool` store → `ValueError` | build/emit 契约不一致 + 能力缺失 | ✅ **已修**：间接下标只在**沿轴变化**时归 `INDIRECT`；`Δ==0`（如 `c[b[0]]`）归 `UNIFORM`，pre/post 发一次 `ONEPT`，serial 主体照常向量化（部分向量化）。不支持的 store 元素类型在 build 期转 `Unsupported` |
 | A0 | `d14_partial_reduce`、`d14b_partial_reduce_fallback` / `test_partial_reduction_on_absorbed_serial_axis_is_rejected`、`test_partial_reduction_falls_back_to_the_parallel_axis` | `[OK ]`，`s` 只累加 2/128 项（`ONEPT` 只留 lane 0） | 静默错误结果 | ✅ **已修**（吸收 serial 轴上的部分归约 build 期拒绝；单段路径回退到并行轴） |
@@ -984,7 +1013,7 @@ python tmp/run_poly_test.py testing/ascend/analysis/test_polyhedral_vectorize.py
 
 | 类别  | 局限                                         | 说明 / 潜在改进                                                                          |
 | --- | ------------------------------------------ | ---------------------------------------------------------------------------------- |
-| 归约  | 展开式需整 chunk；尾块带谓词装载 + 单位元填充                      | `tail != 0` 已支持；归约的 chunk 循环仍要求编译期常量 extent（D9 归约分支拒绝）                                             |
+| 归约  | 短归约（`chunks <= 4`）展开 + 多路累加器；长归约 / 符号 extent 走真实循环 + `local.var` 累加器。尾块带谓词装载 + 单位元填充 | `tail != 0` 已支持；符号 extent 也已支持（运行期夹紧掩码） |
 | 诊断  | 已有结构化 `diagnostics`（改进 7）                  | 成功/失败都收集全部卡点；尚无机器可读的 error code                                                    |
 | 内存域 | GM 操作数拒绝                                   | 需 UB staging（§5.4(c)）                                                              |
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)）                        |

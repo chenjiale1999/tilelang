@@ -127,12 +127,16 @@ def _zero_identity(elem: str):
 
 
 def _min_identity(elem: str):
-    """``Max`` 的单位元：该元素类型的最小可表示值（``-inf`` 语义）。"""
+    """``Max`` 的单位元：浮点用 ``-inf``（打印干净、语义精确），整型用该类型最小值。"""
+    if elem.startswith("float"):
+        return tirx.FloatImm(elem, float("-inf"))
     return tirx.min_value(elem)
 
 
 def _max_identity(elem: str):
-    """``Min`` 的单位元：该元素类型的最大可表示值（``+inf`` 语义）。"""
+    """``Min`` 的单位元：浮点用 ``+inf``（打印干净、语义精确），整型用该类型最大值。"""
+    if elem.startswith("float"):
+        return tirx.FloatImm(elem, float("inf"))
     return tirx.max_value(elem)
 
 

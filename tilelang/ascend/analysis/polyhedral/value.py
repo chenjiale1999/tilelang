@@ -197,12 +197,35 @@ def _arity(expr) -> int:
     return len([f for f in ("a", "b") if hasattr(expr, f) and getattr(expr, f) is not None])
 
 
+def _negate_uniform(node: ValueNode) -> ValueNode | None:
+    """把 lane 均匀标量取负（用于 ``uniform - vector`` → ``vadds(vector, -uniform)``）。
+
+    SIMD 层没有 ``vsubs``，但标量取负是标量开销：``g[i] - g[j]`` 发成
+    ``vadds(vld(g[j]), -g[i])`` 比 ``vdup(g[i]) + vsub`` 少一条向量指令。
+    """
+    if node.recipe in ("imm", "uniform_expr"):
+        scalar = node.scalar
+    elif node.recipe == "uniform_load" and node.access is not None:
+        scalar = tirx.BufferLoad(node.access.buffer, list(node.access.indices))
+    elif node.recipe == "vbrc" and node.args:
+        return _negate_uniform(node.args[0])
+    else:
+        return None
+    if scalar is None:
+        return None
+    return ValueNode("uniform_expr", node.dtype, scalar=-scalar, detail="negated uniform")
+
+
 def _elementwise(recipe: str, expr, args: list, ctx: _ValueContext) -> ValueNode:
     """二元/一元逐元素算子：若一侧 lane 均匀，优先用标量-向量指令。"""
     if all(arg.is_uniform for arg in args):
         return _uniform(expr)
     if len(args) == 2:
         lhs_uniform, rhs_uniform = args[0].is_uniform, args[1].is_uniform
+        if lhs_uniform and not rhs_uniform and recipe == "vsub":
+            negated = _negate_uniform(args[0])
+            if negated is not None:
+                return ValueNode("vadds", ctx.vector_dtype, [args[1], negated], detail="scalar vsub->vadds(-)")
         if lhs_uniform or rhs_uniform:
             scalar_recipe = _VEC_SCALAR_BINARY.get(recipe)
             if scalar_recipe is not None:

@@ -130,7 +130,7 @@
 | 共享标量 / 跨迭代 stencil / 非直接内嵌 serial | 拒绝：`nested serial loop ... is not affine-vectorizable` | `_serial_is_clean` 保守判据 | 设计边界（宁拒绝勿错发） |
 | 并列 serial 中有一段不干净 | 同上（回落到单段路径后拒绝，段级原因在 diagnostics） | 同上 | 设计边界 |
 | 吸收 serial 轴上的**部分归约** | 单段：回退并行轴；多段：拒绝（diag 含 `partial reduction`） | 逐元素路径只能 `ONEPT` lane 0 | 设计边界（A0） |
-| **归约 + 符号 extent** | 拒绝：`a reduction needs a compile-time vector-axis extent` | chunk 循环编译期展开 | 设计边界（可改 PHI） |
+| **归约 + 符号 extent** | 支持：发运行时 chunk 循环 + `local.var` 累加器 | 长归约 / 符号 extent 不再展开（D9 归约分支已解除） | 已支持 |
 | 不支持的 store 元素类型（`bool`） | 拒绝：`store element dtype 'bool' ... is not supported` | `update_mask` 无 b1 宽度 | 设计边界 |
 | **`bool` 作数据操作数（`Cast(float32, c[i])`）** | **build OK → emit `ValueError`** | 见 A1 | **缺陷（应转为拒绝）** |
 | 非 Add/Max/Min 归约（乘积） | 拒绝：`unsupported reduction operator(s) Mul` | 无对应跨 lane 原语 | 设计边界 |

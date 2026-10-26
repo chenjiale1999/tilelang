@@ -157,7 +157,7 @@ build_plan(stmt)
 emit_plan(plan)
   ├─ VectorProgram → 逐段 _emit_segment_stmts（源序），program.axes 统一包一次
   ├─ reduce is None → _Emitter 逐 store 发射；重建 chunk 循环 + 外层 serial 循环
-  └─ reduce != None → _emit_reduce：编译期展开 chunk，SSA 串累加器
+  └─ reduce != None → _emit_reduce：短归约（≤4 chunk）展开 + 多路累加器；否则真实循环 + 可变寄存器累加器
   ▶ TIR (SeqStmt / For)
 ```
 
@@ -598,8 +598,8 @@ def _build(self, node: ValueNode):
 >    步长/间接装载直接使用尾块谓词；归约尾块也先带谓词装载再用 `vsel` 填单位元（D10）。
 > 2. **负步长已支持**：`Δ ≤ -2` 改走「每 lane 索引向量」通道（`vgather2`/`vscatter`，负偏移以补码表达），
 >    读、写两侧都覆盖（D8）。
-> 3. **符号 extent 已支持（非归约）**：运行时 chunk 循环驱动，尾块掩码运行时夹紧；归约的 chunk 循环
->    需要编译期展开，符号 extent 会在**规划期明确拒绝**而不是静默少算（D9）。
+> 3. **符号 extent 已支持**：非归约与归约都由运行时 chunk 循环驱动，尾块掩码运行时夹紧；
+>    归约在符号 extent 下走「真实循环 + 可变寄存器累加器」，不再在规划期拒绝（D9）。
 
 **系统常量**：
 
@@ -613,25 +613,45 @@ def _build(self, node: ValueNode):
 
 ### 3.8 归约发射（最特别的部分）
 
-**伪代码**
+归约按 chunk 数分**两种策略**：短归约（`chunks <= 4`）编译期展开并拆多条累加链；
+长归约与符号 extent 走「真实 chunk 循环 + 可变寄存器累加器」。两条路径的尾块处理一致。
+
+**A. 短归约：编译期展开 + 多路累加器**
 
 ```text
-mask = pset(bits, "PAT_ALL")
-acc  = vdup(identity, elem, mask)               # vadd→0, vmax→-inf, vmin→+inf
-fill = tail ? vdup(identity, elem, mask) : None # 尾块填充寄存器（改进 6）
 for ck in range(chunks):                        # 编译期展开，不是运行时 for！
     if tail and ck == last:                     # 尾块：带谓词装载（D10）
         x = vgather2(src_addr(ck), vci(0), tail_mask)
         x = vsel(x, fill, tail_mask)            # 无效车道填单位元
     else:
         x = vld(src_addr(ck), "NORM")           # 整 chunk
-    red = vcadd(x, mask)                        # 跨 lane 归约，结果只在 lane0
-    acc = vadd(acc, red, mask)
+    red[ck % K] = 首块 ? vcadd(x, mask) : vadd(red[ck % K], vcadd(x, mask))
+acc = red[0..K) 树形合并                          # K = min(4, chunks)
 if 累加写: old = vld(dst_addr, "BRC_B{bits}"); acc = vadd(acc, old, mask)
 vsts(dst_addr, acc, mask, "ONEPT_B{bits}")
 ```
 
-**为什么必须编译期展开？**「跨迭代的寄存器值」在纯 SSA（`Bind`，无 PHI / 可变变量）里无法表达——不能写 `acc = acc ...` 引用上一轮。于是把 chunk 循环**在 Python 层展开**，用不同名字的 `vadd` 串起来。这与 C++ pass 的定型方案一致。
+**B. 长归约 / 符号 extent：真实循环 + `local.var` 累加器**
+
+```text
+acc = AllocBuffer(1, elem x lanes, scope="local.var")   # 可写向量寄存器
+acc[0] = vdup(identity, elem, mask)
+for ck in range(full or ceildiv(extent, lanes)):        # 真实运行时循环
+    x = vld(src_addr(ck), "NORM")                       # 符号 extent 时带谓词装载 + vsel 填单位元
+    acc[0] = vadd(acc[0], vcadd(x, mask), lane0_mask)
+final = acc[0]
+if 累加写: old = 标量读 dst; final = vadds/vmaxs/vmins(final, old, lane0_mask)
+vsts(dst_addr, final, lane0_mask, "ONEPT_B{bits}")
+```
+
+**为什么要分档？** 展开去掉循环控制、给后端跨块调度空间，收益集中在 chunk 数少时；
+chunk 数大时指令体积随 `chunks` 线性膨胀而收益占比下降，因此改用循环 + 可变寄存器
+（`tirx.AllocBuffer` + `BufferStore`/`BufferLoad`，即 `T.simd.alloc_var` 的语义）。
+**多路累加器**（短归约）把 `vcadd` 的串行依赖从 `chunks` 级压到 `ceil(log2 K)` 级，指令条数不变；
+链首直接取第一块的部分结果，因此不再需要 `vdup` 单位元。
+**归约后的算术收窄到 lane 0**：`vcadd/vcmax/vcmin` 只有 lane 0 有效（硬件模板用 `PAT_VL1`
+合并），链合并/累加/回写统一用 `PAT_VL1` 谓词；累加写的旧值按标量读一次直接进
+`vadds/vmaxs/vmins`，省掉 `BRC` 广播装载。
 
 **尾块（改进 6）**：`extent % lanes != 0` 时最后一个 chunk 只有 `tail` 个有效车道，其余车道的 `vld` 读到越界/脏数据；用 `update_mask(extent - ck*lanes, bits)` 造尾块谓词、`vsel(x, fill, tail_mask)` 把无效车道替换成**归约单位元**，再按全 lane 掩码归约（`vadd` 填 0、`vmax` 填 -inf、`vmin` 填 +inf 均不影响结果）。这样 `tail != 0` 也能正确发射，不再需要整除前提。
 
@@ -959,7 +979,7 @@ im2col 本质是**三个耦合特性**，建议分段推进：
 
 | 类别 | 局限 | 说明 / 潜在改进 |
 |---|---|---|
-| 归约 | 展开式需整 chunk | `tail != 0` 已支持（尾块带谓词装载 + 单位元填充）；归约的 chunk 循环仍要求编译期常量 extent |
+| 归约 | 短归约（≤4 个 chunk）展开、长归约与符号 extent 走真实循环 | `tail != 0` 已支持（尾块带谓词装载 + 单位元填充）；符号 extent 归约也已支持（运行期夹紧尾块掩码） |
 | 诊断 | 已有结构化 `diagnostics`（改进 7） | 成功 / 失败都收集全部卡点；暂无机器可读的 error code（没有消费者，待接入管线时再加） |
 | 内存域 | GM 操作数拒绝 | 需 UB staging（§5.4(c)） |
 | 值算子 | `FloorDiv`/`FloorMod` 作值算子仅支持 **2 的幂常量除数** | 非 2 的幂常量除数（需 `vmull` magic-number）、非常量除数（需整型内建）仍拒绝（§5.4(a)） |

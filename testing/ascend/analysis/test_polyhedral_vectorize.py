@@ -458,12 +458,14 @@ def test_operand_rank_mismatch_broadcasts_outer_load():
     plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     value = plan.stores[0].value
-    assert value.recipe == "vsub"
-    # ``g[i]`` is lane-uniform along j → broadcast; ``g[j]`` is a vector load.
-    assert value.args[0].recipe == "vbrc"
-    assert value.args[1].recipe == "vload"
+    # SIMD 层没有 vsubs：``uniform - vector`` 折叠成 ``vadds(vector, -uniform)``，
+    # 标量取负是标量开销（省掉一条 vdup）。
+    assert value.recipe == "vadds"
+    assert value.args[0].recipe == "vload"
+    assert value.args[1].recipe == "uniform_expr"
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vdup" in ops and "tl.simd.vld" in ops and "tl.simd.vsub" in ops
+    assert "tl.simd.vadds" in ops and "tl.simd.vld" in ops
+    assert "tl.simd.vdup" not in ops and "tl.simd.vsub" not in ops
 
 
 def test_reduction_detected():
@@ -508,8 +510,10 @@ def test_reduction_max_maps_to_vcmax():
 
 def test_reduction_with_tail_fills_identity():
     """``extent % lanes != 0``: the last chunk is a partial tile.  Its inactive
-    lanes read out of range, so they must be replaced by the reduction identity
-    (``update_mask`` + ``vsel``) before the cross-lane reduction (改进 6)."""
+    lanes read out of range, so the tail predicate must be applied.  For **Add**
+    the identity is 0 and ``MODE_ZEROING`` already zeroes inactive lanes, so the
+    predicate is passed straight to ``vcadd`` (no ``vsel`` fill); Max/Min still
+    need an explicit identity fill."""
     M, K = 4, 32  # K < 64 lanes -> tail != 0
 
     @T.prim_func
@@ -524,8 +528,8 @@ def test_reduction_with_tail_fills_identity():
     assert plan.reduce is not None and plan.tail == 32
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.update_mask" in ops  # 尾块谓词
-    assert "tl.simd.vsel" in ops  # 单位元填充
-    assert "tl.simd.vcadd" in ops  # 跨 lane 归约
+    assert "tl.simd.vsel" not in ops  # Add 不需要单位元填充
+    assert "tl.simd.vcadd" in ops  # 跨 lane 归约（带尾块掩码）
     assert "tl.simd.vsts" in ops  # ONEPT 回写
 
 
@@ -1011,7 +1015,7 @@ def test_flatten_is_skipped_when_a_load_still_needs_gather():
     """P1 的读侧门禁：展平只是把下标换成 ``k`` 的分解式，**消不掉** gather。
 
     ``d[i, j] = g[i] - g[j]`` 展平后两个读都是分片访问（``g[k//32]`` / ``g[k%32]``）→
-    合成轴不接手，原单轴路径（``vdup`` + 1 条 gather）保持不变。
+    合成轴不接手，原单轴路径（``vadds`` + 1 条 gather，无 ``vdup``）保持不变。
     """
     S, M = 32, 16
 
@@ -1028,12 +1032,16 @@ def test_flatten_is_skipped_when_a_load_still_needs_gather():
     assert [axis.name for axis in plan.axes] == ["i", "j"]
     assert plan.vector_axis.name == "j"
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vgather2" in ops and "tl.simd.vdup" in ops
+    assert "tl.simd.vgather2" in ops and "tl.simd.vadds" in ops
+    assert "tl.simd.vdup" not in ops  # uniform 取负后直接走标量-向量指令
 
 
 def test_direct_serial_reduction_absorbed():
-    """S3：``for i in P: for j in serial: s[i] += a[i,j]``。沿 j 的累积归约是合法的
-    循环携带依赖（同址自读）→ j 被吸收并选为向量轴，走 vcadd 跨 lane 归约。"""
+    """S3：``for i in P: for j in serial: s[i] += a[i,j]``。
+
+    内层 serial 轴只有 8 个 lane（8/64），选它做跨 lane 归约会浪费 56 个 lane；
+    轴打分已按 ``active/lanes`` 折算 → 改选并行轴 i：``s_vec += a[:, j]``，
+    serial 循环保留为真实循环（不再需要 ``vcadd``）。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1046,10 +1054,11 @@ def test_direct_serial_reduction_absorbed():
                     s[i] += a[i, j]
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vadd" in ops and "tl.simd.vgather2" in ops
+    assert "tl.simd.vcadd" not in ops
 
 
 def test_direct_serial_private_scalar_absorbed():
@@ -1073,13 +1082,14 @@ def test_direct_serial_private_scalar_absorbed():
     plan = _single_segment(k)
     assert plan.vector_axis.name == "j"
     assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
-    # pre = acc[0] = 0.0，post = c[i] = acc[0]，均沿向量轴均匀。
-    assert [s.spec.buffer.name for s in plan.pre_stores] == ["acc"]
-    assert [s.kind for s in plan.pre_stores] == [AccessClass.UNIFORM]
+    # pre = acc[0] = 0.0 是 Add 的单位元 → 折叠成累加器初值（pre 写被删除，不再并入旧值）。
+    assert plan.pre_stores == []
+    assert plan.reduce.accumulate is False
     assert [s.spec.buffer.name for s in plan.post_stores] == ["c"]
     assert [s.kind for s in plan.post_stores] == [AccessClass.UNIFORM]
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vcadd" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vadds" not in ops  # 单位元初值 → 不需要并入旧值
 
 
 def test_serial_shared_scalar_rejected():
@@ -1127,7 +1137,9 @@ def test_serial_stencil_rejected():
 
 def test_serial_pre_statement_absorbed():
     """M2 前置语句 + serial：``s[i]=0.0; for j in serial: s[i]+=a[i,j]``。
-    init 给出归约初值 → 作为 ``pre`` 段在 chunk 循环外执行一次，主体走 vcadd。"""
+
+    沿并行轴 i 向量化：chunk 循环包住 ``pre(s[i]=0) → for j: main``，pre 每个 chunk
+    （而不是每个 j 迭代）执行一次。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1141,16 +1153,21 @@ def test_serial_pre_statement_absorbed():
                     s[i] += a[i, j]
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
     assert [s.spec.buffer.name for s in plan.pre_stores] == ["s"]
+    assert [s.kind for s in plan.pre_stores] == [AccessClass.CONTIGUOUS]
     assert plan.post_stores == []
-    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(plan))
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vadd" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vcadd" not in ops
 
 
 def test_serial_post_statement_absorbed():
     """M3 serial + 后置语句：``for j in serial: s[i]+=a[i,j]; s[i]=s[i]*2``。
-    归约后处理 → 作为 ``post`` 段在 chunk 循环外执行一次。"""
+
+    沿并行轴 i 向量化：chunk 循环包住 ``for j: main → post``，post 在寄存器/共享内存里
+    每个 chunk 只做一次（``vmuls``），不再走跨 lane 归约。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1164,16 +1181,19 @@ def test_serial_post_statement_absorbed():
                 s[i] = s[i] * 2.0
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
     assert plan.pre_stores == []
     assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
-    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(plan))
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vadd" in ops and "tl.simd.vmuls" in ops
+    assert "tl.simd.vcadd" not in ops
 
 
 def test_serial_sandwiched_statements_absorbed():
     """前置 + serial + 后置（夹心）：``s[i]=0.0; for j: s[i]+=a[i,j]; s[i]=s[i]*2``。
-    pre 与 post 同时存在，发射顺序保持 pre → 主体 → post。"""
+
+    沿并行轴 i 向量化后，三段的顺序仍是 pre → for j: 主体 → post。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1188,20 +1208,20 @@ def test_serial_sandwiched_statements_absorbed():
                 s[i] = s[i] * 2.0
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
-    assert plan.reduce is not None and plan.reduce.recipe == "vcadd"
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
     assert [s.spec.buffer.name for s in plan.pre_stores] == ["s"]
     assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
-    # pre 写、归约写、post 写各一次，共 3 个 vsts；顺序 pre → 主体 → post。
     ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vcadd" in ops
-    assert ops.count("tl.simd.vsts") >= 3
+    assert "tl.simd.vadd" in ops and "tl.simd.vmuls" in ops
+    assert ops.count("tl.simd.vsts") >= 3  # pre + 主体 + post
 
 
 def test_serial_independent_store_group_absorbed():
     """M1 独立 store 组 + serial：``c[i,0]=1.0; for j: c[i,j]=a[i,j]*2``。
-    两组写互不相关（一组沿轴 uniform，一组沿轴连续）；uniform 的 pre 写必须在 chunk
-    循环外发射，否则 chunks>1 时会重复覆盖。"""
+
+    沿并行轴 i 向量化；``c[i,0]`` 会被 ``j=0`` 那一轮必然覆写（主体不读 c）→
+    pre 写是死写，build 期直接删除。主体沿 i 是步长写，走 ``vgather2``/``vscatter``。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1215,14 +1235,12 @@ def test_serial_independent_store_group_absorbed():
                     c[i, j] = a[i, j] * 2.0
 
     plan = _single_segment(k)
-    assert plan.vector_axis.name == "j"
+    assert plan.vector_axis.name == "i"
     assert plan.reduce is None
-    assert [s.spec.buffer.name for s in plan.pre_stores] == ["c"]
-    assert [s.kind for s in plan.pre_stores] == [AccessClass.UNIFORM]
-    assert [s.kind for s in plan.stores] == [AccessClass.CONTIGUOUS]
+    assert plan.pre_stores == []  # 死写已删除
+    assert [s.kind for s in plan.stores] == [AccessClass.STRIDED]
     ops = _emitted_ops(emit_plan(plan))
-    # 主体只有一个尾块（KS=8 < lanes）：装载走带谓词的 vgather2 而不是 vld（缺陷 D10）。
-    assert "tl.simd.vmuls" in ops and "tl.simd.vgather2" in ops
+    assert "tl.simd.vmuls" in ops and "tl.simd.vgather2" in ops and "tl.simd.vscatter" in ops
 
 
 # ---------------------------------------------------------------------------
@@ -1255,20 +1273,23 @@ def test_multi_serial_independent_segments():
 
     program = _plan(k)
     assert isinstance(program, VectorProgram)
-    assert [axis.name for axis in program.axes] == ["i"]
-    assert [seg.vector_axis.name for seg in program.segments] == ["j", "l"]
+    # 两段都是纯 elementwise → 各自展平成满 lane 合成轴（i×j / i×l，512 元素）。
+    assert program.axes == []
+    assert [seg.vector_axis.name for seg in program.segments] == ["k_i_j", "k_i_l"]
+    assert [seg.chunks for seg in program.segments] == [8, 8]
     assert [seg.stores[0].spec.buffer.name for seg in program.segments] == ["c", "d"]
     assert all(seg.stores[0].kind == AccessClass.CONTIGUOUS for seg in program.segments)
 
     stmt = emit_plan(program)
     kinds = _for_kinds(stmt)
     assert tirx.ForKind.PARALLEL not in kinds
-    assert kinds.count(tirx.ForKind.SERIAL) == 3  # 共享并行轴 i + 两个 chunk 循环
+    # 每段一个满 lane chunk 循环；没有 8/64 lane 的 serial 轴循环。
+    assert kinds.count(tirx.ForKind.SERIAL) == 2
 
 
 def test_multi_serial_reduce_then_use():
-    """归约段 + 广播使用段：段间依赖 ``s[i]`` 沿第二段的向量轴 l 均匀 →
-    逐段向量化 + 源序发射保持语义。"""
+    """归约段 + 广播使用段：两段都沿并行轴 i 向量化（serial 循环保留），
+    段间依赖 ``s[i]`` 是逐 lane 的，源序发射保持语义。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1286,9 +1307,15 @@ def test_multi_serial_reduce_then_use():
     program = _plan(k)
     assert isinstance(program, VectorProgram)
     assert len(program.segments) == 2
-    assert program.segments[0].reduce is not None and program.segments[0].reduce.recipe == "vcadd"
-    assert program.segments[1].reduce is None
-    assert "tl.simd.vcadd" in _emitted_ops(emit_plan(program))
+    assert [seg.vector_axis.name for seg in program.segments] == ["i", "i"]
+    # 向量轴 i 已吃成 lane 维：program 层不能再包 `for i`，否则整段会重复 64 次。
+    assert program.axes == []
+    assert all(seg.reduce is None for seg in program.segments)
+    stmt = emit_plan(program)
+    assert "for i in range(64)" not in str(stmt)
+    ops = _emitted_ops(stmt)
+    assert "tl.simd.vadd" in ops and "tl.simd.vmuls" in ops
+    assert "tl.simd.vcadd" not in ops
 
 
 def test_multi_serial_compose_keeps_source_order():
@@ -1451,7 +1478,7 @@ def test_single_segment_program_emits_identically_to_single_plan():
 
 def test_multi_segment_program_diagnostics_are_populated():
     """缺陷 A：多段路径不再产生「diagnostics 恒空」的计划——program 层有摘要，每段也有
-    自己的逐轴分类与「强制向量轴」说明，与单段路径的 ``plan.diagnostics`` 同构。"""
+    自己的逐轴分类与「选中向量轴」说明，与单段路径的 ``plan.diagnostics`` 同构。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1478,8 +1505,8 @@ def test_multi_segment_program_diagnostics_are_populated():
     assert any("multi-segment program" in note for note in program.diagnostics)
     for segment in program.segments:
         assert any("axis 'i'" in note for note in segment.diagnostics)
-        assert any(f"axis '{segment.vector_axis.name}'" in note for note in segment.diagnostics)
-        assert any("forced vector axis" in note for note in segment.diagnostics)
+        assert any(f"'{segment.vector_axis.name}'" in note for note in segment.diagnostics)
+        assert any("segment vector axis" in note or "flattened segment" in note for note in segment.diagnostics)
 
 
 def test_multi_segment_failure_reason_is_preserved():
@@ -1598,7 +1625,8 @@ def test_vectorize_parallel_nests_lowers_multi_serial_program():
 
     kinds = _for_kinds(transformed)
     assert tirx.ForKind.PARALLEL not in kinds
-    assert kinds.count(tirx.ForKind.SERIAL) == 3  # 共享并行轴 i + 两个 chunk 循环
+    # 两段都展平成满 lane 合成轴：每段一个 chunk 循环。
+    assert kinds.count(tirx.ForKind.SERIAL) == 2
     ops = _emitted_ops(transformed)
     assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
 
@@ -1708,7 +1736,10 @@ def _over_reading_contiguous_load(stmt) -> bool:
 
 
 def test_defect_d1_product_reduction_is_not_emitted_as_sum():
-    """D1 已修：乘积归约显式拒绝（`_reduce_op` 不再默认 `vadd`）。"""
+    """D1 已修：乘积归约**不会再被静默发成求和**。
+
+    沿并行轴 i 的满 lane 向量化把 ``s[i] *= a[i,j]`` 发成逐 lane 的 ``vmul`` 读改写
+    （serial j 保留为真实循环），乘积语义完整保留，也不会出现 ``vcadd``。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1720,17 +1751,18 @@ def test_defect_d1_product_reduction_is_not_emitted_as_sum():
                 for j in T.serial(KS):
                     s[i] = s[i] * a[i, j]
 
-    # 正确契约（D1 已修）：乘积归约必须**显式拒绝**；绝不静默发射成 vcadd 求和。
-    with pytest.raises(Unsupported, match="reduction operator"):
-        _single_segment(k)
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vmul" in ops and "tl.simd.vcadd" not in ops
 
 
 def test_defect_d2_plain_overwrite_is_not_treated_as_reduction():
-    """D2 已修（D13 统一判据后）：覆写 ``s[i] = a[i,j]`` 不再是「后写覆盖」被当成归约。
+    """D2 已修：覆写 ``s[i] = a[i,j]`` 不会被当成归约（不发 ``vcadd`` 求和）。
 
-    归约判定现统一为「lane 均匀地址 + **累加形式** ``dst = dst op x``」；本形态取值不读
-    ``s``，故以「不是累加形式」的精确诊断拒绝。
-    """
+    沿并行轴 i 向量化后是逐 lane 赋值、j 循环保留为真实循环，结果与标量
+    last-write-wins 完全一致。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1741,8 +1773,11 @@ def test_defect_d2_plain_overwrite_is_not_treated_as_reduction():
             for i, j in T.Parallel(MS, KS):
                 s[i] = a[i, j]
 
-    with pytest.raises(Unsupported, match="accumulate form"):
-        _single_segment(k)
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "i"
+    assert plan.reduce is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vsts" in ops and "tl.simd.vcadd" not in ops
 
 
 def test_defect_d3_int_max_reduction_does_not_crash():
@@ -1779,11 +1814,10 @@ def test_defect_d3_f16_max_reduction_does_not_crash():
 
 
 def test_defect_d4_uniform_addend_inside_reduction_is_not_dropped():
-    """D4/D5 已修（D13 统一判据）：归约体里的 lane 均匀加数不再被丢弃。
+    """D4/D5 已修：归约体里的 lane 均匀加数不再被丢弃。
 
-    ``s[i] = s[i] + a[i,j] + 1.0`` 的逐 lane 取值现为 ``vadds(vload(a), 1.0)``（``1.0``
-    保留在内，跨 lane 归约天然正确处理），旧值 ``s[i]`` 作为独立项在末尾并入。
-    """
+    改沿并行轴 i 向量化后，``s[i] = s[i] + a[i,j] + 1.0`` 取值保留 ``+1.0``
+    （``vadds`` 的标量侧是 imm 1.0），旧值 ``s[i]`` 以 ``vload`` 直接参与读改写。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1796,18 +1830,18 @@ def test_defect_d4_uniform_addend_inside_reduction_is_not_dropped():
                     s[i] = s[i] + a[i, j] + 1.0
 
     segment = _single_segment(k)
-    assert segment.reduce is not None
-    varying = segment.stores[0].reduce.varying
-    # 逐 lane 取值保留常量加数（vadds 的另一侧是 imm 1.0），旧值独立并入。
-    assert varying.recipe == "vadds"
-    assert "1.0" in str(varying.args[1].scalar)
-    assert segment.stores[0].reduce.accumulate
+    assert segment.reduce is None
+    value = segment.stores[0].value
+    assert value.recipe == "vadds"
+    assert "1.0" in str(value.args[-1].scalar)
     ops = _emitted_ops(emit_plan(segment))
-    assert "tl.simd.vadds" in ops and "tl.simd.vcadd" in ops
+    assert "tl.simd.vadds" in ops and "tl.simd.vcadd" not in ops
 
 
 def test_defect_d6_two_reductions_in_one_nest_are_both_emitted():
-    """D6 已修：同一 nest 内两条归约各自发射（两条独立累加链 + 两次 ONEPT 回写）。"""
+    """D6 已修：同一 nest 内两条归约各自保留（不再只发第一条）。
+
+    沿并行轴 i 向量化后两条 store 都是逐 lane 读改写：两次 ``vadd`` + 两次 ``vsts``。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1828,19 +1862,18 @@ def test_defect_d6_two_reductions_in_one_nest_are_both_emitted():
                     s2[i] = s2[i] + b[i, j]
 
     segment = _single_segment(k)
-    assert [s.reduce is not None for s in segment.stores] == [True, True]
+    assert [s.reduce for s in segment.stores] == [None, None]
     ops = _emitted_ops(emit_plan(segment))
-    # 两条归约都要回写（两次 ONEPT vsts）与两次跨 lane 归约，不得静默丢 store。
+    # 两条 store 都要回写（两次 vsts）与两次逐 lane 加法，不得静默丢 store。
     assert ops.count("tl.simd.vsts") >= 2
-    assert ops.count("tl.simd.vcadd") == 2
+    assert ops.count("tl.simd.vadd") == 2
+    assert "tl.simd.vcadd" not in ops
 
 
 def test_defect_d13_lane_varying_overwrite_is_not_a_reduction():
-    """D13 已修（统一判据）：``s[i] = a[i,j] + 1.0`` 是「后写覆盖」，不再被静默发成求和。
+    """D13 已修（统一判据）：``s[i] = a[i,j] + 1.0`` 是「后写覆盖」，不会被静默发成求和。
 
-    归约的唯一判据是累加形式 ``dst = dst op x``；取值不读 ``s`` 时明确拒绝（原先会被当成
-    ``vadd`` 归约发成 ``vcadd`` 求和 → 结果错误且无诊断）。
-    """
+    沿并行轴 i 向量化后是逐 lane 的 ``vadds`` + ``vsts``（j 循环保留），不发 ``vcadd``。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1851,16 +1884,17 @@ def test_defect_d13_lane_varying_overwrite_is_not_a_reduction():
             for i, j in T.Parallel(MS, KS):
                 s[i] = a[i, j] + 1.0
 
-    with pytest.raises(Unsupported, match="accumulate form"):
-        _single_segment(k)
+    plan = _single_segment(k)
+    assert plan.reduce is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vadds" in ops and "tl.simd.vcadd" not in ops
 
 
 def test_defect_d5_scaled_old_value_is_rejected():
-    """D5/D13：旧值被缩放（``s[i] = s[i] * 2.0 + a[i,j]``）无法安全剥离 → 明确拒绝。
+    """D5/D13：旧值被缩放（``s[i] = s[i] * 2.0 + a[i,j]``）不再需要拒绝。
 
-    旧值必须作为归约算子的**直接操作数**；被缩放的旧值无法用「末尾并入一次旧值」表达，
-    因此拒绝而不是静默丢掉缩放系数。
-    """
+    沿并行轴 i 向量化是逐 lane 读改写：``vmuls(s, 2.0) → vadd(a) → vsts``，
+    缩放系数完整保留，与标量语义一致。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1872,12 +1906,16 @@ def test_defect_d5_scaled_old_value_is_rejected():
                 for j in T.serial(KS):
                     s[i] = s[i] * 2.0 + a[i, j]
 
-    with pytest.raises(Unsupported, match="accumulate position"):
-        _single_segment(k)
+    plan = _single_segment(k)
+    assert plan.reduce is None
+    ops = _emitted_ops(emit_plan(plan))
+    assert "tl.simd.vmuls" in ops and "tl.simd.vadd" in ops and "tl.simd.vcadd" not in ops
 
 
 def test_defect_d6b_mixed_reductions_keep_their_own_recipe():
-    """D6 已修：同一 nest 内求和与求最大**各自**用自己的归约原语（不再只认第一条）。"""
+    """D6 已修：同一 nest 内求和与求最大**各自**保留自己的算子。
+
+    沿并行轴向量化后分别是 ``vadd`` 与 ``vmax``（不再是跨 lane 的 ``vcadd``/``vcmax``）。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1898,13 +1936,17 @@ def test_defect_d6b_mixed_reductions_keep_their_own_recipe():
                     s2[i] = T.max(s2[i], b[i, j])
 
     segment = _single_segment(k)
-    assert [store.reduce.recipe for store in segment.stores] == ["vcadd", "vcmax"]
+    assert [store.reduce for store in segment.stores] == [None, None]
     ops = _emitted_ops(emit_plan(segment))
-    assert "tl.simd.vcadd" in ops and "tl.simd.vcmax" in ops
+    assert "tl.simd.vadd" in ops and "tl.simd.vmax" in ops
+    assert "tl.simd.vcadd" not in ops and "tl.simd.vcmax" not in ops
 
 
 def test_reduce_segment_with_uniform_broadcast_sibling():
-    """归约段内「取值沿轴均匀」的 store 是一次广播写：既不参与归约，也不被丢掉。"""
+    """归约段内「取值沿轴均匀」的 store 是一次广播写：既不参与归约，也不被丢掉。
+
+    沿并行轴 i 向量化后：``s1[i] += a[i,j]`` 是逐 lane 读改写，``s2[i] = 3.0``
+    是广播写（``vdup`` + ``vsts``）。"""
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1918,11 +1960,11 @@ def test_reduce_segment_with_uniform_broadcast_sibling():
                 s2[i] = 3.0
 
     segment = _single_segment(k)
-    assert segment.reduce is not None
-    assert [store.reduce is not None for store in segment.stores] == [True, False]
+    assert segment.reduce is None
+    assert [store.reduce for store in segment.stores] == [None, None]
     ops = _emitted_ops(emit_plan(segment))
-    assert "tl.simd.vcadd" in ops
-    assert ops.count("tl.simd.vsts") == 2  # 归约回写 + 广播写各一次
+    assert "tl.simd.vadd" in ops and "tl.simd.vdup" in ops
+    assert ops.count("tl.simd.vsts") >= 2  # 读改写回写 + 广播写各一次
 
 
 def test_defect_d13_stencil_shifted_read_is_not_an_accumulation():
@@ -1945,13 +1987,10 @@ def test_defect_d13_stencil_shifted_read_is_not_an_accumulation():
         _single_segment(k)
 
 
-def test_partial_reduction_on_absorbed_serial_axis_is_rejected():
-    """A0（新）：吸收的 serial 轴上的「部分归约」没有向量形式 → 明确拒绝。
-
-    ``s[2*i] += a[i,j]``（lane 均匀地址 + 逐 lane 变化取值）与 ``u[i,j] = s[2*i]`` 混在同一
-    serial 体里时，逐元素路径会用 ``ONEPT`` 只保留 lane 0，把其余迭代的累加静默丢掉
-    （``s`` 只累加 2/128 项）。多段路径强制以 serial 轴为向量轴，因此必须拒绝。
-    """
+def test_partial_reduction_uses_parallel_axis_in_multi_segment():
+    """A0：``s[2*i] += a[i,j]`` + ``u[i,j] = s[2*i]`` 的段沿 serial 轴 j 是「部分归约」
+    （lane 均匀地址 + 逐 lane 变化取值）→ 该轴被拒绝，轴回退到并行轴 i：
+    ``s[2*i]`` 沿 i 是步长地址、逐 lane 互不冲突，语义正确。"""
     MS, KS = 8, 128
 
     @T.prim_func
@@ -1967,9 +2006,12 @@ def test_partial_reduction_on_absorbed_serial_axis_is_rejected():
                 for j in T.serial(KS):
                     u[i, j] = a[i, j] * 2.0
 
-    with pytest.raises(Unsupported) as err:
-        _single_segment(k)
-    assert any("partial reduction" in note for note in err.value.diagnostics)
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert len(program.segments) == 2
+    assert program.segments[0].vector_axis.name == "i"
+    assert program.segments[0].reduce is None
+    emit_plan(program)  # build 成功 ⇒ emit 成功
 
 
 def test_partial_reduction_falls_back_to_the_parallel_axis():
@@ -2088,8 +2130,87 @@ def test_defect_d9_symbolic_extent_is_not_silently_truncated():
     assert any(isinstance(node, tirx.Min) for node in _call_args(stmt, "tl.simd.update_mask"))
 
 
-def test_symbolic_extent_reduction_is_rejected():
-    """D9 归约分支：chunk 循环是编译期展开的，符号 extent 无法展开 → 明确拒绝（不静默少算）。"""
+def _alloc_buffers(stmt) -> list:
+    """收集发射 TIR 里的 ``AllocBuffer`` 语句（归约的可变寄存器累加器）。"""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.AllocBuffer):
+            found.append(node.buffer)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return found
+
+
+def test_short_reduction_is_unrolled_with_multiple_accumulator_chains():
+    """短归约（``chunks <= 4``）：编译期展开 + 多条 SSA 累加链 + 树形合并。
+
+    ``(4, 256)`` / lanes 64 → 4 个 chunk、无尾块：4 条链各自只含一块（链首直接取
+    ``vcadd`` 结果，不需要 ``vdup`` 单位元），再两两合并。串行延迟从 4 级降到 2 级。
+    """
+    M, K = 4, 256
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((M,), "float32")
+            for i, j in T.Parallel(M, K):
+                s[i] = s[i] + a[i, j]
+
+    plan = _single_segment(k)
+    assert plan.chunks == 4 and plan.tail == 0
+    stmt = emit_plan(plan)
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vcadd") == 4  # 展开：每个 chunk 各一次
+    # 3 次树形合并是向量 `vadd`（PAT_VL1，只算 lane 0）；并入旧值走标量-向量 `vadds`。
+    assert ops.count("tl.simd.vadd") == 3
+    assert ops.count("tl.simd.vadds") == 1
+    assert "tl.simd.vdup" not in ops  # 链首直接取 vcadd 结果，不再需要单位元
+    assert not _alloc_buffers(stmt)  # 展开路径不引入可变寄存器
+    # 旧值按标量读一次并入，不再有 BRC 广播装载。
+    assert "BRC_B32" not in str(stmt)
+    # 跨 lane 归约之后的合并/回写都用只保留 lane 0 的谓词。
+    assert 'pset(32, "PAT_VL1")' in str(stmt)
+
+
+def test_long_reduction_keeps_a_real_chunk_loop_with_a_mutable_accumulator():
+    """长归约（``chunks > 4``）：不再展开，改回真实 chunk 循环 + ``local.var`` 累加器。
+
+    ``(2, 512)`` / lanes 64 → 8 个 chunk。展开会线性膨胀 8×3 条指令且关键路径仍是 8 级；
+    循环版只有一条 ``vcadd``，累加器落成可写向量寄存器（codegen 发 ``vector_f32``）。
+    """
+    M, K = 2, 512
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float32"), S: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((M,), "float32")
+            for i, j in T.Parallel(M, K):
+                s[i] = s[i] + a[i, j]
+
+    plan = _single_segment(k)
+    assert plan.chunks == 8
+    stmt = emit_plan(plan)
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vcadd") == 1  # 循环体内只有一份
+    assert "tl.simd.vadd" in ops
+    accumulators = _alloc_buffers(stmt)
+    assert [buffer.scope() for buffer in accumulators] == ["local.var"]
+    assert str(accumulators[0].dtype) == "float32x64"
+    kinds = _for_kinds(stmt)
+    assert kinds.count(tirx.ForKind.SERIAL) == 2  # 外层并行轴 i + chunk 循环
+    chunk_loops = [extent for extent in _for_extents(stmt) if isinstance(extent, tirx.IntImm) and int(extent.value) == 7]
+    assert chunk_loops, "expected a 7-iteration full-chunk loop (chunks-1, tail == 0)"
+
+
+def test_symbolic_extent_reduction_uses_a_runtime_chunk_loop():
+    """符号 extent 归约（D9 归约分支）：不再拒绝，改走「整块主循环 + peel 尾块」。
+
+    主循环跑 ``E // lanes`` 个满 lane 整块；尾块在 ``if E % lanes > 0`` 下执行一次，
+    运行期 ``update_mask`` 夹紧后交给 ``vcadd``（Add 单位元是 0，无需 ``vsel`` 填充）。
+    """
     n = tirx.Var("n", "int32")
 
     @T.prim_func
@@ -2100,8 +2221,15 @@ def test_symbolic_extent_reduction_is_rejected():
             for i in T.Parallel(n):
                 s[0] = s[0] + a[i]
 
-    with pytest.raises(Unsupported, match="compile-time"):
-        _single_segment(k)
+    segment = _single_segment(k)
+    assert segment.chunks is None
+    stmt = emit_plan(segment)
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vcadd") == 2  # 主循环体 + peel 尾块各一份（未按 extent 展开）
+    assert "tl.simd.vsel" not in ops  # Add 不需要单位元填充
+    assert any(not isinstance(extent, tirx.IntImm) for extent in _for_extents(stmt))
+    assert any(isinstance(node, tirx.Min) for node in _call_args(stmt, "tl.simd.update_mask"))
+    assert [buffer.scope() for buffer in _alloc_buffers(stmt)] == ["local.var"]
 
 
 def test_defect_d10_non_reduction_tail_load_is_bounded():
@@ -2171,24 +2299,31 @@ def _one_dimensional_copy(M):
 
 
 def test_tail_chunk_loop_runs_exactly_one_iteration():
-    """P0：尾块循环必须是**单次**迭代 ``[chunks-1, chunks)``。
+    """P0：尾块必须只覆盖最后一个 chunk ``[chunks-1, chunks)``。
 
     ``tirx.For(var, min, extent)`` 的第三个参数是 extent（不是 end）。旧实现写成
-    ``For(tailchunk, full, chunks)``，于是从 ``full`` 起跑 ``chunks`` 次：``(100,)``
-    上会按 36 个有效 lane 写 ``c[128..163]``（缓冲区只有 100 个元素）——越界读写。
+    ``For(tailchunk, full, chunks)``，于是从 ``full`` 起跑 ``chunks`` 次，导致越界读写。
+    尾块现在展开成**直线代码**，因此这里分两种形态检查：整块循环的并集必须恰好是
+    ``[0, chunks-1)``（有尾块时），或者全部展开时每个 chunk 恰好一次写。
     """
     lanes = 64
     for M in (100, 200, 300):
         chunks = (M + lanes - 1) // lanes
-        iterations = _chunk_iterations(emit_plan(_single_segment(_one_dimensional_copy(M))))
-        assert iterations, "expected a strip-mined chunk loop"
+        stmt = emit_plan(_single_segment(_one_dimensional_copy(M)))
+        assert not _over_reading_contiguous_load(stmt), f"M={M}: contiguous load escapes the buffer"
+        iterations = _chunk_iterations(stmt)
+        if not iterations:
+            # 单/双 chunk 全部展开：每个 chunk 恰好一次写（含尾块掩码写）。
+            assert _emitted_ops(stmt).count("tl.simd.vsts") == chunks, f"M={M}"
+            continue
         covered: list = []
         for name, lo, extent in iterations:
             assert lo is not None and extent is not None, f"{name}: non-constant chunk span"
             assert lo >= 0 and lo + extent <= chunks, f"M={M}: chunk loop {name} escapes [0, {chunks})"
             covered.extend(range(lo, lo + extent))
-        # 所有 chunk 循环的并集必须**恰好**是 [0, chunks)：不多跑（越界）也不少跑。
-        assert sorted(covered) == list(range(chunks)), f"M={M}: chunk coverage {sorted(covered)} != [0, {chunks})"
+        # 尾块展开后，剩下的整块循环必须**恰好**覆盖 [0, chunks-1)：不多跑（越界）也不少跑。
+        expected = list(range(chunks - 1)) if M % lanes else list(range(chunks))
+        assert sorted(covered) == expected, f"M={M}: chunk coverage {sorted(covered)} != {expected}"
 
 
 def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():
@@ -2218,12 +2353,15 @@ def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():
 
     plan = build_plan(_first_parallel(k))
     segment = plan.segments[0]
-    assert segment.vector_axis.name == "j"  # serial 主体被向量化
+    assert segment.vector_axis.name == "i"  # 并行主体被向量化，serial 轴保留为循环
+    assert segment.reduce is None
     assert [store.kind for store in segment.pre_stores] == [AccessClass.UNIFORM]
     stmt = emit_plan(plan)  # build 成功 ⇒ emit 成功
     ops = _emitted_ops(stmt)
     assert "tl.simd.vmuls" in ops  # 主体照常向量化
-    assert "ONEPT_B32" in str(stmt)  # pre 语句：一次单元素写
+    # pre 与所有轴无关 → 提到最外层、退化成一次**标量** store（不再 vdup + ONEPT）。
+    assert "c[b[0]] = T.float32(1.0)" in str(stmt)
+    assert "ONEPT_B32" not in str(stmt)
 
 
 def test_lane_invariant_indirect_load_is_uniform():
