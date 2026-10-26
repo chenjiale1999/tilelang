@@ -200,6 +200,18 @@ public:
     StmtExprVisitor::VisitStmt_(op);
   }
 
+  void VisitStmt_(const EvaluateNode *op) final {
+    // A bare Evaluate is an effectful/opaque statement. The region capture
+    // only models values and BufferStores, so lifting it would silently drop
+    // the effect. Reject it here instead of letting it pass A/B/C.
+    if (depth_ > 0) {
+      unsupported = true;
+      unsupported_reason = "opaque Evaluate inside T.Parallel";
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitExpr_(const CallNode *op) final {
     if (depth_ > 0 && !unsupported) {
       const auto *callee = op->op.as<OpNode>();
@@ -209,6 +221,11 @@ public:
             name.rfind("tl.ascend_", 0) == 0) {
           unsupported = true;
           unsupported_reason = "TileOp/copy inside T.Parallel";
+          return;
+        }
+        if (name == "tirx.call_extern" || name == "tirx.call_pure_extern") {
+          unsupported = true;
+          unsupported_reason = "opaque call_extern inside T.Parallel";
           return;
         }
       }

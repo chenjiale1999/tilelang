@@ -318,7 +318,7 @@ private:
 
   void AnalyzeVF(const SBlockNode *vf) {
     ManualDetector manual;
-    manual(vf->body);
+    manual(ffi::GetRef<SBlock>(vf));
     if (manual.manual) {
       VSimdCaptureInfo info;
       info.vf_index = vf_index_;

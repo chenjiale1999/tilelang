@@ -251,6 +251,49 @@ def test_alloc_var_outside_opaque():
     assert _info(main)[0]["status"] == "OPAQUE"
 
 
+def test_alloc_var_unused_inside_opaque():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                v = T.alloc_var("float32", init=0.0)
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i]
+            T.copy(c_ub, C)
+
+    report = _report(main)
+    assert "status=OPAQUE" in report
+    assert "local.var" in report
+    assert _info(main)[0]["status"] == "OPAQUE"
+
+
+def test_opaque_evaluate_opaque():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n):
+                    T.evaluate(
+                        T.call_extern(
+                            "float32", "opaque_side_effect", a_ub[i]
+                        )
+                    )
+
+    report = _report(main)
+    assert "status=OPAQUE" in report
+    assert "opaque Evaluate" in report
+    assert _info(main)[0]["status"] == "OPAQUE"
+
+
 def test_no_vf_reports_empty():
     @T.prim_func
     def main(A: T.Tensor((16,), "float32")):

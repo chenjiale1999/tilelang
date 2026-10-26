@@ -541,7 +541,7 @@ public:
 
   void AnalyzeVF(const SBlock &vf, int index) {
     ManualDetector manual;
-    manual(vf->body);
+    manual(vf);
     if (manual.manual) {
       *out_ << "VF#" << index << " status=OPAQUE\n";
       *out_ << "  message: manual SIMD / nd2nz / local.var\n";
