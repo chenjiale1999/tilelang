@@ -25,7 +25,8 @@ using ffi::String;
 
 namespace {
 
-static std::string AccessString(const AccessInfo &acc) {
+static std::string AccessString(const VSimdAccess &wrapped) {
+  const AccessInfo &acc = wrapped.access;
   std::ostringstream os;
   os << (acc.is_write ? "W " : "R ") << acc.buffer->name << "[";
   for (size_t i = 0; i < acc.indices.size(); ++i) {
@@ -36,13 +37,59 @@ static std::string AccessString(const AccessInfo &acc) {
   os << "]";
   if (acc.is_write && acc.value.defined())
     os << " = " << acc.value;
+  os << " shape=[";
+  for (size_t i = 0; i < wrapped.value_shape.size(); ++i) {
+    if (i)
+      os << ",";
+    os << wrapped.value_shape[i];
+  }
+  os << "] axes=[";
+  for (size_t i = 0; i < wrapped.value_axes.size(); ++i) {
+    if (i)
+      os << ",";
+    os << wrapped.value_axes[i];
+  }
+  os << "] dep={";
+  for (size_t i = 0; i < wrapped.dep_axes.size(); ++i) {
+    if (i)
+      os << ",";
+    os << wrapped.dep_axes[i];
+  }
+  os << "}";
   return os.str();
+}
+
+static bool ExprUsesVar(const PrimExpr &expr, const Var &var) {
+  if (!expr.defined())
+    return false;
+  for (const Var &used : tirx::UndefinedVars(expr)) {
+    if (used.same_as(var))
+      return true;
+  }
+  return false;
+}
+
+static std::vector<int> ComputeDepAxes(const AccessInfo &acc,
+                                       const std::vector<LoopInfo> &domain) {
+  std::vector<int> dep;
+  for (size_t axis = 0; axis < domain.size(); ++axis) {
+    bool used = false;
+    for (const PrimExpr &index : acc.indices) {
+      if (ExprUsesVar(index, domain[axis].var)) {
+        used = true;
+        break;
+      }
+    }
+    if (used)
+      dep.push_back(static_cast<int>(axis));
+  }
+  return dep;
 }
 
 } // namespace
 
-VSimdRegionLift BuildMinimal1DRegion(const VSimdCaptureInfo &info,
-                                     const std::string &memory_status) {
+VSimdRegionLift BuildMinimalRegion(const VSimdCaptureInfo &info,
+                                   const std::string &memory_status) {
   VSimdRegionLift result;
   if (info.status != "CLOSED") {
     result.reason = "capture/scope is not CLOSED";
@@ -52,8 +99,8 @@ VSimdRegionLift BuildMinimal1DRegion(const VSimdCaptureInfo &info,
     result.reason = "memory legality is " + memory_status;
     return result;
   }
-  if (info.domain.size() != 1) {
-    result.reason = "PR-C minimal lift only supports one T.Parallel level";
+  if (info.domain.empty()) {
+    result.reason = "region requires at least one T.Parallel axis";
     return result;
   }
 
@@ -78,7 +125,16 @@ VSimdRegionLift BuildMinimal1DRegion(const VSimdCaptureInfo &info,
   result.region.vf_index = info.vf_index;
   result.region.nest_index = info.nest_index;
   result.region.domain = info.domain;
-  result.region.accesses = info.accesses;
+  for (const AccessInfo &acc : info.accesses) {
+    VSimdAccess wrapped;
+    wrapped.access = acc;
+    wrapped.dep_axes = ComputeDepAxes(acc, info.domain);
+    for (size_t axis = 0; axis < info.domain.size(); ++axis) {
+      wrapped.value_axes.push_back(static_cast<int>(axis));
+      wrapped.value_shape.push_back(info.domain[axis].extent);
+    }
+    result.region.accesses.push_back(std::move(wrapped));
+  }
   result.region.captures = info.captures;
   result.region.outer_vars = info.outer_vars;
   result.region.shape_syms = info.shape_syms;
@@ -98,6 +154,16 @@ VSimdRegionLift BuildMinimal1DRegion(const VSimdCaptureInfo &info,
     result.reason = "internal expander verification failed: " + verify.reason;
   }
   return result;
+}
+
+VSimdRegionLift BuildMinimal1DRegion(const VSimdCaptureInfo &info,
+                                     const std::string &memory_status) {
+  if (info.domain.size() != 1) {
+    VSimdRegionLift result;
+    result.reason = "PR-C minimal lift only supports one T.Parallel level";
+    return result;
+  }
+  return BuildMinimalRegion(info, memory_status);
 }
 
 std::string DumpVSimdRegion(const VSimdRegion &region) {
@@ -145,28 +211,25 @@ std::string DumpVSimdRegion(const VSimdRegion &region) {
     os << "\n";
   }
   os << "  accesses:\n";
-  for (const AccessInfo &acc : region.accesses)
-    os << "    " << AccessString(acc) << "\n";
+  for (const VSimdAccess &wrapped : region.accesses)
+    os << "    " << AccessString(wrapped) << "\n";
   return os.str();
 }
 
 Stmt ExpandVSimdRegionToLoops(const VSimdRegion &region) {
   std::vector<Stmt> stores;
-  for (const AccessInfo &acc : region.accesses) {
+  for (const VSimdAccess &wrapped : region.accesses) {
+    const AccessInfo &acc = wrapped.access;
     if (acc.is_write)
       stores.push_back(BufferStore(acc.buffer, acc.value, acc.indices));
   }
   if (stores.empty())
     return Evaluate(0);
-  Stmt body = stores.size() == 1 ? stores[0] : SeqStmt(stores);
-  Stmt result;
-  if (region.domain.empty()) {
-    result = body;
-  } else {
-    const LoopInfo &loop = region.domain[0];
-    // Reference expansion is intentionally a serial scalar loop; it is a
-    // semantic oracle, not the P3 physical lowering.
-    result = For(loop.var, loop.min, loop.extent, ForKind::kSerial, body);
+  Stmt result = stores.size() == 1 ? stores[0] : SeqStmt(stores);
+  // Reference expansion is intentionally serial scalar loops; it is a
+  // semantic oracle, not the P3 physical lowering.
+  for (auto it = region.domain.rbegin(); it != region.domain.rend(); ++it) {
+    result = For(it->var, it->min, it->extent, ForKind::kSerial, result);
   }
   // T.view aliases are DeclBuffer definitions, not allocations. They must be
   // declared before the reconstructed loop or the expanded IR references an
@@ -255,26 +318,28 @@ VSimdRegionVerify VerifyExpandedRegion(const VSimdRegion &region,
       return result;
     }
   } else {
-    if (verify.loops.size() != 1) {
+    if (verify.loops.size() != region.domain.size()) {
       result.ok = false;
       result.reason = "expanded loop count does not match region domain";
       return result;
     }
-    const ForNode *loop = verify.loops[0];
-    const LoopInfo &domain = region.domain[0];
-    if (!loop->loop_var.same_as(domain.var) ||
-        !ffi::StructuralEqual()(loop->min, domain.min) ||
-        !ffi::StructuralEqual()(loop->extent, domain.extent)) {
-      result.ok = false;
-      result.reason = "expanded domain does not match region domain";
-      return result;
+    for (size_t i = 0; i < region.domain.size(); ++i) {
+      const ForNode *loop = verify.loops[i];
+      const LoopInfo &domain = region.domain[i];
+      if (!loop->loop_var.same_as(domain.var) ||
+          !ffi::StructuralEqual()(loop->min, domain.min) ||
+          !ffi::StructuralEqual()(loop->extent, domain.extent)) {
+        result.ok = false;
+        result.reason = "expanded domain does not match region domain";
+        return result;
+      }
     }
   }
 
   std::vector<const AccessInfo *> writes;
-  for (const AccessInfo &acc : region.accesses) {
-    if (acc.is_write)
-      writes.push_back(&acc);
+  for (const VSimdAccess &wrapped : region.accesses) {
+    if (wrapped.access.is_write)
+      writes.push_back(&wrapped.access);
   }
   if (verify.stores.size() != writes.size()) {
     result.ok = false;
@@ -313,7 +378,7 @@ String AnalyzeVSimdRegionReport(const PrimFunc &func) {
                 static_cast<size_t>(info.vf_index) < statuses.size()
             ? statuses[info.vf_index]
             : "MISSING";
-    VSimdRegionLift lift = BuildMinimal1DRegion(info, memory_status);
+    VSimdRegionLift lift = BuildMinimalRegion(info, memory_status);
     out << "VF#" << info.vf_index << " nest " << info.nest_index << ": ";
     if (!lift.lifted) {
       if (lift.internal_error) {
