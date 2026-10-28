@@ -36,9 +36,11 @@ namespace tl {
  */
 struct VSimdAccess {
   vsimd::AccessInfo access;
-  std::vector<int> dep_axes;      // axes used by access.indices only
-  std::vector<int> value_axes;    // v1: domain axes; future: value axes
+  std::vector<int> dep_axes;         // axes used by access.indices only
+  std::vector<int> value_axes;       // v1: domain axes; future: value axes
   std::vector<PrimExpr> value_shape; // v1: domain extents; future: value shape
+  bool has_layout{false};            // buffer has a layout annotation
+  Layout layout;                     // preserved context, not a physical op
 };
 
 /*!

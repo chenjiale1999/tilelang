@@ -56,6 +56,7 @@ static std::string AccessString(const VSimdAccess &wrapped) {
     os << wrapped.dep_axes[i];
   }
   os << "}";
+  os << " layout=" << (wrapped.has_layout ? "annotated" : "none");
   return os.str();
 }
 
@@ -132,6 +133,13 @@ VSimdRegionLift BuildMinimalRegion(const VSimdCaptureInfo &info,
     for (size_t axis = 0; axis < info.domain.size(); ++axis) {
       wrapped.value_axes.push_back(static_cast<int>(axis));
       wrapped.value_shape.push_back(info.domain[axis].extent);
+    }
+    for (const auto &layout : info.layouts) {
+      if (layout.first->data.same_as(acc.buffer->data)) {
+        wrapped.has_layout = true;
+        wrapped.layout = layout.second;
+        break;
+      }
     }
     result.region.accesses.push_back(std::move(wrapped));
   }
