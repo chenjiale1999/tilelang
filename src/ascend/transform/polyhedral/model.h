@@ -47,6 +47,15 @@ class StorePlanNode : public ffi::Object {
   ffi::Optional<ValueNode> promote;
   int64_t mask_free_until{0};
   ffi::Optional<int64_t> mask_free_from;
+  // Mixed element widths in one segment (Stage 1): ``store_lanes`` is the
+  // natural vector-register width of this store's element type, while the
+  // segment's chunk width is ``VectorPlan.lanes``. ``store_lane_mode`` is
+  // ``full`` when they match, otherwise the store writes ``plan.lanes`` of its
+  // own register lanes and must be emitted in the packed form
+  // (``PK_B*`` / ``PK4_B*``) whose suffix is ``store_pack_bits``.
+  int64_t store_lanes{0};
+  ffi::String store_lane_mode{"full"};
+  ffi::Optional<int64_t> store_pack_bits;
 
   static constexpr const bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StorePlan", StorePlanNode,
@@ -64,7 +73,10 @@ class StorePlanNode : public ffi::Object {
         .def_ro("reduce", &StorePlanNode::reduce)
         .def_ro("promote", &StorePlanNode::promote)
         .def_ro("mask_free_until", &StorePlanNode::mask_free_until)
-        .def_ro("mask_free_from", &StorePlanNode::mask_free_from);
+        .def_ro("mask_free_from", &StorePlanNode::mask_free_from)
+        .def_ro("store_lanes", &StorePlanNode::store_lanes)
+        .def_ro("store_lane_mode", &StorePlanNode::store_lane_mode)
+        .def_ro("store_pack_bits", &StorePlanNode::store_pack_bits);
   }
 };
 

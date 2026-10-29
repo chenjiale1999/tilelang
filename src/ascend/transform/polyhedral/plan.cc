@@ -734,23 +734,138 @@ std::string PyBufferDtypeName(const tirx::Buffer& buffer) {
   return ffi::DLDataTypeToString(buffer->dtype).operator std::string();
 }
 
-void RequireUniformElementWidth(const std::vector<StoreSpec>& specs) {
-  std::map<int, tirx::Buffer> widths;
-  for (const StoreSpec& spec : specs) {
-    widths[MaskBits(ElemDtype(PyBufferDtypeName(spec->buffer)))] = spec->buffer;
+/*! \brief Natural vector-register width of a store's element type (2048/bits). */
+int64_t StoreRegisterLanes(const StoreSpec& spec) {
+  return VRegLanes(ElemDtype(PyBufferDtypeName(spec->buffer)));
+}
+
+/*! \brief Element bit width shared by every load inside ``expr`` (0 = unknown/mixed). */
+int CommonLoadBits(const PrimExpr& expr) {
+  int bits = 0;
+  bool mixed = false;
+  tirx::PostOrderVisit(expr, [&](const ffi::ObjectRef& node) {
+    const auto* load = node.as<tirx::BufferLoadNode>();
+    if (load == nullptr) return;
+    int width = load->buffer->dtype.bits();
+    if (bits == 0) {
+      bits = width;
+    } else if (bits != width) {
+      mixed = true;
+    }
+  });
+  return mixed ? 0 : bits;
+}
+
+/*!
+ * \brief Register lanes of a genuine narrowing conversion, if any.
+ *
+ * A cast only narrows the *register* when the converted expression is itself a
+ * full register of its own element type: every load inside it must share that
+ * element width (``cast(bf16, f32_load)``). A cast that merely closes a
+ * widening round trip (``f16 load -> f32 arithmetic -> f16 store``) keeps the
+ * store's own register and must not shrink the chunk.
+ */
+std::optional<int64_t> NarrowingSourceLanes(const PrimExpr& value,
+                                            const tirx::Buffer& buffer) {
+  const auto* cast = value.as<tirx::CastNode>();
+  if (cast == nullptr) return std::nullopt;
+  if (cast->value.dtype().bits() <= buffer->dtype.bits()) return std::nullopt;
+  if (CommonLoadBits(cast->value) != cast->value.dtype().bits()) return std::nullopt;
+  return VRegLanes(ElemDtype(ffi::DLDataTypeToString(cast->value.dtype())));
+}
+
+/*!
+ * \brief Lanes of the vector a store hands to its write port.
+ *
+ * A narrowing conversion fills only ``VRegLanes(src)`` lanes of the wider
+ * destination register; every other recipe produces a full destination
+ * register.
+ */
+int64_t ProducedLanes(const PrimExpr& value, const tirx::Buffer& buffer) {
+  std::optional<int64_t> narrowed = NarrowingSourceLanes(value, buffer);
+  if (narrowed.has_value()) return *narrowed;
+  return VRegLanes(ElemDtype(PyBufferDtypeName(buffer)));
+}
+
+/*!
+ * \brief Pick the chunk width of one segment (mixed element widths, Stage 1).
+ *
+ * The chunk covers ``lanes`` logical elements; a store whose element type has
+ * ``2048 / bits`` register lanes writes exactly ``lanes`` of them, so every
+ * store width must be ``lanes``, ``2 * lanes`` or ``4 * lanes``. Stage 1 keeps
+ * the model deliberately narrow:
+ *
+ *  - ``lanes`` is the smallest width the stores actually produce, so one chunk
+ *    is never wider than the data a store hands to its write port;
+ *  - a store wider than the chunk must be a narrowing conversion whose source
+ *    register is exactly ``lanes`` wide (it is emitted in the packed form);
+ *  - mixed widths with sibling (``pre``/``post``) statements or a statement
+ *    predicate are rejected here; the extent and access-shape checks live in
+ *    ``BuildPlanForAxis`` once the vector axis is known.
+ */
+int64_t SelectSegmentLanes(const SegmentSpecs& specs,
+                           std::optional<int64_t> override_lanes) {
+  int64_t min_effective = 0;
+  for (const StoreSpec& spec : specs.main_specs) {
+    int64_t effective =
+        std::min(StoreRegisterLanes(spec), ProducedLanes(spec->value, spec->buffer));
+    min_effective = min_effective == 0 ? effective : std::min(min_effective, effective);
   }
-  if (widths.size() <= 1) return;
-  std::string detail;
-  bool first = true;
-  for (const auto& entry : widths) {
-    detail += (first ? "" : ", ") + entry.second->name.operator std::string() + ":" +
-              ElemDtype(PyBufferDtypeName(entry.second)) + " (" +
-              std::to_string(entry.first) + "bit)";
-    first = false;
+  if (min_effective == 0) return override_lanes.value_or(0);
+  int64_t lanes = override_lanes.value_or(min_effective);
+  if (lanes <= 0) return min_effective;
+
+  bool mixed = false;
+  for (const StoreSpec& spec : specs.main_specs) {
+    int64_t register_lanes = StoreRegisterLanes(spec);
+    std::string name = spec->buffer->name.operator std::string();
+    if (register_lanes % lanes != 0 || register_lanes / lanes > 4) {
+      throw Unsupported("store '" + name + "' has " + std::to_string(register_lanes) +
+                        " register lanes, which the segment chunk width " +
+                        std::to_string(lanes) + " cannot cover (split the nest)");
+    }
+    if (register_lanes / lanes > 1) mixed = true;
   }
-  throw Unsupported(
-      "mixed element widths in one vector segment (" + detail +
-      "): every store of a segment must have the same element bit width because the chunk stride is shared; split the nest or stage an explicit cast");
+  if (!mixed) return lanes;
+
+  if (!specs.pre_specs.empty() || !specs.post_specs.empty()) {
+    throw Unsupported(
+        "mixed element widths in one segment are only supported without sibling statements "
+        "around the loop; split the nest or stage an explicit cast");
+  }
+  for (const StoreSpec& spec : specs.main_specs) {
+    int64_t register_lanes = StoreRegisterLanes(spec);
+    int64_t ratio = register_lanes / lanes;
+    std::string name = spec->buffer->name.operator std::string();
+    if (spec->mask.has_value()) {
+      throw Unsupported(
+          "mixed element widths in one segment are not supported with a statement predicate on "
+          "store '" +
+          name + "'");
+    }
+    const auto* cast = spec->value.as<tirx::CastNode>();
+    if (ratio == 1) {
+      if (cast != nullptr && cast->value.dtype().bits() < spec->buffer->dtype.bits()) {
+        throw Unsupported("store '" + name +
+                          "' widens its value inside a mixed-width segment; widening stores are "
+                          "not supported yet");
+      }
+      continue;
+    }
+    std::optional<int64_t> narrowed = NarrowingSourceLanes(spec->value, spec->buffer);
+    if (!narrowed.has_value()) {
+      throw Unsupported("store '" + name + "' needs " + std::to_string(ratio) +
+                        "x the segment chunk width " + std::to_string(lanes) +
+                        " but its value is not a narrowing conversion; split the nest or stage "
+                        "an explicit cast");
+    }
+    if (*narrowed != lanes) {
+      throw Unsupported("store '" + name + "' narrows from a " + std::to_string(*narrowed) +
+                        "-lane register but the segment chunk width is " +
+                        std::to_string(lanes) + " (split the nest)");
+    }
+  }
+  return lanes;
 }
 
 SegmentSpecs PrepareSegment(const std::vector<Axis>& axes,
@@ -769,10 +884,7 @@ SegmentSpecs PrepareSegment(const std::vector<Axis>& axes,
   }
   std::vector<StoreSpec> all = specs.AllSpecs();
   for (const StoreSpec& spec : all) RequireSupportedElement(spec->buffer);
-  RequireUniformElementWidth(all);
-
-  std::string elem = ElemDtype(PyBufferDtypeName(specs.main_specs[0]->buffer));
-  specs.lanes = lanes.has_value() ? *lanes : VRegLanes(elem);
+  specs.lanes = SelectSegmentLanes(specs, lanes);
 
   auto classify = [&](const std::vector<StoreSpec>& group) {
     std::vector<AccessInfo> infos;
@@ -1085,6 +1197,75 @@ std::vector<Axis> OuterAxes(const ffi::Array<Axis>& axes, const Axis& vector_axi
   return outer;
 }
 
+/*! \brief Whether the chunk is narrower than at least one store's register. */
+bool HasPartialLaneStore(const VectorPlan& plan) {
+  for (const StorePlan& store : plan->stores) {
+    if (store->store_lane_mode.operator std::string() != "full") return true;
+  }
+  return false;
+}
+
+/*! \brief Collect the register widths of every real load in a value DAG. */
+void CollectLoadLanes(const ValueNode& node, std::set<int64_t>* lanes) {
+  if (!node.defined()) return;
+  const std::string recipe = node->recipe.operator std::string();
+  if (recipe == "vload" || recipe == "vload_strided" || recipe == "gather") {
+    lanes->insert(VRegLanes(ElemDtype(node->dtype.operator std::string())));
+  }
+  for (const ffi::ObjectRef& arg : node->args) {
+    CollectLoadLanes(Downcast<ValueNode>(arg), lanes);
+  }
+  if (node->predicate.has_value()) {
+    CollectLoadLanes(Downcast<ValueNode>(*node->predicate), lanes);
+  }
+}
+
+/*!
+ * \brief Stage 1 guards for a segment whose chunk is narrower than some store.
+ *
+ * A partial-lane segment writes ``lanes`` elements per chunk out of a wider
+ * store register. It is only proved for straight-line, unpredicated,
+ * contiguous element-wise stores whose values load exactly ``lanes`` wide and
+ * whose extent divides evenly (no tail); everything else keeps falling back to
+ * the legacy lowering.
+ */
+void ValidatePartialLaneSegment(const VectorPlan& plan,
+                                const std::optional<int64_t>& extent, int64_t lanes) {
+  if (!extent.has_value()) {
+    throw Unsupported(
+        "mixed element widths in one segment require a static vector-axis extent that is a "
+        "multiple of the chunk width " +
+        std::to_string(lanes) + " (got a symbolic extent)");
+  }
+  if (*extent % lanes != 0) {
+    throw Unsupported(
+        "mixed element widths in one segment require the vector-axis extent (" +
+        std::to_string(*extent) + ") to be a multiple of the chunk width " +
+        std::to_string(lanes) + " (tails are not supported yet)");
+  }
+  for (const StorePlan& store : plan->stores) {
+    const std::string name = store->spec->buffer->name.operator std::string();
+    const std::string kind = store->kind_value.operator std::string();
+    if (kind != AccessClassName(AccessClass::kContiguous) &&
+        kind != AccessClassName(AccessClass::kUniform)) {
+      throw Unsupported(
+          "mixed element widths in one segment only support contiguous or uniform stores ('" +
+          name + "' is " + kind + ")");
+    }
+    std::set<int64_t> load_lanes;
+    CollectLoadLanes(store->value, &load_lanes);
+    if (store->mask.has_value()) CollectLoadLanes(*store->mask, &load_lanes);
+    if (store->index.has_value()) CollectLoadLanes(*store->index, &load_lanes);
+    for (int64_t width : load_lanes) {
+      if (width != lanes) {
+        throw Unsupported("mixed element widths in one segment require every load to be " +
+                          std::to_string(lanes) + "-lane wide (store '" + name +
+                          "' loads a " + std::to_string(width) + "-lane register)");
+      }
+    }
+  }
+}
+
 VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                             std::optional<Axis> serial_axis,
                             const std::vector<StoreSpec>& pre_specs,
@@ -1162,6 +1343,21 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     if (mask_free_from.has_value()) {
       store.CopyOnWrite()->mask_free_from = ffi::Optional<int64_t>(*mask_free_from);
     }
+    // Mixed element widths (Stage 1): record how many of this store's register
+    // lanes one chunk actually writes. ``full`` keeps the historical form.
+    int64_t register_lanes = VRegLanes(ElemDtype(PyBufferDtypeName(spec->buffer)));
+    int64_t ratio = lanes > 0 ? register_lanes / lanes : 1;
+    store.CopyOnWrite()->store_lanes = register_lanes;
+    if (ratio == 2) {
+      store.CopyOnWrite()->store_lane_mode = ffi::String("pk_half");
+    } else if (ratio == 4) {
+      store.CopyOnWrite()->store_lane_mode = ffi::String("pk_quarter");
+    } else {
+      store.CopyOnWrite()->store_lane_mode = ffi::String("full");
+    }
+    if (ratio > 1) {
+      store.CopyOnWrite()->store_pack_bits = ffi::Optional<int64_t>(2048 / lanes);
+    }
     return store;
   };
 
@@ -1180,6 +1376,11 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   plan.CopyOnWrite()->stores = stores;
   plan.CopyOnWrite()->pre_stores = pre_stores;
   plan.CopyOnWrite()->post_stores = post_stores;
+
+  // Mixed element widths (Stage 1): a chunk narrower than some store register
+  // is only proved for the straight-line element-wise subset.
+  const bool partial_lanes = HasPartialLaneStore(plan);
+  if (partial_lanes) ValidatePartialLaneSegment(plan, extent, lanes);
 
   // Along a serial axis, pre/post are siblings of the chunk loop and must be
   // lane-uniform; along a parallel axis they live inside the chunk body.
@@ -1229,6 +1430,11 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   }
 
   ReduceInfo reduce = ClassifyReduce(plan, analyzer);
+  if (reduce.defined() && partial_lanes) {
+    throw Unsupported(
+        "a reduction cannot share a segment with a wider-lane store (mixed element widths would "
+        "fold the unused lanes into the accumulator); split the nest or stage an explicit cast");
+  }
   if (reduce.defined()) plan.CopyOnWrite()->reduce = ffi::Optional<ffi::ObjectRef>(reduce);
   if (reduce.defined()) {
     // The reduction path hands pre/post to the outer-store emitter, which needs

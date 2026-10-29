@@ -198,6 +198,10 @@ PrimExpr Vcvt(const PrimExpr& src, const std::string& target_elem, const PrimExp
   const std::string part4 = "PART_P0";
   std::vector<PrimExpr> args = {src, mask};
   auto push = [&](const std::string& value) { args.push_back(StrImm(value)); };
+  // ``PART_EVEN`` matches ``simd.vcvt(part=0)`` (the language default) and is
+  // what the verified cast kernel emits before a packed ``PK_B*`` store: a
+  // narrowing conversion fills the even 16-bit slots of the wider destination
+  // register, and the packed store writes exactly those lanes.
   if (src_elem == "float32") {
     if (target_elem == "int64") {
       push(round); push(sat); push(part2); push(ModeZeroing());
@@ -1123,7 +1127,17 @@ void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const P
   PrimExpr value = emitter->VectorOperand(store->value);
   bool uniform = AccessClassFromName(store->kind_value.operator std::string()) ==
                  AccessClass::kUniform;
-  std::string dist = (uniform ? "ONEPT_B" : "NORM_B") + std::to_string(bits);
+  std::string dist;
+  const std::string lane_mode = store->store_lane_mode.operator std::string();
+  if (lane_mode == "pk_half" || lane_mode == "pk_quarter") {
+    // Mixed element widths: the value register is wider than the chunk, so the
+    // store must write exactly ``plan.lanes`` elements through the packed form
+    // (verified cast-kernel recipe: ``vcvt`` with ``PART_EVEN`` + ``PK_B*``).
+    int64_t pack_bits = store->store_pack_bits.has_value() ? *store->store_pack_bits : bits;
+    dist = (lane_mode == "pk_half" ? "PK_B" : "PK4_B") + std::to_string(pack_bits);
+  } else {
+    dist = (uniform ? "ONEPT_B" : "NORM_B") + std::to_string(bits);
+  }
   emitter->lets_.push_back(tirx::Evaluate(
       Vsts(emitter->Addr(store->access, uniform), store->spec->buffer, value, mask, dist)));
   emitter->NoteWrite(store->spec->buffer);
