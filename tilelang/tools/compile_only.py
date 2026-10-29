@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -40,6 +41,9 @@ DEFAULT_TARGET = "c"
 _PINNED_CUDA_TARGET: dict[str, str] = {"kind": "cuda", "arch": "sm_80"}
 _ERROR_PREFIX = "tilelang compile-only error"
 _CUDA_FFI_MISSING = "CUDA codegen FFI missing (e.g. macOS Metal wheel); use default --target c"
+# Extra PassContext config as a JSON object, e.g.
+#   TL_PASS_CONFIG='{"tl.ascend.polyhedral.impl": "cpp"}' ./run_lower_trace.sh k.py ascend
+_PASS_CONFIG_ENV = "TL_PASS_CONFIG"
 
 
 def cuda_codegen_available() -> bool:
@@ -153,17 +157,31 @@ def discover_prim_func(module: ModuleType):
 
 
 def _pass_context_config() -> dict:
-    """Enable ``#line`` when this build registered ``TL_EMIT_LINE_DIRECTIVES``.
+    """Build the ``PassContext`` config for compile-only lowering.
 
-    Older wheels reject the unknown pass key. CI merge with main has the
-    option; CE can then map generated C back to the example.
+    Always enables ``#line`` when this build registered
+    ``TL_EMIT_LINE_DIRECTIVES`` (older wheels reject the unknown pass key; CI
+    merge with main has the option, so CE can map generated C back to the
+    example). ``TL_PASS_CONFIG`` (JSON object) is merged on top, which is how
+    opt-in pipeline switches such as ``tl.ascend.polyhedral.impl`` are reached
+    from the CLI.
     """
     from tilelang.transform import PassConfigKey
 
+    config: dict = {}
     key = getattr(PassConfigKey, "TL_EMIT_LINE_DIRECTIVES", None)
-    if key is None:
-        return {}
-    return {key: True}
+    if key is not None:
+        config[key] = True
+    raw = os.environ.get(_PASS_CONFIG_ENV, "").strip()
+    if raw:
+        try:
+            extra = json.loads(raw)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"{_PASS_CONFIG_ENV} is not valid JSON: {raw}") from err
+        if not isinstance(extra, dict):
+            raise ValueError(f"{_PASS_CONFIG_ENV} must be a JSON object, got {type(extra).__name__}")
+        config.update(extra)
+    return config
 
 
 def compile_kernel_source(func, target: str | dict[str, str] = DEFAULT_TARGET) -> str:

@@ -21,6 +21,7 @@ parallel FA reports ``unsupported expr: T.exp`` until that pass is migrated.
 
 import math
 
+import tilelang
 import tilelang.ascend.language as T
 from tilelang.layout import make_ascend_compact_nz_layout
 
@@ -154,6 +155,12 @@ def parallel_flash_attention_fwd(
             T.copy(O_ub, O)
 
     return main
+
+
+@tilelang.jit
+def parallel_fa_compile_only():
+    """Compile-only entry for ``run_lower_trace.sh`` (first JIT kernel is used)."""
+    return parallel_flash_attention_fwd()
 
 
 def ref_parallel_flash_attention(q, k, v, scale=None):

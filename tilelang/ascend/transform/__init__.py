@@ -57,6 +57,16 @@ def AscendAnalyzeVSimdRegion():
     return _ffi_api.AscendAnalyzeVSimdRegion()  # type: ignore
 
 
+def AscendBuildP2PlanInputs(func):
+    """Return per-nest P1->P2 inputs (status + optional parallel Stmt).
+
+    Each item is a dict with ``vf_index``/``nest_index``/``status``/``reason``
+    and, when ``status == "LIFTED"``, ``stmt``: the P1 reference expansion
+    rewritten as a ``For(kParallel)`` chain, ready for ``build_plan``.
+    """
+    return _ffi_api.AscendBuildP2PlanInputs(func)  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -180,6 +190,43 @@ def NormalizeAscendFractalStorage():
     return _ffi_api.NormalizeAscendFractalStorage()  # type: ignore
 
 
+def AscendLiftParallelToArray():
+    """P1 pass: mark every nest P1 lifts with its typed region carrier.
+
+    The analysis is the existing read-only P1 lift (memory legality, capture
+    closure, region + expander self-check). A lifted nest is wrapped in
+    ``AttrStmt("tl.vsimd.array_region")``; the nest itself is unchanged and a
+    nest P1 rejects is left exactly as it was.
+    """
+    return _ffi_api.AscendLiftParallelToArray()  # type: ignore
+
+
+def AscendPlanArray():
+    """P2 pass: plan every P1 region carrier.
+
+    Consumes ``tl.vsimd.array_region`` markers and rewrites them to
+    ``AttrStmt("tl.vsimd.array_plan")`` carrying the ``VectorProgram``. A nest
+    the planner rejects is unwrapped untouched (legacy lowering takes over).
+    """
+    return _ffi_api.AscendPlanArray()  # type: ignore
+
+
+def AscendLowerArrayPlan():
+    """P3 pass: emit every plan carrier as ``tl.simd.*`` TIR."""
+    return _ffi_api.AscendLowerArrayPlan()  # type: ignore
+
+
+def AscendPolyhedralVectorize():
+    """Replace vectorizable ``T.Parallel`` nests with ``T.simd.*`` (P1 -> P2 -> P3).
+
+    A nest whose plan is rejected is left untouched, so
+    :func:`AscendSimdVFLowerParallel` still lowers it exactly as before. The pass
+    is gated by ``tl.ascend.polyhedral.impl`` (``legacy`` by default, ``cpp`` to
+    enable it).
+    """
+    return _ffi_api.AscendPolyhedralVectorize()  # type: ignore
+
+
 def AscendSimdVFLowerParallel():
     """Lower T.Parallel inside SIMD_VF blocks to MicroAPI register-level vector ops."""
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
@@ -285,6 +332,11 @@ __all__ = [
     "AscendAnalyzeSimdVFCaptureInfo",
     "AscendAnalyzeVSimdRegion",
     "AscendAnalyzeVSimdRegionReport",
+    "AscendBuildP2PlanInputs",
+    "AscendLiftParallelToArray",
+    "AscendPlanArray",
+    "AscendLowerArrayPlan",
+    "AscendPolyhedralVectorize",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",

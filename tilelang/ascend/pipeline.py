@@ -118,7 +118,15 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.NormalizeBufferVersion()(mod)
-    mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+    # Polyhedral P2+P3 vectorizer (opt-in, C++ only). ``legacy`` keeps the
+    # historical behavior (only AscendSimdVFLowerParallel below); ``cpp`` runs
+    # the C++ P2 planner + P3 emitter. A nest the planner rejects is left in
+    # place for the legacy pass to lower.
+    polyhedral_impl = pass_ctx.config.get("tl.ascend.polyhedral.impl", "legacy")
+    polyhedral_impl = (polyhedral_impl or "legacy").lower()
+    if polyhedral_impl == "cpp":
+        mod = ascend_transform.AscendPolyhedralVectorize()(mod)
+    # mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
     mod = ascend_transform.AscendLowerTileOp()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
