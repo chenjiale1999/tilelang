@@ -145,7 +145,8 @@ struct SegmentSpecs {
     specs.insert(specs.end(), post_specs.begin(), post_specs.end());
     return specs;
   }
-  VectorPlan plan_for(const Axis& vector_axis, arith::Analyzer* analyzer) const;
+  VectorPlan plan_for(const Axis& vector_axis, arith::Analyzer* analyzer,
+                      const PlanOptions& options) const;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -161,12 +162,13 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                             const std::vector<StoreSpec>& post_specs,
                             const std::vector<AccessInfo>& post_infos,
                             const Axis& vector_axis, int64_t lanes,
-                            arith::Analyzer* analyzer);
+                            arith::Analyzer* analyzer, const PlanOptions& options);
 
 VectorPlan SegmentSpecs::plan_for(const Axis& vector_axis,
-                                  arith::Analyzer* analyzer) const {
+                                  arith::Analyzer* analyzer,
+                                  const PlanOptions& options) const {
   return BuildPlanForAxis(axes, serial_axis, pre_specs, pre_infos, main_specs, main_infos,
-                          post_specs, post_infos, vector_axis, lanes, analyzer);
+                          post_specs, post_infos, vector_axis, lanes, analyzer, options);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1226,8 +1228,8 @@ void CollectLoadLanes(const ValueNode& node, std::set<int64_t>* lanes) {
  * A partial-lane segment writes ``lanes`` elements per chunk out of a wider
  * store register. It is only proved for straight-line, unpredicated,
  * contiguous element-wise stores whose values load exactly ``lanes`` wide and
- * whose extent divides evenly (no tail); everything else keeps falling back to
- * the legacy lowering.
+ * whose extent divides evenly (no tail); everything else is rejected (the nest
+ * stays a serial loop).
  */
 void ValidatePartialLaneSegment(const VectorPlan& plan,
                                 const std::optional<int64_t>& extent, int64_t lanes) {
@@ -1266,6 +1268,177 @@ void ValidatePartialLaneSegment(const VectorPlan& plan,
   }
 }
 
+/*! \brief Whether any store of the segment targets an explicitly annotated NZ buffer. */
+bool HasNzStore(const VectorPlan& plan) {
+  for (const StorePlan& store : plan->stores) {
+    if (store->layout_kind.operator std::string() == "nz") return true;
+  }
+  return false;
+}
+
+/*!
+ * \brief Stage 2b: validate the paired form of a half-register NZ store.
+ *
+ * ``vsstb`` has no packed variant, so a ``pk_half`` NZ store cannot be scattered
+ * as planned: the value register only holds ``lanes`` valid elements out of its
+ * ``2 * lanes`` lanes. It is emitted in the *paired* form instead — two
+ * consecutive chunks are de-interleaved into one full register (``vdintlv`` +
+ * two ``vcvt`` parts + ``vor``) and written with a single ``vsstb``, the same
+ * recipe as the hand-written FA softmax. That form only exists when the segment
+ * is a clean element-wise body over whole chunk pairs and the packed store owns
+ * its destination buffer, so everything else stays ``Unsupported``.
+ */
+void ValidatePackedNzSegment(const VectorPlan& plan, const std::optional<int64_t>& extent,
+                             int64_t lanes) {
+  std::optional<size_t> packed;
+  for (size_t i = 0; i < plan->stores.size(); ++i) {
+    const StorePlan& store = plan->stores[i];
+    if (store->layout_kind.operator std::string() != "nz") continue;
+    if (store->store_lane_mode.operator std::string() != "pk_half") continue;
+    if (packed.has_value()) {
+      throw Unsupported(
+          "at most one half-register NZ store per segment is supported (split the nest)");
+    }
+    packed = i;
+  }
+  if (!packed.has_value()) return;
+
+  const StorePlan& target = plan->stores[*packed];
+  const std::string name = target->spec->buffer->name.operator std::string();
+  if (*packed != plan->stores.size() - 1) {
+    throw Unsupported("the packed NZ store to '" + name +
+                      "' must be the last store of the segment (the merged register only exists "
+                      "after both chunks)");
+  }
+  for (const StorePlan& store : plan->stores) {
+    if (store.same_as(target)) continue;
+    if (store->spec->buffer->data.same_as(target->spec->buffer->data)) {
+      throw Unsupported("the packed NZ store to '" + name +
+                        "' must own its buffer (another store of the segment writes it)");
+    }
+  }
+  if (target->value->recipe.operator std::string() != "vcvt" ||
+      target->value->args.size() != 1) {
+    throw Unsupported("the packed NZ store to '" + name +
+                      "' needs a plain narrowing cast as its value");
+  }
+  if (!extent.has_value() || *extent % (2 * lanes) != 0) {
+    throw Unsupported("the packed NZ store to '" + name +
+                      "' needs the vector axis to cover whole chunk pairs (extent=" +
+                      (extent.has_value() ? std::to_string(*extent) : std::string("?")) +
+                      ", pair=" + std::to_string(2 * lanes) + ")");
+  }
+}
+
+/*! \brief Find the explicit layout of a store buffer (same buffer or shared data var). */
+const Layout* LookupStoreLayout(const PlanOptions& options, const tirx::Buffer& buffer) {
+  for (const auto& entry : options.layouts) {
+    if (entry.first.same_as(buffer) || entry.first->data.same_as(buffer->data)) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
+}
+
+/*! \brief Row-major linearized physical offset of a logical index under ``layout``. */
+PrimExpr PhysicalOffset(const Layout& layout, const ffi::Array<PrimExpr>& logical) {
+  ffi::Array<PrimExpr> out = layout->Forward(logical);
+  ffi::Array<PrimExpr> shape = layout->OutputShape();
+  PrimExpr offset = IntImm(DataType::Int(64), 0);
+  for (size_t i = 0; i < out.size(); ++i) {
+    offset = offset * tirx::Cast(DataType::Int(64), shape[i]) +
+             tirx::Cast(DataType::Int(64), out[i]);
+  }
+  return offset;
+}
+
+/*!
+ * \brief Classify one store's destination layout (Stage 2).
+ *
+ * Default is ND: a buffer without an explicit layout annotation keeps the plain
+ * contiguous store. A buffer explicitly annotated with an Ascend NZ layout is
+ * scattered as 32B blocks straight from the register (``vsstb``); the block and
+ * element strides are derived from the layout forward map instead of being
+ * hard-coded, and any shape the scatter cannot express stays ``Unsupported`` so
+ * the nest is left as a serial loop instead of writing a wrong layout.
+ *
+ * Returns the classification instead of mutating ``store``: a by-value
+ * ``StorePlan`` parameter would bump the node refcount and turn the caller's
+ * ``CopyOnWrite`` into a private copy (the write would be lost).
+ */
+struct StoreLayoutPlan {
+  bool nz{false};
+  int64_t block_stride{0};  // 32B blocks between two neighbouring C0 groups
+};
+
+StoreLayoutPlan ClassifyStoreLayout(const StorePlan& store, const PlanOptions& options,
+                                    int64_t lanes, arith::Analyzer* analyzer) {
+  StoreLayoutPlan result;
+  const tirx::Buffer& buffer = store->spec->buffer;
+  const Layout* layout = LookupStoreLayout(options, buffer);
+  if (layout == nullptr || !layout->defined() ||
+      layout->as<FragmentNode>() != nullptr) {
+    return result;  // no explicit (physical) layout: default ND
+  }
+  const std::string name = buffer->name.operator std::string();
+  if (!IsAscendNZLayout(*layout, buffer)) {
+    throw Unsupported("store to '" + name +
+                      "' has an explicit non-NZ layout; only ND (default) and Ascend NZ "
+                      "destination layouts are supported");
+  }
+  const std::string lane_mode = store->store_lane_mode.operator std::string();
+  if (lane_mode == "pk_quarter") {
+    throw Unsupported("NZ store to '" + name +
+                      "' would need a quarter-register source; only the half-register packed "
+                      "form is implemented");
+  }
+  if (store->kind_value != AccessClassName(AccessClass::kContiguous)) {
+    throw Unsupported("NZ store to '" + name +
+                      "' requires a contiguous access along the vector axis (got " +
+                      store->kind_value.operator std::string() + ")");
+  }
+  if (store->mask.has_value()) {
+    throw Unsupported("NZ store to '" + name +
+                      "' does not support a statement predicate yet");
+  }
+  const int c0 = AscendC0(buffer->dtype.bits());
+  std::optional<int64_t> cols = ConstInt(buffer->shape.back(), analyzer);
+  if (c0 <= 0 || lanes % c0 != 0) {
+    throw Unsupported("NZ store to '" + name + "' needs a chunk width multiple of the 32B block "
+                      "(" + std::to_string(c0) + " elements), got " + std::to_string(lanes));
+  }
+  if (!cols.has_value() || *cols % lanes != 0 || lanes > *cols) {
+    throw Unsupported("NZ store to '" + name +
+                      "' needs a static column extent covering a whole number of chunks (cols=" +
+                      (cols.has_value() ? std::to_string(*cols) : std::string("?")) +
+                      ", chunk=" + std::to_string(lanes) + ")");
+  }
+  // A half-register source is written in the paired form (Stage 2b): two chunks
+  // are merged into one full register, so the columns must cover whole pairs.
+  if (lane_mode == "pk_half" && *cols % (2 * lanes) != 0) {
+    throw Unsupported("NZ store to '" + name + "' narrows to a half register, so it needs whole " +
+                      "chunk pairs (cols=" + std::to_string(*cols) + ", pair=" +
+                      std::to_string(2 * lanes) + ")");
+  }
+  // Block stride from the layout forward map: the distance between the 32B block
+  // holding (row, col) and the one holding (row, col + C0).
+  ffi::Array<PrimExpr> indices = store->spec->indices;
+  ffi::Array<PrimExpr> next;
+  for (size_t i = 0; i < indices.size(); ++i) {
+    next.push_back(i + 1 == indices.size() ? indices[i] + IntImm32(c0) : indices[i]);
+  }
+  PrimExpr step = analyzer->Simplify(PhysicalOffset(*layout, next) -
+                                     PhysicalOffset(*layout, indices));
+  std::optional<int64_t> block = ConstInt(step, analyzer);
+  if (!block.has_value() || *block <= 0 || *block % c0 != 0) {
+    throw Unsupported("NZ store to '" + name +
+                      "' has a non-constant 32B block stride under its layout");
+  }
+  result.nz = true;
+  result.block_stride = *block / c0;
+  return result;
+}
+
 VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                             std::optional<Axis> serial_axis,
                             const std::vector<StoreSpec>& pre_specs,
@@ -1275,7 +1448,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                             const std::vector<StoreSpec>& post_specs,
                             const std::vector<AccessInfo>& post_infos,
                             const Axis& vector_axis, int64_t lanes,
-                            arith::Analyzer* analyzer) {
+                            arith::Analyzer* analyzer, const PlanOptions& options) {
   bool along_serial =
       serial_axis.has_value() && vector_axis->var.same_as((*serial_axis)->var);
   if (!pre_specs.empty() || !post_specs.empty()) {
@@ -1358,6 +1531,15 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     if (ratio > 1) {
       store.CopyOnWrite()->store_pack_bits = ffi::Optional<int64_t>(2048 / lanes);
     }
+    // Destination layout (Stage 2): the classification is applied here, where
+    // the plan node is still uniquely owned, so ``CopyOnWrite`` stays in place.
+    StoreLayoutPlan layout_plan = ClassifyStoreLayout(store, options, lanes, analyzer);
+    if (layout_plan.nz) {
+      store.CopyOnWrite()->layout_kind = ffi::String("nz");
+      store.CopyOnWrite()->nz_block_stride =
+          ffi::Optional<int64_t>(layout_plan.block_stride);
+      store.CopyOnWrite()->nz_elem_stride = ffi::Optional<int64_t>(1);
+    }
     return store;
   };
 
@@ -1381,6 +1563,23 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   // is only proved for the straight-line element-wise subset.
   const bool partial_lanes = HasPartialLaneStore(plan);
   if (partial_lanes) ValidatePartialLaneSegment(plan, extent, lanes);
+
+  // Destination layouts (Stage 2): an NZ scatter has no tail or sibling form.
+  const bool nz_stores = HasNzStore(plan);
+  if (nz_stores) {
+    if (!extent.has_value() || *extent % lanes != 0) {
+      throw Unsupported(
+          "NZ stores require the vector-axis extent to be a multiple of the chunk width " +
+          std::to_string(lanes) + " (tails are not supported yet)");
+    }
+    if (!pre_specs.empty() || !post_specs.empty()) {
+      throw Unsupported(
+          "NZ stores are only supported without sibling statements around the loop");
+    }
+  }
+  // Stage 2b: a half-register NZ store is widened to a full register by pairing
+  // two chunks; that shape has its own segment-level contract.
+  ValidatePackedNzSegment(plan, extent, lanes);
 
   // Along a serial axis, pre/post are siblings of the chunk loop and must be
   // lane-uniform; along a parallel axis they live inside the chunk body.
@@ -1434,6 +1633,10 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     throw Unsupported(
         "a reduction cannot share a segment with a wider-lane store (mixed element widths would "
         "fold the unused lanes into the accumulator); split the nest or stage an explicit cast");
+  }
+  if (reduce.defined() && nz_stores) {
+    throw Unsupported(
+        "a reduction store cannot be scattered into an NZ destination yet; split the nest");
   }
   if (reduce.defined()) plan.CopyOnWrite()->reduce = ffi::Optional<ffi::ObjectRef>(reduce);
   if (reduce.defined()) {
@@ -1505,7 +1708,8 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
                                         const std::vector<Stmt>& post_stmts,
                                         const AliasMap& aliases, arith::Analyzer* analyzer,
                                         std::optional<int64_t> lanes, bool single,
-                                        const std::vector<std::string>& base_notes) {
+                                        const std::vector<std::string>& base_notes,
+                                        const PlanOptions& options) {
   std::string flatten_word = single ? "nest" : "segment";
   SegmentSpecs specs = PrepareSegment(axes, serial_axis, pre_stmts, main_stmt, post_stmts,
                                       aliases, analyzer, lanes);
@@ -1524,7 +1728,7 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
     bool ok = true;
     VectorPlan plan;
     try {
-      plan = flat_specs.plan_for(flat_axis, analyzer);
+      plan = flat_specs.plan_for(flat_axis, analyzer, options);
     } catch (const Unsupported& error) {
       diagnostics.push_back("flattened axis '" + flat_axis->name.operator std::string() +
                             "': " + error.message());
@@ -1552,7 +1756,7 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
   for (const Axis& axis : ranked) {
     VectorPlan plan;
     try {
-      plan = specs.plan_for(axis, analyzer);
+      plan = specs.plan_for(axis, analyzer, options);
     } catch (const Unsupported& error) {
       // Per-axis failure reasons survive even on success (改进 7).
       errors.push_back("axis '" + axis->name.operator std::string() + "': " + error.message());
@@ -1587,15 +1791,17 @@ std::pair<VectorPlan, bool> BuildSegment(const std::vector<Axis>& axes,
                                          const Stmt& main_stmt,
                                          const std::vector<Stmt>& post_stmts,
                                          const AliasMap& aliases, arith::Analyzer* analyzer,
-                                         std::optional<int64_t> lanes) {
+                                         std::optional<int64_t> lanes,
+                                         const PlanOptions& options) {
   return PlanSegment(axes, std::optional<Axis>(serial_axis), pre_stmts, main_stmt, post_stmts,
-                     aliases, analyzer, lanes, /*single=*/false, {});
+                     aliases, analyzer, lanes, /*single=*/false, {}, options);
 }
 
 /*! \brief Multi-segment path: several sibling clean serial loops. */
 std::optional<VectorProgram> TryBuildProgram(const Stmt& stmt, arith::Analyzer* analyzer,
                                              std::optional<int64_t> lanes,
-                                             std::vector<std::string>* notes) {
+                                             std::vector<std::string>* notes,
+                                             const PlanOptions& options) {
   auto absorbed = AbsorbParallelChain(stmt, analyzer);
   const std::vector<Axis>& parallel_axes = absorbed.first;
   Stmt current = absorbed.second;
@@ -1658,7 +1864,7 @@ std::optional<VectorProgram> TryBuildProgram(const Stmt& stmt, arith::Analyzer* 
     std::pair<VectorPlan, bool> segment;
     try {
       segment = BuildSegment(segment_axes, serial_axes.back(), pre, body, post, aliases,
-                            analyzer, lanes);
+                            analyzer, lanes, options);
     } catch (const Unsupported& error) {
       notes->push_back("segment " + std::to_string(order) + " (T.serial '" +
                        serial_axes.back()->name.operator std::string() + "'): " +
@@ -1701,10 +1907,12 @@ std::optional<VectorProgram> TryBuildProgram(const Stmt& stmt, arith::Analyzer* 
 
 }  // namespace
 
-VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes) {
+VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes,
+                        const PlanOptions& options) {
   arith::Analyzer analyzer;
   std::vector<std::string> notes;
-  std::optional<VectorProgram> program = TryBuildProgram(stmt, &analyzer, lanes, &notes);
+  std::optional<VectorProgram> program =
+      TryBuildProgram(stmt, &analyzer, lanes, &notes, options);
   if (program.has_value()) return *program;
 
   VectorPlan plan;
@@ -1716,7 +1924,8 @@ VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes) {
     pieces.insert(pieces.end(), split.post.begin(), split.post.end());
     AliasMap aliases = CollectAliases(SeqStmts(pieces));
     auto planned = PlanSegment(split.axes, split.serial_axis, split.pre, split.main,
-                               split.post, aliases, &analyzer, lanes, /*single=*/true, notes);
+                               split.post, aliases, &analyzer, lanes, /*single=*/true, notes,
+                               options);
     plan = planned.first;
     flattened = planned.second;
   } catch (const Unsupported& error) {

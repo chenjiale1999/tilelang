@@ -105,6 +105,49 @@ PrimExpr Vscatter(const PrimExpr& src, const PrimExpr& base_load,
   return SimdCall(simd_vscatter(), DataType::Void(), {src, ptr, index, mask});
 }
 
+/*! \brief ``tl.simd.vsstb``: scatter 32B blocks straight into an NZ destination. */
+PrimExpr Vsstb(const PrimExpr& src, const PrimExpr& base_load, const tirx::Buffer& buffer,
+               const PrimExpr& mask, const PrimExpr& stride) {
+  int lanes = VRegLanes(ElemDtype(buffer->dtype));
+  PrimExpr ptr = AccessPtr(base_load, lanes, /*rw=*/2);
+  return SimdCall(simd_vsstb(), DataType::Void(), {src, ptr, stride, mask});
+}
+
+/*! \brief ``tl.simd.vdintlv``: de-interleave two registers into a pair. */
+PrimExpr Vdintlv(const PrimExpr& low, const PrimExpr& high) {
+  return SimdCall(simd_vdintlv(), low.dtype(), {low, high});
+}
+
+/*! \brief ``tl.simd.vintlv``: interleave two registers into a pair. */
+PrimExpr Vintlv(const PrimExpr& low, const PrimExpr& high) {
+  return SimdCall(simd_vintlv(), low.dtype(), {low, high});
+}
+
+/*! \brief ``tl.simd.vld2``: one dual-dest load, de-interleaved into a pair. */
+PrimExpr Vld2(const PrimExpr& base_load, const tirx::Buffer& buffer) {
+  const std::string elem = ElemDtype(buffer->dtype);
+  int bits = 0;
+  ElemBits(elem, &bits);
+  PrimExpr ptr = AccessPtr(base_load, 2 * VRegLanes(elem), /*rw=*/1);
+  return SimdCall(simd_vld2(), VecDataType(elem),
+                  {ptr, StrImm("DINTLV_B" + std::to_string(bits))});
+}
+
+/*! \brief ``tl.simd.pair_get``: one register of a ``vdintlv``/``vintlv`` pair. */
+PrimExpr PairGet(const PrimExpr& pair, int index) {
+  return SimdCall(simd_pair_get(), pair.dtype(), {pair, IntImm32(index)});
+}
+
+/*! \brief ``tl.simd.vor``: bitwise or of two registers under ``mask``. */
+PrimExpr Vor(const PrimExpr& lhs, const PrimExpr& rhs, const PrimExpr& mask) {
+  return SimdCall(simd_vor(), lhs.dtype(), {lhs, rhs, mask, StrImm(ModeZeroing())});
+}
+
+/*! \brief ``T.reinterpret`` one register to another element type (same lanes). */
+PrimExpr ReinterpretAs(const PrimExpr& value, const std::string& elem) {
+  return reinterpret(VecDataType(elem), value);
+}
+
 PrimExpr Vdup(const PrimExpr& scalar, const std::string& elem, const PrimExpr& mask) {
   return SimdCall(simd_vdup(), VecDataType(elem),
                   {scalar, mask, StrImm(ModeZeroing())});
@@ -190,11 +233,12 @@ PrimExpr ReduceCall(const std::string& recipe, const PrimExpr& src, const PrimEx
  * ``part=0``; only the pairs P2 can produce are needed, everything else keeps
  * the Python "Unsupported vcvt conversion" rejection.
  */
-PrimExpr Vcvt(const PrimExpr& src, const std::string& target_elem, const PrimExpr& mask) {
+PrimExpr Vcvt(const PrimExpr& src, const std::string& target_elem, const PrimExpr& mask,
+              const std::string& part = "PART_EVEN") {
   std::string src_elem = ElemDtype(ffi::DLDataTypeToString(src.dtype()).operator std::string());
   const std::string round = "ROUND_R";
   const std::string sat = "RS_ENABLE";
-  const std::string part2 = "PART_EVEN";
+  const std::string part2 = part;
   const std::string part4 = "PART_P0";
   std::vector<PrimExpr> args = {src, mask};
   auto push = [&](const std::string& value) { args.push_back(StrImm(value)); };
@@ -519,6 +563,22 @@ struct CarryEntry {
   PrimExpr value;
 };
 
+/*!
+ * \brief Shared de-interleaved domain of the paired (pack2) emitter.
+ *
+ * In this domain a single ``vld2`` fetches a whole chunk pair and hands the two
+ * parity streams to the even/odd emitters, so every value is a *strided* stream
+ * instead of a contiguous register. Contiguous destinations re-interleave the
+ * two streams at the store site (``vintlv``); the NZ destination consumes the
+ * streams directly (``vcvt`` even/odd parts). Section 3 of the analysis: this
+ * trades two ``vld`` + one ``vdintlv`` for one ``vld2`` + one ``vintlv``.
+ */
+struct PairDomain {
+  std::map<std::string, PrimExpr> loads;  // pair-base key -> vld2 pair value
+  std::vector<Stmt>* lets{nullptr};       // vld2 binds, emitted before both halves
+  int next{0};                            // unique name counter
+};
+
 /* ------------------------------------------------------------------------- */
 /* _Emitter                                                                  */
 /* ------------------------------------------------------------------------- */
@@ -528,7 +588,8 @@ class Emitter {
   Emitter(const VectorPlan& plan, PrimExpr chunk, std::string prefix, bool masked_tail = false,
           int64_t chunk_min = 0, std::optional<int64_t> chunk_max = std::nullopt,
           ProgramPrologue* shared = nullptr,
-          std::map<std::string, CarryEntry>* carry = nullptr, bool allow_carry = false)
+          std::map<std::string, CarryEntry>* carry = nullptr, bool allow_carry = false,
+          PairDomain* pair = nullptr, int pair_stream = 0)
       : plan_(plan),
         chunk_(std::move(chunk)),
         prefix_(std::move(prefix)),
@@ -537,7 +598,9 @@ class Emitter {
         chunk_max_(chunk_max),
         shared_(shared),
         carry_(carry != nullptr ? carry : &owned_carry_),
-        allow_carry_(allow_carry) {
+        allow_carry_(allow_carry),
+        pair_(pair),
+        pair_stream_(pair_stream) {
     lane_base_ = chunk_ * IntImm32(plan_->lanes);
     for (const StorePlan& store : plan_->pre_stores) written_buffers_.push_back(store->spec->buffer);
     for (const StorePlan& store : plan_->stores) written_buffers_.push_back(store->spec->buffer);
@@ -701,8 +764,7 @@ class Emitter {
   }
 
   /* -- addresses -------------------------------------------------------- */
-  ffi::Array<PrimExpr> AddrIndices(const AccessInfo& access, bool uniform) {
-    PrimExpr base = uniform ? IntImm32(0) : lane_base_;
+  ffi::Array<PrimExpr> AddrIndicesAt(const AccessInfo& access, const PrimExpr& base) {
     ffi::Array<PrimExpr> out;
     for (const PrimExpr& index : access->indices) {
       out.push_back(analyzer_.Simplify(tirx::Substitute(
@@ -714,8 +776,33 @@ class Emitter {
     return out;
   }
 
+  ffi::Array<PrimExpr> AddrIndices(const AccessInfo& access, bool uniform) {
+    return AddrIndicesAt(access, uniform ? IntImm32(0) : lane_base_);
+  }
+
   PrimExpr Addr(const AccessInfo& access, bool uniform = false) {
     return tirx::BufferLoad(access->buffer, AddrIndices(access, uniform));
+  }
+
+  /*!
+   * \brief De-interleaved stream register of a contiguous load (``vld2`` domain).
+   *
+   * The pair base is the *even* chunk's address (the odd emitter subtracts its
+   * own chunk back off ``lane_base_``), so both streams share one dual-dest
+   * load. The bind goes to the shared list, which is emitted before both halves.
+   */
+  PrimExpr PairStream(const AccessInfo& access) {
+    PrimExpr base = lane_base_ - IntImm32(pair_stream_ * plan_->lanes);
+    PrimExpr addr = tirx::BufferLoad(access->buffer, AddrIndicesAt(access, base));
+    std::string key = ExprKey(addr);
+    auto it = pair_->loads.find(key);
+    if (it == pair_->loads.end()) {
+      PrimExpr load = Vld2(addr, access->buffer);
+      tirx::Var var("dl" + prefix_ + std::to_string(pair_->next++), load.dtype());
+      pair_->lets->push_back(tirx::Bind(var, load));
+      it = pair_->loads.emplace(key, var).first;
+    }
+    return Bind(PairGet(it->second, pair_stream_), &lets_);
   }
 
   PrimExpr IndexAddr(const AccessInfo& access) {
@@ -953,6 +1040,8 @@ class Emitter {
   std::map<std::string, PrimExpr> memo_;
   std::map<const ValueNodeNode*, std::string> value_keys_;
   std::map<const tirx::BufferNode*, std::string> buffer_keys_;
+  PairDomain* pair_;
+  int pair_stream_{0};
   arith::Analyzer analyzer_;
 };
 
@@ -991,6 +1080,11 @@ PrimExpr Emitter::Build(const ValueNode& node) {
     }
     int bits = MaskBits(node->dtype.operator std::string());
     PrimExpr mask = LoadGuard(node, bits);
+    if (pair_ != nullptr && !mask.defined()) {
+      // De-interleaved pair domain: one ``vld2`` replaces the two contiguous
+      // loads (and the explicit ``vdintlv`` the merge would need).
+      return PairStream(*node->access);
+    }
     if (!mask.defined()) {
       return Bind(Vld(Addr(*node->access), (*node->access)->buffer, "NORM"), &lets_);
     }
@@ -1127,8 +1221,26 @@ void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const P
   PrimExpr value = emitter->VectorOperand(store->value);
   bool uniform = AccessClassFromName(store->kind_value.operator std::string()) ==
                  AccessClass::kUniform;
-  std::string dist;
   const std::string lane_mode = store->store_lane_mode.operator std::string();
+  if (store->layout_kind.operator std::string() == "nz") {
+    if (lane_mode != "full") {
+      // Only the paired emitter widens a half-register source into a full one
+      // (``EmitPackedNzStore``); scattering it here would write stale lanes.
+      throw Unsupported("a half-register NZ store must be emitted in the paired form");
+    }
+    // ND -> NZ: scatter the register as 32B blocks at the layout block stride,
+    // i.e. store the value straight into the NZ destination (no ND staging).
+    int64_t block = store->nz_block_stride.has_value() ? *store->nz_block_stride : 0;
+    int64_t elem = store->nz_elem_stride.has_value() ? *store->nz_elem_stride : 1;
+    PrimExpr stride = IntImm(DataType::Int(32), (block << 16) | (elem & 0xffff));
+    emitter->lets_.push_back(tirx::Evaluate(
+        Vsstb(value, emitter->Addr(store->access, /*uniform=*/false), store->spec->buffer, mask,
+              stride)));
+    emitter->NoteWrite(store->spec->buffer);
+    emitter->NoteStore(store, value);
+    return;
+  }
+  std::string dist;
   if (lane_mode == "pk_half" || lane_mode == "pk_quarter") {
     // Mixed element widths: the value register is wider than the chunk, so the
     // store must write exactly ``plan.lanes`` elements through the packed form
@@ -1142,6 +1254,140 @@ void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const P
       Vsts(emitter->Addr(store->access, uniform), store->spec->buffer, value, mask, dist)));
   emitter->NoteWrite(store->spec->buffer);
   emitter->NoteStore(store, value);
+}
+
+/*!
+ * \brief The one store of a segment that needs the paired (pack2) emitter.
+ *
+ * A ``pk_half`` NZ store hands ``lanes`` valid elements to a ``2 * lanes``-lane
+ * register and ``vsstb`` has no packed variant, so the plan pairs two chunks
+ * (Stage 2b); an empty result keeps the historical single-chunk emission.
+ */
+std::optional<StorePlan> PackedNzStore(const VectorPlan& plan) {
+  for (const StorePlan& store : plan->stores) {
+    if (store->layout_kind.operator std::string() != "nz") continue;
+    if (store->store_lane_mode.operator std::string() != "pk_half") continue;
+    return store;
+  }
+  return std::nullopt;
+}
+
+/*!
+ * \brief Emit the paired form of a half-register NZ store.
+ *
+ * One loop iteration covers two chunks (columns ``[0, 2 * lanes)`` of the row).
+ * The two value registers hold consecutive column halves, so the lanes are
+ * de-interleaved first: after ``vdintlv`` the even stream carries columns
+ * ``0, 2, 4, ...`` and the odd stream ``1, 3, 5, ...``; ``vcvt`` with
+ * ``PART_EVEN`` / ``PART_ODD`` writes each stream into the matching 16-bit slot
+ * of one destination register and ``vor`` merges both parts. The merged register
+ * holds ``2 * lanes`` consecutive elements and is scattered with a single
+ * ``vsstb`` — the same atomic recipe as the hand-written FA softmax.
+ *
+ * ``even_val`` / ``odd_val`` are the (wider) values of both chunks, already
+ * evaluated in their own emitters: the caller appends both ``lets_`` lists
+ * before this function's own chain, so the merge always sees bound registers.
+ */
+void EmitPackedNzStore(const StorePlan& store, Emitter* even, const PrimExpr& even_val,
+                       const PrimExpr& odd_val, bool deinterleaved, std::vector<Stmt>* out) {
+  const std::string elem = ElemDtype(store->spec->buffer->dtype);
+  PrimExpr mask = even->AllMask(MaskBits(elem));
+  auto bind = [&](const PrimExpr& expr) {
+    tirx::Var var("pk" + even->prefix() + std::to_string(out->size()), expr.dtype());
+    out->push_back(tirx::Bind(var, expr));
+    return var;
+  };
+  PrimExpr lo = even_val;
+  PrimExpr hi = odd_val;
+  if (!deinterleaved) {
+    // Contiguous halves: split them into the even/odd column streams first.
+    PrimExpr pair = bind(Vdintlv(even_val, odd_val));
+    lo = bind(PairGet(pair, 0));
+    hi = bind(PairGet(pair, 1));
+  }
+  PrimExpr lo_narrow = bind(Vcvt(lo, elem, mask, "PART_EVEN"));
+  PrimExpr hi_narrow = bind(Vcvt(hi, elem, mask, "PART_ODD"));
+  // ``vor`` is bitwise, so the halves are merged as raw 16-bit lanes.
+  PrimExpr merged_bits =
+      bind(Vor(ReinterpretAs(lo_narrow, "uint16"), ReinterpretAs(hi_narrow, "uint16"), mask));
+  PrimExpr merged = bind(ReinterpretAs(merged_bits, elem));
+  int64_t block = store->nz_block_stride.has_value() ? *store->nz_block_stride : 0;
+  int64_t elem_stride = store->nz_elem_stride.has_value() ? *store->nz_elem_stride : 1;
+  PrimExpr stride = IntImm(DataType::Int(32), (block << 16) | (elem_stride & 0xffff));
+  out->push_back(tirx::Evaluate(Vsstb(merged, even->Addr(store->access, /*uniform=*/false),
+                                     store->spec->buffer, mask, stride)));
+  even->NoteWrite(store->spec->buffer);
+  even->NoteStore(store, merged);
+}
+
+/*!
+ * \brief Whether one value keeps its lanes positionally independent.
+ *
+ * The de-interleaved domain permutes lane positions (even/odd streams), so a
+ * value may only live there when every recipe is lane-wise: contiguous loads,
+ * lane-uniform leaves and element-wise arithmetic. Reductions, permutes,
+ * gathers, index vectors and predicated values all break the permutation.
+ */
+bool LaneLocalValue(const ValueNode& node) {
+  if (!node.defined() || node->predicate.has_value()) return false;
+  const std::string recipe = node->recipe.operator std::string();
+  if (recipe == "imm" || recipe == "uniform_expr" || recipe == "uniform_load" ||
+      recipe == "vbrc" || recipe == "vload") {
+    return true;
+  }
+  if (recipe == "vcvt" && node->args.size() == 1) {
+    return LaneLocalValue(Downcast<ValueNode>(node->args[0]));
+  }
+  // Scalar-vector recipes carry the scalar as the second argument node.
+  const bool unary = IsElementwiseUnaryRecipe(recipe) && node->args.size() == 1;
+  const bool binary = IsElementwiseBinaryRecipe(recipe) && node->args.size() == 2;
+  const bool scalar_binary = IsScalarVectorRecipe(recipe) && node->args.size() == 2;
+  if (!unary && !binary && !scalar_binary) return false;
+  for (const ffi::ObjectRef& arg : node->args) {
+    if (!LaneLocalValue(Downcast<ValueNode>(arg))) return false;
+  }
+  return true;
+}
+
+/*! \brief Whether a whole chunk pair can be emitted in the de-interleaved domain. */
+bool PairDomainAllowed(const VectorPlan& plan, const StorePlan& packed) {
+  for (const StorePlan& store : plan->stores) {
+    if (store->kind_value != AccessClassName(AccessClass::kContiguous)) return false;
+    if (store->mask.has_value()) return false;
+    if (!store.same_as(packed) &&
+        store->store_lane_mode.operator std::string() != "full") {
+      // A packed ND store needs its own half-register handling.
+      return false;
+    }
+    if (!LaneLocalValue(store->value)) return false;
+  }
+  return true;
+}
+
+/*!
+ * \brief Emit a contiguous (ND) store out of the de-interleaved pair domain.
+ *
+ * Both streams are re-interleaved into the original lane order at the store
+ * site, so the destination sees the same two contiguous chunk registers as
+ * before. The forward map keeps the *stream* values: a later load of the same
+ * address inside the segment stays in the de-interleaved domain.
+ */
+void EmitPairContiguousStore(const StorePlan& store, Emitter* even, Emitter* odd,
+                             const PrimExpr& even_val, const PrimExpr& odd_val,
+                             std::vector<Stmt>* out) {
+  const std::string elem = ElemDtype(store->spec->buffer->dtype);
+  const int bits = MaskBits(elem);
+  PrimExpr mask = even->AllMask(bits);
+  PrimExpr pair = even->Bind(Vintlv(even_val, odd_val), out);
+  const std::string dist = "NORM_B" + std::to_string(bits);
+  out->push_back(tirx::Evaluate(Vsts(even->Addr(store->access), store->spec->buffer,
+                                    PairGet(pair, 0), mask, dist)));
+  out->push_back(tirx::Evaluate(Vsts(odd->Addr(store->access), store->spec->buffer,
+                                    PairGet(pair, 1), mask, dist)));
+  even->NoteWrite(store->spec->buffer);
+  odd->NoteWrite(store->spec->buffer);
+  even->NoteStore(store, even_val);
+  odd->NoteStore(store, odd_val);
 }
 
 void EmitStore(const VectorPlan& plan, const StorePlan& store, Emitter* emitter) {
@@ -1313,15 +1559,80 @@ std::pair<std::vector<Stmt>, std::vector<Stmt>> StripMine(const VectorPlan& plan
 std::pair<std::vector<Stmt>, std::vector<Stmt>> EmitElementwiseChunks(
     const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
     ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry, bool allow_carry) {
-  MakeBlock make_block = [&](const PrimExpr& chunk_index, bool masked_tail,
-                             const std::string& label, int64_t chunk_min,
-                             std::optional<int64_t> chunk_max) -> Block {
-    Emitter body(plan, chunk_index, prefix + label, masked_tail, chunk_min, chunk_max, shared,
-                 carry, allow_carry);
-    for (const StorePlan& store : plan->stores) EmitStore(plan, store, &body);
-    return Block{body.prologue_, body.lets_};
+  std::optional<StorePlan> packed = PackedNzStore(plan);
+  if (!packed.has_value()) {
+    MakeBlock make_block = [&](const PrimExpr& chunk_index, bool masked_tail,
+                               const std::string& label, int64_t chunk_min,
+                               std::optional<int64_t> chunk_max) -> Block {
+      Emitter body(plan, chunk_index, prefix + label, masked_tail, chunk_min, chunk_max, shared,
+                   carry, allow_carry);
+      for (const StorePlan& store : plan->stores) EmitStore(plan, store, &body);
+      return Block{body.prologue_, body.lets_};
+    };
+    return StripMine(plan, chunk, make_block);
+  }
+
+  // Stage 2b: one loop iteration covers a chunk *pair*. Both halves are emitted
+  // by their own emitter, the packed store is deferred until both value chains
+  // exist, and only then is the pair merged.
+  TVM_FFI_ICHECK(plan->chunks.has_value())
+      << "the paired NZ emitter needs static chunk counts (plan contract)";
+  int64_t pairs = *plan->chunks / 2;
+  const StorePlan& packed_store = packed.value();
+  // Lane-wise bodies run in the de-interleaved domain: one ``vld2`` instead of
+  // two loads plus the explicit ``vdintlv`` the merge would otherwise need.
+  const bool deinterleave = PairDomainAllowed(plan, packed_store);
+
+  auto emit_pair = [&](const PrimExpr& pair_index) -> Block {
+    const PrimExpr even_chunk = pair_index * IntImm32(2);
+    const PrimExpr odd_chunk = even_chunk + IntImm32(1);
+    std::vector<Stmt> shared_lets;
+    PairDomain domain;
+    domain.lets = &shared_lets;
+    Emitter even(plan, even_chunk, prefix + "e", false, 0, std::nullopt, shared, carry,
+                 allow_carry, deinterleave ? &domain : nullptr, /*pair_stream=*/0);
+    Emitter odd(plan, odd_chunk, prefix + "o", false, 0, std::nullopt, shared, carry,
+                allow_carry, deinterleave ? &domain : nullptr, /*pair_stream=*/1);
+    // Value binds and the write they feed stay in source order (a later store may
+    // read what an earlier one wrote through the forward map).
+    std::vector<Stmt> body;
+    auto flush = [&]() {
+      for (Stmt& stmt : even.TakeLets()) body.push_back(std::move(stmt));
+      for (Stmt& stmt : odd.TakeLets()) body.push_back(std::move(stmt));
+    };
+    for (const StorePlan& store : plan->stores) {
+      if (store.same_as(packed_store)) continue;
+      if (deinterleave) {
+        PrimExpr even_val = even.VectorOperand(store->value);
+        PrimExpr odd_val = odd.VectorOperand(store->value);
+        flush();
+        EmitPairContiguousStore(store, &even, &odd, even_val, odd_val, &body);
+      } else {
+        EmitStore(plan, store, &even);
+        EmitStore(plan, store, &odd);
+      }
+    }
+    const ValueNode& packed_value = Downcast<ValueNode>(packed_store->value->args[0]);
+    PrimExpr even_val = even.VectorOperand(packed_value);
+    PrimExpr odd_val = odd.VectorOperand(packed_value);
+    flush();
+    Block block;
+    for (Stmt& stmt : even.prologue_) block.prologue.push_back(std::move(stmt));
+    for (Stmt& stmt : odd.prologue_) block.prologue.push_back(std::move(stmt));
+    for (Stmt& stmt : shared_lets) block.lets.push_back(std::move(stmt));
+    for (Stmt& stmt : body) block.lets.push_back(std::move(stmt));
+    EmitPackedNzStore(packed_store, &even, even_val, odd_val, deinterleave, &block.lets);
+    return block;
   };
-  return StripMine(plan, chunk, make_block);
+
+  if (pairs == 1) {
+    Block single = emit_pair(IntImm32(0));
+    return {single.prologue, single.lets};
+  }
+  Block pair_loop = emit_pair(chunk);
+  Stmt loop_body = SeqOfVec(pair_loop.lets).empty() ? Stmt() : SeqOfVec(pair_loop.lets)[0];
+  return {pair_loop.prologue,
+          {tirx::For(chunk, IntImm32(0), IntImm32(pairs), ForKind::kSerial, loop_body)}};
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1445,6 +1756,10 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
   // structure (pre -> for inner: main -> post) so pre/post run once per chunk.
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
   if (plan->vector_axis->is_parallel && !inner.empty() && !ReduceOf(plan).defined()) {
+    if (PackedNzStore(plan).has_value()) {
+      throw Unsupported(
+          "a packed NZ store needs the vector axis to be the innermost axis (split the nest)");
+    }
     return EmitParallelAxisParts(plan, chunk, prefix, hoisted, single, shared, carry,
                                  allow_carry);
   }

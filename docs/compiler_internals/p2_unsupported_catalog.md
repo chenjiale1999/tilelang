@@ -433,3 +433,48 @@ a statement outside the serial loop must be uniform along the vector axis (got {
 
 阶段六「异常注入」要求：每个 build 期拒绝点至少 1 个用例（`emit.py` 的 4 条按死代码处理，
 在阶段四评审记录中标注依据）。
+
+***
+
+## G. C++ 端口新增拒绝点（Python oracle 未同步）
+
+阶段一（同段混宽）与阶段二（NZ 目标布局）是在 C++ 端新增的能力，Python 参考实现里没有
+对应分支，因此不参与 A~F 的逐字对拍；每条都有 C++ 侧单测（`pytest.raises(Unsupported, match=...)`）。
+
+| 阶段 | 触发点 | message |
+| --- | --- | --- |
+| 一 | 更宽的 store 不是窄化 cast | `store '{name}' needs {ratio}x the segment chunk width {lanes} but its value is not a narrowing conversion; split the nest or stage an explicit cast` |
+| 一 | 窄化源寄存器宽度与段 chunk 不一致 | `store '{name}' narrows from a {n}-lane register but the segment chunk width is {lanes} (split the nest)` |
+| 一 | 混宽段里出现加宽 store | `store '{name}' widens its value inside a mixed-width segment; widening stores are not supported yet` |
+| 一 | 混宽段内有更窄 lane 的 load | `mixed element widths in one segment require every load to be {lanes}-lane wide (store '{name}' loads a {width}-lane register)` |
+| 一 | 归约与半寄存器 store 同段 | `a reduction cannot share a segment with a wider-lane store (mixed element widths would fold the unused lanes into the accumulator); split the nest or stage an explicit cast` |
+| 二 | 目标 buffer 有显式非 NZ layout | `store to '{name}' has an explicit non-NZ layout; only ND (default) and Ascend NZ destination layouts are supported` |
+| 二 | NZ 目标 + 四分之一寄存器 store（pack4 未实现） | `NZ store to '{name}' would need a quarter-register source; only the half-register packed form is implemented` |
+| 二 | NZ 目标但访存不是沿向量轴连续 | `NZ store to '{name}' requires a contiguous access along the vector axis (got {kind})` |
+| 二 | NZ 目标 + 语句级谓词 | `NZ store to '{name}' does not support a statement predicate yet` |
+| 二 | chunk 宽度不是 32B 块（C0）的整数倍 | `NZ store to '{name}' needs a chunk width multiple of the 32B block ({c0} elements), got {lanes}` |
+| 二 | 列 extent 不覆盖整数个 chunk | `NZ store to '{name}' needs a static column extent covering a whole number of chunks (cols={cols}, chunk={lanes})` |
+| 二 | 半寄存器 store 凑不出整 chunk 对 | `NZ store to '{name}' narrows to a half register, so it needs whole chunk pairs (cols={cols}, pair={pair})` |
+| 二 | 布局前向下 32B 块步长不是常量 | `NZ store to '{name}' has a non-constant 32B block stride under its layout` |
+| 二 | NZ 段带 tail | `NZ stores require the vector-axis extent to be a multiple of the chunk width {lanes} (tails are not supported yet)` |
+| 二 | NZ 段带 pre/post 兄弟语句 | `NZ stores are only supported without sibling statements around the loop` |
+| 二 | 归约写入 NZ 目标 | `a reduction store cannot be scattered into an NZ destination yet; split the nest` |
+| 2b | 一个段里出现多条半寄存器 NZ store | `at most one half-register NZ store per segment is supported (split the nest)` |
+| 2b | 打包 store 后面还有写入（合并寄存器尚未存在） | `the packed NZ store to '{name}' must be the last store of the segment (the merged register only exists after both chunks)` |
+| 2b | 打包 store 的 buffer 被同段其它 store 写 | `the packed NZ store to '{name}' must own its buffer (another store of the segment writes it)` |
+| 2b | 打包 store 的值不是纯窄化 cast | `the packed NZ store to '{name}' needs a plain narrowing cast as its value` |
+| 2b | 向量轴 extent 不是 chunk 对的整数倍 | `the packed NZ store to '{name}' needs the vector axis to cover whole chunk pairs (extent={extent}, pair={pair})` |
+| 2b（P3） | 向量轴不是最内层轴 | `a packed NZ store needs the vector axis to be the innermost axis (split the nest)` |
+| 2b（P3） | 单 chunk 发射路径收到半寄存器 NZ store | `a half-register NZ store must be emitted in the paired form` |
+
+访问形态（`kContiguous`）与 32B 对齐是 NZ 散射的前置条件：不满足时一律 `Unsupported`，
+由 legacy lowering 接管，绝不产出“布局写错但能跑”的代码。
+
+阶段 2b 的配对形态（反交织 + `vcvt(PART_EVEN/PART_ODD)` + `vor` + 单条 `vsstb`）只在
+“整个段是干净的逐元素体、覆盖整 chunk 对、打包 store 独占其 buffer 且是最后一条写”时启用；
+任何一条不满足都退回 `Unsupported`，不做半寄存器散射。
+
+反交织本身有两档发射：整段值是 lane-local（只含连续 load、lane 均匀叶子、逐元素算术/`vcvt`）
+时，用一条 `vld2(DINTLV_B*)` 在载入处取偶/奇列流，连续目标在写回处用 `vintlv` 还原，
+`vdintlv` 完全省掉；否则退回“两条 `vld` + 一条 `vdintlv`”的保守形态（语义相同，仅多一条指令）。
+这条选择在 P3 内按 DAG 结构判定，不改变 plan/渲染，因此不影响与 Python oracle 的对拍。

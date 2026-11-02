@@ -18,11 +18,11 @@
  *                            replaces them with the emitted ``T.simd.*`` TIR.
  *
  * Any stage that cannot handle a nest leaves the original IR unchanged: the
- * carrier is unwrapped back to the exact nest statement, which the legacy
- * ``AscendSimdVFLowerParallel`` then lowers as before.
+ * carrier is unwrapped back to the exact nest statement, which stays a serial
+ * loop (this pass is the pipeline's only ``T.Parallel`` lowering).
  *
  * ``VectorizeParallelNests`` runs the three stages in order; it is the pass the
- * Ascend pipeline inserts (``tl.ascend.polyhedral.impl = "cpp"``).
+ * Ascend pipeline inserts.
  */
 #ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_STAGE_PASSES_H_
 #define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_STAGE_PASSES_H_
@@ -42,7 +42,7 @@ inline constexpr const char* kArrayPlanAttr = "tl.vsimd.array_plan";
  * \brief P1: run the vsimd analysis and mark every lifted nest.
  *
  * The function body is otherwise unchanged; a nest P1 does not lift is left
- * exactly as it was, so ``AscendSimdVFLowerParallel`` still handles it.
+ * exactly as it was (no carrier, so no downstream stage rewrites it).
  */
 TVM_DLL tirx::PrimFunc LiftParallelToArray(tirx::PrimFunc func);
 
@@ -50,7 +50,7 @@ TVM_DLL tirx::PrimFunc LiftParallelToArray(tirx::PrimFunc func);
  * \brief P2: plan every ``tl.vsimd.array_region`` nest.
  *
  * Rejected nests are unwrapped (never left marked), so a nest P1 lifted but P2
- * cannot plan falls back to the legacy lowering.
+ * cannot plan stays untouched through P3.
  */
 TVM_DLL tirx::PrimFunc PlanArray(tirx::PrimFunc func);
 

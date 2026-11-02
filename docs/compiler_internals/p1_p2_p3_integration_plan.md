@@ -15,8 +15,8 @@
 > TIR + tl.simd.*（真实 Ascend 向量指令）
 > ```
 >
-> 三个 Pass 连续执行；P3 之后未处理的 `T.Parallel` 仍由既有
-> `AscendSimdVFLowerParallel` 兜底，保证灰度期可回退。
+> 三个 Pass 由组合 Pass `AscendPolyhedralVectorize` 连续执行，是流水线里
+> `T.Parallel` 的唯一降级路径；未被规划的 nest 原样保留（不再有第二个 emitter 兜底）。
 
 本文档覆盖现状差异、对接设计、C++ 迁移、测试验证与分阶段执行计划。
 
@@ -230,7 +230,7 @@ update_mask / vsel / vcvt / vcadd/vcmax/vcmin / vsts / vscatter`。
 | D11 | 合法性语义：写单射 + 跨迭代无 RAW/WAR/WAW；数据相关/`select` 索引 `UNPROVEN` | 支持 STRIDED / PERMUTE / PIECEWISE / INDIRECT 写（`vscatter`） | 权威边界冲突 | A8 等间接写会被 P1 拒绝；反之 P2 对重复地址 scatter 无单射证明 | **P1 始终是合法性权威**；P1 放行面即基线。间接/无结构写作为扩展，需 P1 增加显式 scatter 契约后才放行 |
 | D12 | `local.var` 一律 `OPAQUE`/`UNSUPPORTED`；`ManualDetector` 检查 **SBlock 自身** 的 `alloc_buffers`，因此 VF 内（nest 外）的 `T.alloc_var` 也会把整个 VF 判 OPAQUE | 私有标量提升（S2）：`local`/`local.var` RMW 提升为向量寄存器 | 能力冲突 | S2 场景在 P1 被拒；仅放宽 nest 内 `local.var` 不够，SBlock 级 detector 仍会短路 | P1 v2 结构化模式增加 `local_var_as_capture` 开关：SBlock/nest 内的 `local.var` 登记为 capture 而非 OPAQUE；`tl.simd.*`/`tl.ascend_nd2nz*` 仍判 OPAQUE；legacy 报告行为不变 |
 | D13 | `captures` 种类 `param/alloc/local/view` | P2 需要 buffer scope（尤其 `global` 判拒） | 字段可映射 | 无阻断 | 适配层按 `Buffer::scope()` 补齐/校验 `in_global` |
-| D14 | `layouts: Buffer -> Layout`；`layout_changing` 只在 PR-A 报告里 | P2/P3 当前未消费；设计上用于 `vsts` vs `vsstb` | 预留字段未接线 | 暂无功能影响 | 契约保留；P3 增加 layout-aware store 作为扩展 |
+| D14 | `layouts: Buffer -> Layout`；`layout_changing` 只在 PR-A 报告里 | P2/P3 消费：显式 NZ 目标 → `vsstb` 散射（`StorePlan.layout_kind/nz_block_stride/nz_elem_stride`）；半寄存器窄化走配对形态 | 已接线 | 无（ND 默认路径零差异） | 已实现：region `layouts` 经 `PlanOptions` 进入 P2，块步长由 `Layout::Forward` 推导；`P2InputToMap["layouts"]` 暴露注解 buffer 名；2b 配对（`vdintlv`+`vcvt part0/1`+`vor`+单条 `vsstb`）同一段级契约 |
 | D15 | `accesses` 要求 index rank == buffer rank（G5） | `linear_element_offset` 对 store 同样要求 rank 匹配 | 一致 | 无 | 适配层保留 G5 诊断 |
 | D16 | `LoopInfo.min` 任意 | `_require_zero_min` 要求可证为 0 | 语义一致 | 非 0 下界明确拒绝 | 适配层把 `min` 传给 P2；P2 保留 R5 诊断 |
 | D17 | `shape_syms` + `bindings` 支撑符号 extent | D9 符号 extent 走运行时 chunk 循环；非归约/归约都支持 | 表示层差异 | 符号 extent 可支持 | 域变量 + shape_syms 原样进入 `PlanOptions`；`legacy_parity` 模式下 analyzer 只绑定轴范围 |
@@ -405,7 +405,7 @@ tirx::Stmt EmitPlan(const VectorProgram &plan, const EmitContext &ctx);
 
 - 三个 Pass **必须连续执行**，中间不得插入普通优化（与顶层设计 §9 的 annotation carrier 约束一致）；
 - P3 读取 plan 后，替换前用 `nest_fingerprint` 做结构校验；校验失败 → `LOG(WARNING)` + 跳过，
-  由 legacy `AscendSimdVFLowerParallel` 兜底。
+  该 nest 原样保留。
 
 > 备选方案：若自定义 Object 节点成本过高，可先把 P2/P3 实现为同一个
 > `AscendPolyhedralVectorize` Pass 内的两个阶段（仍保留独立 FFI 查询入口）。
@@ -491,27 +491,24 @@ tirx::Stmt EmitPlan(const VectorProgram &plan, const EmitContext &ctx);
 
 ```python
 mod = ascend_transform.NormalizeBufferVersion()(mod)
-mod = ascend_transform.AscendLiftParallelToArray()(mod)   # 新增 P1
-mod = ascend_transform.AscendPlanArray()(mod)             # 新增 P2
-mod = ascend_transform.AscendLowerArrayPlan()(mod)        # 新增 P3
-mod = ascend_transform.AscendSimdVFLowerParallel()(mod)   # 既有兜底
+mod = ascend_transform.AscendPolyhedralVectorize()(mod)   # P1 -> P2 -> P3
 mod = ascend_transform.AscendLowerTileOp()(mod)
 ```
 
 约束：
 
 - 三个 Pass 必须相邻；P2/P3 不依赖任何其它 Pass 的输出形态；
-- 增加配置开关（建议 `TL_ENABLE_POLYHEDRAL_VECTORIZE`），灰度期默认关闭，验收后默认开启；
-- P3 只替换“有 plan 且指纹校验通过”的 nest；其余留给 legacy emitter；
+- 不需要 PassContext 开关：组合 Pass 已无条件接入，P1/P2/P3 也可用独立 FFI 入口单独调用；
+- P3 只替换“有 plan 且指纹校验通过”的 nest；其余原样保留为串行循环；
 - P1/P2 对函数体 `structural_equal`；只有 P3 修改 IR；
 - P3 不得调用 `arith::Analyzer`、`classify_access`、`build_value` 等分析函数（CI 架构断言）。
 
-### 3.4 与 legacy 路径的共存
+### 3.4 与旧 emitter 的关系
 
-- `AscendSimdVFLowerParallel` 仍是唯一的“最后兜底”；P3 不做整 VF 替换，只替换单 nest；
-- 若一个 VF 内部分 nest 被 P3 替换、部分回退，legacy emitter 仍能处理剩余的 `T.Parallel`；
-- 需要新增回归用例：同一 VF 内“一个可规划 + 一个不可规划 nest”，验证混合 IR 不产生重复发射/漏发射；
-- 当 `TL_ENABLE_POLYHEDRAL_VECTORIZE=0` 时，P1/P2/P3 全部 no-op，行为与当前 `Parallel_lowering` 完全一致。
+- `AscendPolyhedralVectorize` 取代 `AscendSimdVFLowerParallel`，后者不再接入流水线；
+- P3 不做整 VF 替换，只替换单 nest；同一 VF 内“可规划 + 不可规划”的混合是合法结果，
+  不可规划的那个保持 `T.Parallel`（最终按串行循环发射）；
+- 需要回归用例：同一 VF 内“一个可规划 + 一个不可规划 nest”，验证混合 IR 不产生重复发射/漏发射。
 
 ### 3.5 编码与仓库规范
 
@@ -703,8 +700,8 @@ P2 代码不包含任何 `PrimFunc/IRModule/SIMD_VF` 依赖（CI grep）。
 | 混合 VF 重复发射 | P3 替换 + legacy 同 VF 兜底 | 只替换单 nest；新增混合 VF 用例；P3 后统计残留 Parallel |
 | 性能回退 | 计划/发射与旧 emitter 不一致 | 记录 IR 体积/编译时间/指令数；先灰度后默认开启 |
 
-**一键回滚**：`TL_ENABLE_POLYHEDRAL_VECTORIZE=0` 时 P1/P2/P3 全部 no-op，
-`AscendSimdVFLowerParallel` 行为与当前分支完全一致。
+**回滚**：不再提供 PassContext 开关；需要回滚时在 `pipeline.py` 里移除
+`AscendPolyhedralVectorize` 的调用（P1/P2/P3 均为纯 IR 变换，仍可用独立 FFI 入口调用）。
 
 ---
 

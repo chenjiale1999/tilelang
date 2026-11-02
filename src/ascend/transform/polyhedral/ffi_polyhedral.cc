@@ -33,10 +33,6 @@ namespace tvm {
 namespace tl {
 namespace polyhedral {
 
-// Pipeline switch: ``legacy`` (default) keeps the historical behavior, ``cpp``
-// enables this vectorizer (the only implementation behind the pass).
-TVM_REGISTER_PASS_CONFIG_OPTION("tl.ascend.polyhedral.impl", ffi::String);
-
 namespace {
 
 ffi::Map<ffi::String, ffi::Any> MakeError(const Unsupported& error) {
@@ -105,17 +101,29 @@ tvm::transform::Pass MakeStagePass(const char* name,
  * fails we keep descending so inner nests still get a chance. Bottom-up would
  * leave the outer ``T.Parallel`` behind, hence pre-order.
  */
+/*! \brief Turn the optional FFI layout map into the planner context. */
+PlanOptions MakePlanOptions(const ffi::Optional<ffi::Map<tirx::Buffer, Layout>>& layouts) {
+  PlanOptions options;
+  if (layouts.has_value()) {
+    for (const auto& entry : *layouts) {
+      options.layouts.emplace_back(entry.first, entry.second);
+    }
+  }
+  return options;
+}
+
 class NestVectorizer : public tirx::StmtMutator {
  public:
-  explicit NestVectorizer(std::optional<int64_t> lanes) : lanes_(lanes) {}
+  NestVectorizer(std::optional<int64_t> lanes, PlanOptions options)
+      : lanes_(lanes), options_(std::move(options)) {}
 
   tirx::Stmt VisitStmt_(const tirx::ForNode* op) final {
     if (op->kind == tirx::ForKind::kParallel) {
       try {
-        VectorProgram program = BuildPlan(ffi::GetRef<tirx::Stmt>(op), lanes_);
+        VectorProgram program = BuildPlan(ffi::GetRef<tirx::Stmt>(op), lanes_, options_);
         return EmitPlan(program);
       } catch (const Unsupported&) {
-        // Keep the nest untouched; legacy lowering takes over.
+        // Keep the nest untouched; the pipeline runs no other lowering.
       }
     }
     return tirx::StmtMutator::VisitStmt_(op);
@@ -123,6 +131,7 @@ class NestVectorizer : public tirx::StmtMutator {
 
  private:
   std::optional<int64_t> lanes_;
+  PlanOptions options_;
 };
 
 }  // namespace
@@ -132,9 +141,10 @@ ffi::Array<ffi::Any> AscendPolyhedralAxisClass(const AccessInfo& info, const Axi
 }
 
 ffi::Map<ffi::String, ffi::Any> AscendPolyhedralBuildPlan(
-    const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes) {
+    const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes,
+    ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts) {
   return Guarded([&]() {
-    VectorProgram program = BuildPlan(stmt, OptionalLanes(lanes));
+    VectorProgram program = BuildPlan(stmt, OptionalLanes(lanes), MakePlanOptions(layouts));
     return MakeOk("program", ffi::Any(program));
   });
 }
@@ -149,9 +159,10 @@ ffi::Map<ffi::String, ffi::Any> AscendPolyhedralRenderPlan(const ffi::ObjectRef&
 }
 
 ffi::Map<ffi::String, ffi::Any> AscendPolyhedralVectorizeNests(
-    const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes) {
+    const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes,
+    ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts) {
   return Guarded([&]() {
-    NestVectorizer vectorizer(OptionalLanes(lanes));
+    NestVectorizer vectorizer(OptionalLanes(lanes), MakePlanOptions(layouts));
     return MakeOk("stmt", ffi::Any(vectorizer(stmt)));
   });
 }

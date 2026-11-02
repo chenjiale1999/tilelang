@@ -21,6 +21,10 @@ Covered contract (one test per catalogued case):
 
 * §0 Case I   copy / scalar broadcast, and the no-operand (Copy / Brc) shape;
 * §0 Case II  a global-memory operand is rejected (needs UB staging first);
+* §0 Case III user-allocated ``T.alloc_fragment`` (the V-core register tile) read
+  and written directly in ``T.Parallel``: both nests are lifted by P1 and the
+  fragment is planned/emitted as a contiguous ND buffer (fill: UB → reg,
+  consume: reg → UB);
 * §1 Case I   ``if`` / ``if-else`` (two-arm merged to ``vsel``, single arm to a
   predicated store);
 * §1 Case II  ternary (``T.if_then_else`` / ``tirx.Select``): a *loop-invariant*
@@ -66,6 +70,13 @@ Covered contract (one test per catalogued case):
   being swallowed by the single-segment fallback.
 * transform   ``vectorize_parallel_nests`` lowers a whole multi-axis nest
   (outer axes → serial, vector axis → strip-mined chunks).
+* P1→P2 交付  ``AscendBuildP2PlanInputs`` 的接口契约：LIFTED 的 nest 必带一个
+  可直接规划的 ``stmt``（与直接规划原 nest 的 plan/emit 逐字段一致），
+  ``FALLBACK`` / ``OPAQUE`` / Branch B 只带状态不带 ``stmt``。
+* 三段 pass   ``AscendLiftParallelToArray`` → ``AscendPlanArray`` →
+  ``AscendLowerArrayPlan`` 的 carrier 交接、幂等，以及被拒 nest 逐字节不变。
+* 流水线      ``AscendPolyhedralVectorize`` 是唯一的 ``T.Parallel`` 降级路径，
+  默认配置下就运行（没有 impl 开关），生成的设备源码带 ``simd_inst::``。
 
 The mathematical core (``finite_difference`` / ``classify_delta``) is unit
 tested directly, since every case above is decided by the sign/shape of
@@ -75,14 +86,17 @@ tested directly, since every case above is decided by the sign/shape of
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 
 import pytest
 
+import tilelang
 import tilelang.ascend.language as T
 import tvm
 from tvm import arith, tirx
 
+from tilelang.ascend import transform as at
 from tilelang.ascend.analysis.polyhedral import (
     AccessClass,
     Unsupported,
@@ -94,6 +108,44 @@ from tilelang.ascend.analysis.polyhedral import (
     render_plan,
     vectorize_parallel_nests,
 )
+from tilelang.layout import (
+    make_ascend_compact_nz_layout,
+    make_ascend_major_mn_layout,
+    make_ascend_nz_layout,
+)
+
+
+# ---------------------------------------------------------------------------
+# IR dump switch
+# ---------------------------------------------------------------------------
+#
+# ``TL_POLYHEDRAL_DUMP_IR=1 pytest -s <this file>`` prints, for every case that
+# calls the helpers below, the plan render and the vectorized IR (for the FA
+# case: the P1 region report and the whole pass output). Off by default so the
+# normal suite stays silent.
+_DUMP_ENV = "TL_POLYHEDRAL_DUMP_IR"
+
+
+def _dump_enabled() -> bool:
+    return os.environ.get(_DUMP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dump_plan_ir(label: str, plan) -> None:
+    """打印 plan 渲染 + 向量化后的 IR（受 ``TL_POLYHEDRAL_DUMP_IR`` 控制）。"""
+    if not _dump_enabled():
+        return
+    print(f"\n===== {label}: plan =====")
+    print(render_plan(plan))
+    print(f"===== {label}: vectorized IR =====")
+    print(emit_plan(plan))
+
+
+def _dump_stmt(label: str, stmt) -> None:
+    """打印一段整 IR（pass 产物 / 报告），同样受开关控制。"""
+    if not _dump_enabled():
+        return
+    print(f"\n===== {label} =====")
+    print(stmt)
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +182,43 @@ def _for_kinds(stmt) -> list:
     return kinds
 
 
-def _plan(func):
-    return build_plan(_first_parallel(func))
+def _plan(func, layouts=None):
+    return build_plan(_first_parallel(func), layouts=layouts)
+
+
+def _emitted_text(func, layouts=None) -> str:
+    """向量化后的 IR 文本（阶段一/阶段二的 store 形态断言用）。"""
+    return str(emit_plan(_plan(func, layouts)))
+
+
+def _count_parallel_nests(stmt) -> int:
+    count = 0
+
+    def visit(node):
+        nonlocal count
+        if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL:
+            count += 1
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return count
+
+
+def _buffer(func, name: str) -> tirx.Buffer:
+    found: dict = {}
+
+    def visit(node):
+        if isinstance(node, tirx.BufferLoad):
+            found[node.buffer.name] = node.buffer
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    assert name in found, f"buffer {name!r} is not accessed by the kernel"
+    return found[name]
+
+
+def _nz(func, factory=make_ascend_compact_nz_layout, name: str = "c_ub"):
+    """显式 NZ 布局的 ``{Buffer: Layout}``（P1 region 交接的手工等价）。"""
+    buffer = _buffer(func, name)
+    return {buffer: factory(buffer)}
 
 
 def _single_segment(func):
@@ -395,6 +482,62 @@ def test_global_operand_rejected():
 
     with pytest.raises(Unsupported, match="global-memory operand"):
         _plan(k)
+
+
+def test_manual_fragment_register_in_parallel():
+    """§0 Case III: a user-allocated fragment (the V-core register tile) read and
+    written directly in ``T.Parallel`` — the most general shape of a topk-gate
+    style kernel, without the statement-level ``if`` that P1 still rejects.
+
+    Data has to be staged in UB first (a GM operand inside ``T.SimdVF`` is a
+    front-end semantic error and P2's Branch B), so the kernel has two nests:
+    fill the register tile from UB, then consume it into UB.  Both nests are
+    LIFTED by P1; P2 treats the fragment as a contiguous ND buffer, and P3
+    emits ``vld``/``vsts`` for the register tile (fill) and for the UB write
+    (consume).  This pins the P1/P2/P3 hand-off; giving the fragment *register*
+    semantics in the final codegen is a separate downstream concern.
+    """
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i] + 1.0
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i] * 2.0
+            T.copy(c_ub, C)
+    print(f"\nfunc:\n{k}")
+    items = _p1_inputs(k)
+    print(f"p1:\n{items}")
+    assert [item["status"] for item in items] == ["LIFTED", "LIFTED"]
+    assert [_stored_buffers(item["stmt"]) for item in items] == [["frag"], ["c_ub"]]
+
+    fill = build_plan(items[0]["stmt"]).segments[0]
+    print(f"p2:\n{fill}")
+    assert fill.vector_axis.name == "i"
+    assert (fill.lanes, fill.chunks, fill.tail) == (64, 1, 0)
+    assert fill.stores[0].kind == AccessClass.CONTIGUOUS
+    assert fill.stores[0].spec.buffer.scope() == "local.fragment"
+    assert fill.stores[0].value.recipe == "vadds"
+    fill_ops = _emitted_ops(emit_plan(fill))
+    print(f"p3:\n{emit_plan(fill)}")
+    print(f"p3:\n{fill_ops}")
+    assert "tl.simd.vld" in fill_ops and "tl.simd.vsts" in fill_ops
+
+    use = build_plan(items[1]["stmt"]).segments[0]
+    print(f"p2-2:\n{use}")
+    assert use.vector_axis.name == "i"
+    assert use.stores[0].kind == AccessClass.CONTIGUOUS
+    assert _recipes(use.stores[0].value) == ["vmuls", "vload", "imm"]
+    use_ops = _emitted_ops(emit_plan(use))
+    print(f"p3-2:\n{emit_plan(use)}")
+    assert "tl.simd.vld" in use_ops and "tl.simd.vsts" in use_ops
 
 
 # ---------------------------------------------------------------------------
@@ -809,8 +952,9 @@ def test_vector_minus_scalar_still_folds_to_vadds():
 
 
 def test_mixed_element_width_segment_is_rejected():
-    """P0-2：一段共享一个 lane 数（chunk 步长 = lanes）。f16 与 int32 混写时后者的
-    向量寄存器只有一半 lane，会静默漏写/越界 → build 期必须拒绝。"""
+    """P0-2 + Stage 1：一段共享一个 chunk 宽度（chunk 步长 = lanes）。f16 与 int32
+    混写时后者每个 chunk 只能覆盖一半元素，会静默漏写/越界；因此宽于 chunk 的
+    store 必须是窄化转换（``vcvt`` 打包写），普通 store 仍然必须拒绝。"""
     N = 128
 
     @T.prim_func
@@ -829,7 +973,7 @@ def test_mixed_element_width_segment_is_rejected():
                 cf[i] = af[i]
                 ci[i] = ai[i]
 
-    with pytest.raises(Unsupported, match="mixed element widths"):
+    with pytest.raises(Unsupported, match="not a narrowing conversion"):
         _plan(k)
 
 
@@ -3129,3 +3273,1270 @@ def test_carry_tracks_the_newest_producer():
     ops = _emitted_ops(stmt)
     assert ops.count("tl.simd.vld") == 1, "段 1 的初值与段 2 的读都应由直通/最新寄存器满足"
     assert "accs1_0[0]" in str(stmt), "消费段必须使用段 1 回写的寄存器（最新生产者）"
+
+
+# ===========================================================================
+# 阶段一：同一段内混合元素宽度（窄化 cast → 半寄存器 + PK 打包写）
+# ===========================================================================
+#
+# 一个 ``float32 -> bfloat16`` 的窄化 ``Cast`` 只把 64 条 f32 lane 变成 64 个
+# 有效 bf16（bf16 寄存器有 128 lane），所以段宽取各 store 实际产出的最小值
+# （``plan.lanes``），并把每个 store 自己寄存器被写到的比例记在
+# ``store_lane_mode``；更宽的一方用打包写（``PK_B*``），与板级验证过的 cast
+# kernel 完全一致。硬件无关：只断言 plan 字段与发射结构。
+
+_WIDE = 128
+
+
+def _mixed_width_kernel():
+    """fp32 store + bf16 narrowing store（FA softmax 的形状）。"""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                b_ub[i, j] = T.exp(a_ub[i, j])
+                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    return k
+
+
+def test_mixed_width_segment_uses_min_lane_width():
+    plan = _plan(_mixed_width_kernel())
+    assert len(plan.segments) == 1
+    segment = plan.segments[0]
+
+    # 16384 logical elements: a float32 register covers 64 of them per chunk.
+    assert segment.lanes == 64
+    assert segment.chunks == 2  # vector axis j is 128 wide
+    assert segment.tail == 0
+
+    fp32_store, bf16_store = segment.stores
+    assert fp32_store.store_lanes == 64
+    assert fp32_store.store_lane_mode == "full"
+    assert fp32_store.store_pack_bits is None
+
+    assert bf16_store.store_lanes == 128
+    assert bf16_store.store_lane_mode == "pk_half"
+    # The packed store suffix is the width of the conversion source register.
+    assert bf16_store.store_pack_bits == 32
+    assert bf16_store.value.recipe == "vcvt"
+
+
+def test_mixed_width_segment_emits_packed_store_with_part_even():
+    _dump_plan_ir("mixed width", _plan(_mixed_width_kernel()))
+    text = _emitted_text(_mixed_width_kernel())
+
+    # Full-width store keeps the historical contiguous form.
+    assert '"NORM_B32"' in text
+    # The wider store writes exactly 64 bfloat16 elements through the packed form.
+    assert '"PK_B32"' in text
+    assert '"NORM_B16"' not in text, "the bf16 store must not write its full register"
+    # The narrowing conversion selects the even 16-bit slots (``simd.vcvt(part=0)``,
+    # the verified cast-kernel recipe); the packed store then writes those lanes.
+    assert "PART_EVEN" in text
+    # store -> load forwarding: the cast reads the freshly computed register
+    # instead of reloading UB (no VST->VLD barrier needed).
+    assert text.count("tl.simd.vld") == 1
+
+
+def test_mixed_width_segment_vectorizes_the_whole_nest():
+    stmt = vectorize_parallel_nests(_mixed_width_kernel().body)
+    assert _count_parallel_nests(stmt) == 0
+    text = str(stmt)
+    assert "tl.simd.vsts" in text
+    assert "PK_B32" in text
+
+
+def test_narrowing_cast_store_alone_packs_half_register():
+    """A lone ``f32 -> bf16`` store is the same shape: 64 of 128 lanes."""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
+            T.copy(c_ub, C)
+
+    segment = _plan(k).segments[0]
+    assert segment.lanes == 64
+    assert segment.stores[0].store_lane_mode == "pk_half"
+    assert segment.stores[0].store_pack_bits == 32
+
+    text = _emitted_text(k)
+    assert '"PK_B32"' in text
+    assert "PART_EVEN" in text, "narrowing needs the half-register part selector"
+
+
+def test_same_width_segment_keeps_full_mode():
+    """Zero-diff guard: an ordinary fp32 nest still uses the full store form."""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                b_ub[i, j] = T.exp(a_ub[i, j])
+            T.copy(b_ub, B)
+
+    segment = _plan(k).segments[0]
+    assert segment.lanes == 64
+    assert segment.stores[0].store_lane_mode == "full"
+    assert segment.stores[0].store_pack_bits is None
+
+    text = _emitted_text(k)
+    assert '"NORM_B32"' in text
+    assert "PK_B" not in text
+
+
+def test_mixed_width_with_tail_is_rejected():
+    """M = 96 is not a multiple of the 64-lane chunk width."""
+
+    m = 96
+
+    @T.prim_func
+    def k(A: T.Tensor((m,), "float32"), B: T.Tensor((m,), "float32"),
+          C: T.Tensor((m,), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((m,), "float32")
+            b_ub = T.alloc_shared((m,), "float32")
+            c_ub = T.alloc_shared((m,), "bfloat16")
+            T.copy(A, a_ub)
+            for i in T.Parallel(m):
+                b_ub[i] = T.exp(a_ub[i])
+                c_ub[i] = T.Cast("bfloat16", b_ub[i])
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="tails are not supported"):
+        _plan(k)
+
+
+def test_mixed_width_with_predicate_is_rejected():
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                if j < _WIDE - 8:
+                    b_ub[i, j] = T.exp(a_ub[i, j])
+                    c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="statement predicate"):
+        _plan(k)
+
+
+def test_mixed_width_with_reduction_is_rejected():
+    """A reduction store cannot share a chunk with a wider-lane store.
+
+    The lane-uniform/partial-lane guards may fire before ``ClassifyReduce``; the
+    Stage 1 reduction guard is the second line of defence. Either way the nest
+    must be rejected, never lowered with a truncated accumulator.
+    """
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), S: T.Tensor((_WIDE,), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            s_ub = T.alloc_shared((_WIDE,), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                s_ub[i] = s_ub[i] + a_ub[i, j]
+                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
+            T.copy(s_ub, S)
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="no vectorizable axis"):
+        _plan(k)
+
+
+def test_mixed_width_with_wider_load_is_rejected():
+    """The chunk is 64 lanes, so a 128-lane load inside it is not proved."""
+
+    @T.prim_func
+    def k(A16: T.Tensor((_WIDE, _WIDE), "float16"), B: T.Tensor((_WIDE, _WIDE), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a16_ub = T.alloc_shared((_WIDE, _WIDE), "float16")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A16, a16_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                b_ub[i, j] = T.Cast("float32", a16_ub[i, j]) + T.float32(1.0)
+                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="-lane wide"):
+        _plan(k)
+
+
+# ===========================================================================
+# 阶段二：目标 buffer 带显式 NZ 布局（寄存器直写 + 半寄存器配对形态）
+# ===========================================================================
+#
+# 写一个注解成 Ascend NZ（compact ``[col/C0, row, col%C0]`` 或 canonical MajorK）
+# 的 buffer 不能用连续写：planner 把该 store 判成 ``layout_kind == "nz"``，块步长
+# 由布局前向映射推导，emitter 用 ``tl.simd.vsstb`` 散射。
+#
+# 窄化 store（``f32 -> bf16``）只填自己寄存器的一半，而 ``vsstb`` 没有 PK 变体，
+# 所以阶段 2b 先把它加宽：一个 chunk 对的两半由一条 ``vld2(DINTLV_B32)`` 反交织
+# 取出，分别窄化进目标寄存器的偶/奇 16-bit 槽（``vcvt PART_EVEN/PART_ODD``），
+# ``vor`` 合并成满寄存器后一条 ``vsstb`` 散射整行；同段的连续目标在写回处用
+# ``vintlv`` 还原。块步长是算出来的，不是硬编码。
+
+
+def _nz_2d_kernel():
+    """``c_ub[i, j] = exp(a_ub[i, j])``：一条 fp32 store，源是 ND。"""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                c_ub[i, j] = T.exp(a_ub[i, j])
+            T.copy(c_ub, C)
+
+    return k
+
+
+def test_compact_nz_store_is_classified_with_layout_block_stride():
+    kernel = _nz_2d_kernel()
+    segment = _plan(kernel, _nz(kernel)).segments[0]
+    store = segment.stores[0]
+
+    assert segment.lanes == 64
+    assert store.layout_kind == "nz"
+    # Compact NZ is [col/C0, row, col%C0]; two neighbouring 32B blocks are
+    # ``rows`` blocks apart, i.e. 128 * 8 fp32 elements / C0 = 128 blocks.
+    assert store.nz_block_stride == _WIDE
+    assert store.nz_elem_stride == 1
+
+
+def test_compact_nz_store_emits_vsstb_with_block_stride():
+    kernel = _nz_2d_kernel()
+    layouts = _nz(kernel)
+    _dump_plan_ir("compact NZ store", _plan(kernel, layouts))
+    text = _emitted_text(kernel, layouts)
+
+    assert "tl.simd.vsstb" in text
+    # (block_stride << 16) | elem_stride = (128 << 16) | 1
+    assert str((_WIDE << 16) | 1) in text
+    # The register is scattered, never written contiguously.
+    assert "tl.simd.vsts" not in text
+
+
+def test_canonical_nz_store_uses_the_same_block_stride():
+    kernel = _nz_2d_kernel()
+    layouts = _nz(kernel, make_ascend_nz_layout)
+    store = _plan(kernel, layouts).segments[0].stores[0]
+
+    assert store.layout_kind == "nz"
+    assert store.nz_block_stride == _WIDE
+    assert store.nz_elem_stride == 1
+    assert "tl.simd.vsstb" in _emitted_text(kernel, layouts)
+
+
+def test_nz_store_vectorizes_the_whole_nest():
+    kernel = _nz_2d_kernel()
+    layouts = _nz(kernel)
+    stmt = vectorize_parallel_nests(kernel.body, layouts=layouts)
+
+    assert _count_parallel_nests(stmt) == 0
+    text = str(stmt)
+    assert "vsstb" in text
+    assert "vsts" not in text
+
+
+def test_nd_destination_keeps_the_contiguous_store():
+    """Zero-diff guard: no explicit layout ⇒ the historical ND form."""
+
+    kernel = _nz_2d_kernel()
+    store = _plan(kernel).segments[0].stores[0]
+
+    assert store.layout_kind == "nd"
+    assert store.nz_block_stride is None
+    assert store.nz_elem_stride is None
+
+    text = _emitted_text(_nz_2d_kernel())
+    assert '"NORM_B32"' in text
+    assert "vsstb" not in text
+
+
+def test_p1_hand_off_exposes_the_annotated_layouts():
+    """P1 hands the annotated buffer names over to P2 with the region."""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            T.copy(A, a_ub)
+            T.annotate_layout({c_ub: make_ascend_compact_nz_layout(c_ub)})
+            with T.SimdVF():
+                for i, j in T.Parallel(_WIDE, _WIDE):
+                    c_ub[i, j] = T.exp(a_ub[i, j])
+            T.copy(c_ub, C)
+
+    lifted = [item for item in at.AscendBuildP2PlanInputs(k) if item["status"] == "LIFTED"]
+    assert lifted, "the nest must be lifted"
+    assert list(lifted[0]["layouts"]) == ["c_ub"]
+
+
+def test_explicit_non_nz_layout_is_rejected():
+    kernel = _nz_2d_kernel()
+    layouts = _nz(kernel, make_ascend_major_mn_layout)
+
+    with pytest.raises(Unsupported, match="explicit non-NZ layout"):
+        _plan(kernel, layouts)
+
+
+def test_half_register_nz_store_is_paired_into_a_full_register():
+    """Stage 2b：窄化 + NZ 用配对形态（vld2 + part0/1 + vor + 一条 vsstb）。"""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                b_ub[i, j] = T.exp(a_ub[i, j])
+                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    store = _plan(k, _nz(k)).segments[0].stores[1]
+    assert store.store_lane_mode == "pk_half"
+    assert store.layout_kind == "nz"
+    assert store.nz_block_stride == _WIDE
+
+    _dump_plan_ir("narrow + NZ (pack2)", _plan(k, _nz(k)))
+    text = _emitted_text(k, _nz(k))
+    # 两个 chunk 的 f32 值由一条 vld2 反交织取出，再分别写进目标寄存器的
+    # 偶数/奇数 16-bit 槽。
+    assert text.count("tl.simd.vld2(") == 1
+    assert "DINTLV_B32" in text
+    assert "tl.simd.vdintlv" not in text, "反交织已经折进 vld2，不应再发一次"
+    assert "PART_EVEN" in text
+    assert "PART_ODD" in text
+    assert "tl.simd.vor" in text
+    assert "uint16x128" in text
+    # 同段的 ND 目标在写回处还原成连续两半：vintlv + 两条 vsts。
+    assert "tl.simd.vintlv" in text
+    assert text.count("tl.simd.vsts") == 2
+    # 合并后是满寄存器：一条 vsstb 散射整行，不再需要半寄存器打包写。
+    assert text.count("tl.simd.vsstb") == 1
+    assert str((_WIDE << 16) | 1) in text
+    assert '"PK_B32"' not in text
+
+
+def test_paired_store_alone_loads_both_chunks():
+    """单条窄化 + NZ store：一条 vld2 -> 两个 part -> 一条 vsstb（DSA 配方）。"""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
+            T.copy(c_ub, C)
+
+    text = _emitted_text(k, _nz(k))
+    assert text.count("tl.simd.vld2(") == 1
+    assert "tl.simd.vld(" not in text
+    assert "tl.simd.vdintlv" not in text
+    assert text.count("tl.simd.vsstb") == 1
+
+
+def test_paired_store_loops_over_chunk_pairs():
+    """4 chunks = 2 pairs: 每次迭代推进两个 chunk，vsstb 在循环内只发一条。"""
+
+    rows, wide = 64, 256
+
+    @T.prim_func
+    def k(A: T.Tensor((rows, wide), "float32"), C: T.Tensor((rows, wide), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((rows, wide), "float32")
+            c_ub = T.alloc_shared((rows, wide), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(rows, wide):
+                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
+            T.copy(c_ub, C)
+
+    segment = _plan(k, _nz(k)).segments[0]
+    assert segment.lanes == 64
+    assert segment.chunks == 4
+
+    text = _emitted_text(k, _nz(k))
+    # 每对 chunk 一次迭代：chunk 索引 2*pair，步长 2 * lanes。
+    assert "T.grid(%d, 2)" % rows in text
+    assert "chunk_s0 * 128" in text
+    assert text.count("tl.simd.vsstb") == 1
+    assert str((rows << 16) | 1) in text
+
+
+def test_paired_store_needs_whole_chunk_pairs():
+    """64 列 = 1 个 chunk，凑不出一个 chunk 对。"""
+
+    m = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, m), "float32"), C: T.Tensor((_WIDE, m), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, m), "float32")
+            c_ub = T.alloc_shared((_WIDE, m), "bfloat16")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, m):
+                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="whole chunk pairs"):
+        _plan(k, _nz(k))
+
+
+def test_paired_store_must_be_the_last_store():
+    """合并寄存器只在配对结束后才存在，打包 store 后面不能再有语句。"""
+
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32"),
+          C: T.Tensor((_WIDE, _WIDE), "bfloat16"), D: T.Tensor((_WIDE, _WIDE), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
+            d_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                b_ub[i, j] = T.exp(a_ub[i, j])
+                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
+                d_ub[i, j] = b_ub[i, j] * T.float32(2.0)
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+            T.copy(d_ub, D)
+
+    with pytest.raises(Unsupported, match="must be the last store"):
+        _plan(k, _nz(k))
+
+
+def test_nz_store_with_predicate_is_rejected():
+    @T.prim_func
+    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            c_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(_WIDE, _WIDE):
+                if j < _WIDE - 8:
+                    c_ub[i, j] = T.exp(a_ub[i, j])
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="statement predicate"):
+        _plan(k, _nz(k))
+
+
+def test_nz_store_with_partial_column_chunk_is_rejected():
+    """96 columns is not a whole number of 64-element chunks."""
+
+    m = 96
+
+    @T.prim_func
+    def k(A: T.Tensor((m, m), "float32"), C: T.Tensor((m, m), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((m, m), "float32")
+            c_ub = T.alloc_shared((m, m), "float32")
+            T.copy(A, a_ub)
+            for i, j in T.Parallel(m, m):
+                c_ub[i, j] = T.exp(a_ub[i, j])
+            T.copy(c_ub, C)
+
+    with pytest.raises(Unsupported, match="whole number of chunks"):
+        _plan(k, _nz(k))
+
+
+# ===========================================================================
+# FA 闭环：parallel-softmax 的 P1→P2→P3 整段替换
+# ===========================================================================
+
+
+def _parallel_fa():
+    """构造 parallel-softmax FA 例子（示例目录不在 ``sys.path`` 上）。"""
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    fa_dir = repo / "examples/ascend/flash_attention"
+    if str(fa_dir) not in sys.path:
+        sys.path.insert(0, str(fa_dir))
+    from parallel_fa import parallel_flash_attention_fwd
+
+    return parallel_flash_attention_fwd()
+
+
+def test_parallel_fa_direct_nz_store_lifts():
+    func = _parallel_fa()
+    report = str(at.AscendAnalyzeVSimdRegionReport(func))
+    _dump_stmt("FA: P1 region report", report)
+    assert "status=LIFTED" in report
+    assert "domain: i in [0, 128) j in [0, 128)" in report
+    assert "W P_nz_ub[i, j] = T.Cast(" in report
+    assert "layout=annotated" in report
+    assert "layouts:" in report
+    assert "verify: OK" in report
+    # The P_nz store must be in the same region as the P_ub store.
+    assert "W P_ub[i, j] = T.exp" in report
+
+
+def test_parallel_fa_vectorizes_the_softmax_nest():
+    """整条 pass 把 P_ub + P_nz_ub 的 nest 换成 vld2 + part0/1 + vor + vsstb。"""
+    func = _parallel_fa()
+    out_func = at.AscendPolyhedralVectorize()(tvm.IRModule({"main": func}))["main"]
+    out = str(out_func)
+    _dump_stmt("FA: P1->P2->P3", out)
+
+    left = []
+
+    def visit(node):
+        if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL:
+            left.append(node)
+
+    tirx.stmt_functor.post_order_visit(out_func.body, visit)
+    assert not left, "the softmax nest must be replaced by the vectorized form"
+    assert "tl.simd.vld2" in out
+    assert "PART_ODD" in out
+    assert "tl.simd.vor" in out
+    assert "tl.simd.vsstb" in out
+    # P_nz_ub 是 129 行的 compact NZ：块步长 = (129 << 16) | 1。
+    assert str((129 << 16) | 1) in out
+
+
+def test_parallel_fa_scope_has_layout():
+    func = _parallel_fa()
+    infos = at.AscendAnalyzeSimdVFCaptureInfo(func)
+    nz_regions = [
+        info
+        for info in infos
+        if any("P_nz_ub" in str(name) for name in info["captures"])
+    ]
+    assert nz_regions
+    assert any("P_nz_ub" in lane for lane in nz_regions[0]["layouts"])
+
+
+# ===========================================================================
+# P1 -> P2 交付契约（``AscendBuildP2PlanInputs``）、三段 pass 与流水线接入
+# ===========================================================================
+#
+# 这一组钉的是“nest 之外的接口”。P2/P3 的规划与发射语义已由上面各节的
+# 场景用例覆盖（多 store、三元/if、归约、broadcast、transpose/flatten、
+# 混合宽度、NZ 等），这里不再重复 plan 字段，只覆盖三件事：
+#
+#   * 交付：LIFTED 的 ``stmt`` 能直接喂给 ``build_plan``，并且与直接规划原
+#     ``T.Parallel`` nest 的 plan/emit 逐字段一致；被拒 nest（FALLBACK /
+#     OPAQUE）只带状态、不带 ``stmt``；
+#   * 三段：P1/P2/P3 通过 ``tl.vsimd.array_region`` / ``tl.vsimd.array_plan``
+#     逐段交接，幂等，被拒 nest 逐字节不变；
+#   * 流水线：``AscendPolyhedralVectorize`` 是唯一的 ``T.Parallel`` 降级路径，
+#     默认 PassContext 下就运行。
+
+
+def _vf_report(func) -> str:
+    return str(at.AscendAnalyzeVSimdRegionReport(func))
+
+
+def _p1_inputs(func):
+    return at.AscendBuildP2PlanInputs(func)
+
+
+def _outer_parallel_nests(func) -> list:
+    """Outermost ``T.Parallel`` nests in source order (one per P1 nest)."""
+
+    nests: list = []
+
+    def walk(stmt):
+        if isinstance(stmt, tirx.For):
+            if stmt.kind == tirx.ForKind.PARALLEL:
+                nests.append(stmt)
+                return
+            walk(stmt.body)
+            return
+        if isinstance(stmt, tirx.SeqStmt):
+            for child in stmt.seq:
+                walk(child)
+            return
+        if isinstance(stmt, tirx.SBlockRealize):
+            walk(stmt.block)
+            return
+        body = getattr(stmt, "body", None)
+        if body is not None:
+            walk(body)
+
+    walk(func.body)
+    return nests
+
+
+def _lifted(func, index: int = 0):
+    """The ``index``-th P1 nest as a LIFTED hand-off item (with its ``stmt``)."""
+    items = _p1_inputs(func)
+    assert items, "no P1 nest was reported"
+    item = items[index]
+    assert item["status"] == "LIFTED", item.get("reason")
+    assert "stmt" in item, "LIFTED input must carry a statement"
+    return item
+
+
+def _stored_buffers(stmt) -> list:
+    names: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferStore):
+            names.append(node.buffer.name)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return names
+
+
+def _has_decl_buffer(stmt) -> bool:
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.DeclBuffer):
+            found.append(node)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return bool(found)
+
+
+def _plan_and_emit_parity(func, index: int = 0) -> None:
+    """The P1 hand-off ``stmt`` must plan/emit exactly like the original nest."""
+    item = _lifted(func, index)
+    original_plan = build_plan(_outer_parallel_nests(func)[index])
+    p1_plan = build_plan(item["stmt"])
+    assert render_plan(original_plan) == render_plan(p1_plan)
+    assert tvm.ir.structural_equal(emit_plan(original_plan), emit_plan(p1_plan), map_free_vars=True)
+    _dump_stmt("P1 hand-off stmt", item["stmt"])
+
+
+def _assert_no_stmt_rejected(func, allowed, reason_match: str):
+    items = _p1_inputs(func)
+    assert len(items) == 1
+    item = items[0]
+    assert item["status"] in allowed, (item["status"], item.get("reason"))
+    assert "stmt" not in item
+    assert reason_match in item["reason"]
+
+
+def _assert_branch_b(func, match: str, index: int = 0):
+    """P1 LIFTED but P2 rejects: the documented Branch B, not a bug."""
+    with pytest.raises(Unsupported, match=match):
+        build_plan(_lifted(func, index)["stmt"])
+
+
+def _run_stage(func, pass_factory):
+    """Run one staged pass (P1 / P2 / P3) on a PrimFunc."""
+    return pass_factory()(tvm.IRModule.from_expr(func))["main"]
+
+
+def _run_combined(func):
+    """Run the combined ``AscendPolyhedralVectorize`` pass on a PrimFunc."""
+    return at.AscendPolyhedralVectorize()(tvm.IRModule.from_expr(func))["main"]
+
+
+def _carriers(stmt, attr_key: str) -> list:
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.AttrStmt) and node.attr_key == attr_key:
+            found.append(node)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return found
+
+
+def _lower_source(func) -> str:
+    """Lower under the default pass context (no impl switch) to device source."""
+    with tvm.target.Target("ascend"), tilelang.transform.PassContext():
+        return tilelang.lower(func, target="ascend").kernel_source
+
+
+# ---------------------------------------------------------------------------
+# kernels
+# ---------------------------------------------------------------------------
+
+
+def _p1_kernel_1d():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_2d():
+    m, n = 8, 64
+
+    @T.prim_func
+    def main(A: T.Tensor((m, n), "float32"), C: T.Tensor((m, n), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((m, n), "float32")
+            c_ub = T.alloc_shared((m, n), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i, j in T.Parallel(m, n):
+                    c_ub[i, j] = a_ub[i, j] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_3d():
+    b0, b1, b2 = 2, 8, 16
+
+    @T.prim_func
+    def main(A: T.Tensor((b0, b1, b2), "float32"), C: T.Tensor((b0, b1, b2), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((b0, b1, b2), "float32")
+            c_ub = T.alloc_shared((b0, b1, b2), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i, j, k in T.Parallel(b0, b1, b2):
+                    c_ub[i, j, k] = a_ub[i, j, k] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_4d():
+    b0, b1, b2, b3 = 2, 2, 4, 8
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((b0, b1, b2, b3), "float32"),
+        C: T.Tensor((b0, b1, b2, b3), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((b0, b1, b2, b3), "float32")
+            c_ub = T.alloc_shared((b0, b1, b2, b3), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i, j, k, l in T.Parallel(b0, b1, b2, b3):
+                    c_ub[i, j, k, l] = a_ub[i, j, k, l] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_extent(extent: int):
+    @T.prim_func
+    def main(A: T.Tensor((extent,), "float32"), C: T.Tensor((extent,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((extent,), "float32")
+            c_ub = T.alloc_shared((extent,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(extent):
+                    c_ub[i] = a_ub[i] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_gm_operand_in_vf():
+    """GM load inside ``T.SimdVF``: P1 lifts it, P2 rejects it (Branch B)."""
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            c_ub = T.alloc_shared((n,), "float32")
+            with T.SimdVF():
+                for i in T.Parallel(n):
+                    c_ub[i] = A[i]
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_local_var():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                v = T.alloc_var("float32", init=0.0)
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] + v
+            T.copy(c_ub, C)
+
+    return main
+
+
+def _p1_kernel_opaque_evaluate():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n):
+                    T.evaluate(T.call_extern("float32", "opaque_side_effect", a_ub[i]))
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# 交付契约：LIFTED 带可规划的 stmt，拒绝项只带状态
+# ---------------------------------------------------------------------------
+
+
+def test_p1_lift_contract_1d():
+    func = _p1_kernel_1d()
+    item = _lifted(func)
+    assert (item["vf_index"], item["nest_index"]) == (0, 0)
+
+    stmt = item["stmt"]
+    assert isinstance(stmt, tirx.For)
+    assert stmt.kind == tirx.ForKind.PARALLEL
+    assert stmt.loop_var.name == "i"
+    assert int(stmt.min) == 0 and int(stmt.extent) == 64
+    assert _for_kinds(stmt) == [tirx.ForKind.PARALLEL]
+    assert _stored_buffers(stmt) == ["c_ub"]
+    assert len(_outer_parallel_nests(func)) == 1
+
+    report = _vf_report(func)
+    assert "VF#0 nest 0: status=LIFTED" in report
+    assert "domain: i in [0, 64)" in report
+    assert "W c_ub[i] = a_ub[i] + T.float32(1.0) shape=[64] axes=[0] dep={0}" in report
+    assert "R a_ub[i] shape=[64] axes=[0] dep={0}" in report
+    assert "for i in range(64)" in report
+    assert "verify: OK" in report
+    assert "tl.vsimd.region" in report
+
+    program = build_plan(stmt)
+    assert isinstance(program, VectorProgram)
+    assert program.axes == []
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    assert segment.vector_axis.name == "i"
+    assert (segment.lanes, segment.chunks, segment.tail) == (64, 1, 0)
+    assert segment.reduce is None
+    assert len(segment.stores) == 1
+    assert segment.stores[0].kind == AccessClass.CONTIGUOUS
+
+
+def test_p1_lift_contract_2d():
+    func = _p1_kernel_2d()
+    report = _vf_report(func)
+    assert "domain: i in [0, 8) j in [0, 64)" in report
+    assert "shape=[8,64] axes=[0,1] dep={0,1}" in report
+    assert "T.grid(8, 64)" in report
+    assert "verify: OK" in report
+
+    stmt = _lifted(func)["stmt"]
+    assert _for_kinds(stmt) == [tirx.ForKind.PARALLEL] * 2
+    assert (stmt.loop_var.name, int(stmt.extent)) == ("i", 8)
+    assert (stmt.body.loop_var.name, int(stmt.body.extent)) == ("j", 64)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [_p1_kernel_1d, _p1_kernel_2d, _p1_kernel_3d, _p1_kernel_4d],
+    ids=["1d", "2d", "3d", "4d"],
+)
+def test_p1_stmt_plans_like_the_original_nest(factory):
+    """P1 交接 stmt 的 For 链全为 ``PARALLEL``，plan/emit 与原 nest 一致。"""
+    func = factory()
+    assert _for_kinds(_lifted(func)["stmt"]) == [tirx.ForKind.PARALLEL] * _nest_rank(func)
+    _plan_and_emit_parity(func)
+
+
+def _nest_rank(func) -> int:
+    nest = _outer_parallel_nests(func)[0]
+    rank = 1
+    while isinstance(nest.body, tirx.For):
+        nest = nest.body
+        rank += 1
+    return rank
+
+
+@pytest.mark.parametrize("extent, chunks, tail", [(100, 2, 36), (1, 1, 1)], ids=["tail", "unit"])
+def test_p1_tail_and_unit_extent_plan(extent, chunks, tail):
+    func = _p1_kernel_extent(extent)
+    segment = build_plan(_lifted(func)["stmt"]).segments[0]
+    assert (segment.chunks, segment.tail) == (chunks, tail)
+    _plan_and_emit_parity(func)
+    
+
+
+def test_p1_symbolic_extent_plan():
+    """符号 extent：运行时 chunk 循环 + 符号尾块，plan 不折叠成常量。"""
+    e = T.dynamic("E")
+
+    @T.prim_func
+    def main(A: T.Tensor((e,), "float32"), C: T.Tensor((e,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((e,), "float32")
+            c_ub = T.alloc_shared((e,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(e):
+                    c_ub[i] = a_ub[i] + 1.0
+            T.copy(c_ub, C)
+
+    assert "shape_syms:" in _vf_report(main)
+    segment = build_plan(_lifted(main)["stmt"]).segments[0]
+    assert segment.chunks is None and segment.tail is None
+    _plan_and_emit_parity(main)
+
+
+def test_p1_view_region_drops_decl_buffer():
+    """局部 view 的 ``DeclBuffer`` 不进入交接 stmt，store 仍引用 view 名。"""
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            base = T.alloc_shared((n,), "float32")
+            T.copy(A, base)
+            with T.SimdVF():
+                for i in T.Parallel(n // 2):
+                    v = T.view(base, shape=(n // 2, 2), dtype="float32")
+                    v[i, 0] = v[i, 0] + 1.0
+            T.copy(base, C)
+
+    report = _vf_report(main)
+    assert "local_views:" in report
+    assert "v -> base" in report
+    assert "decl_buffer" in report
+
+    stmt = _lifted(main)["stmt"]
+    assert not _has_decl_buffer(stmt)
+    assert _stored_buffers(stmt) == ["v"]
+    _plan_and_emit_parity(main)
+
+
+def test_p1_tail_bind_is_inlined_known_boundary():
+    """外层 Bind 被内联（已知边界：emit 文本不同，plan 结构相同）。"""
+    n, bn = 1000, 256
+
+    @T.prim_func
+    def main(A: T.Tensor((n + bn,), "float32"), C: T.Tensor((n + bn,), "float32")):
+        with T.Kernel(T.ceildiv(n, bn)) as bx:
+            a_ub = T.alloc_shared((n + bn,), "float32")
+            c_ub = T.alloc_shared((n + bn,), "float32")
+            T.copy(A, a_ub)
+            tail = T.min(n - bx * bn, bn)
+            with T.SimdVF():
+                for i in T.Parallel(tail):
+                    c_ub[i] = a_ub[i] + 1.0
+            T.copy(c_ub, C)
+
+    stmt = _lifted(main)["stmt"]
+    free = {var.name for var in tirx.analysis.undefined_vars(stmt, [])}
+    assert "tail" not in free
+    assert "bx" in free
+    assert "T.min" in str(stmt)
+    
+    original_plan = build_plan(_outer_parallel_nests(main)[0])
+    p1_plan = build_plan(stmt)
+    assert render_plan(original_plan) == render_plan(p1_plan)
+    # 已知差异：尾块表达式被内联成 T.min(...)，所以只比对 plan 形状。
+    assert not tvm.ir.structural_equal(emit_plan(original_plan), emit_plan(p1_plan), map_free_vars=True)
+
+
+def test_p1_multi_nest_single_vf():
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] + 1.0
+                for i in T.Parallel(n):
+                    a_ub[i] = c_ub[i] + 2.0
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(main)
+    assert [(item["vf_index"], item["nest_index"]) for item in items] == [(0, 0), (0, 1)]
+    assert [item["status"] for item in items] == ["LIFTED", "LIFTED"]
+    assert _stored_buffers(items[0]["stmt"]) == ["c_ub"]
+    assert _stored_buffers(items[1]["stmt"]) == ["a_ub"]
+
+
+def test_p1_inner_bind_is_opaque():
+    m, n = 8, 64
+
+    @T.prim_func
+    def main(A: T.Tensor((m * n,), "float32"), C: T.Tensor((m * n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((m * n,), "float32")
+            c_ub = T.alloc_shared((m * n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i, j in T.Parallel(m, n):
+                    t = i * n + j
+                    c_ub[t] = a_ub[t] + 1.0
+            T.copy(c_ub, C)
+
+    _assert_no_stmt_rejected(main, {"OPAQUE", "FALLBACK"}, "tirx.Bind")
+
+
+@pytest.mark.parametrize(
+    "factory, allowed, reason",
+    [
+        (_p1_kernel_local_var, {"OPAQUE"}, "local.var"),
+        (_p1_kernel_opaque_evaluate, {"OPAQUE", "FALLBACK"}, "opaque"),
+    ],
+    ids=["local_var", "opaque_evaluate"],
+)
+def test_p1_opaque_statement_keeps_its_status(factory, allowed, reason):
+    _assert_no_stmt_rejected(factory(), allowed, reason)
+
+
+def test_p1_reduction_falls_back():
+    m, n = 8, 64
+
+    @T.prim_func
+    def main(A: T.Tensor((m, n), "float32"), C: T.Tensor((m,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((m, n), "float32")
+            c_ub = T.alloc_shared((m,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i, j in T.Parallel(m, n):
+                    c_ub[i] += a_ub[i, j]
+            T.copy(c_ub, C)
+
+    _assert_no_stmt_rejected(main, {"FALLBACK"}, "ILLEGAL")
+
+
+def test_p1_illegal_memory_falls_back():
+    n = 256
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n - 32):
+                    a_ub[i] = a_ub[i + 32]
+
+    items = _p1_inputs(main)
+    assert len(items) == 1
+    assert items[0]["status"] == "FALLBACK"
+    assert "memory legality is ILLEGAL" in items[0]["reason"]
+    assert "stmt" not in items[0]
+
+
+def test_p1_mixed_legality_marks_whole_vf():
+    """PR-A：按 VF 聚合，一个非法 nest 会拖垮同 VF 的合法兄弟。"""
+    n = 256
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n - 32):
+                    c_ub[i] = a_ub[i] + 1.0
+                for i in T.Parallel(n - 32):
+                    a_ub[i] = a_ub[i + 32]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(main)
+    assert len(items) == 2
+    assert [item["status"] for item in items] == ["FALLBACK", "FALLBACK"]
+    assert all("stmt" not in item for item in items)
+
+
+def test_p1_gm_operand_branch_b():
+    """P1 能 lift、P2 不能 plan：Branch B 是文档化的交接结果，不是 bug。
+
+    其余 Branch B 形状（bool store、非零下界、stencil 尾块）的 P2 拒绝信息
+    已分别由 ``test_bool_store_is_rejected_at_build_time``、
+    ``test_serial_loop_with_non_zero_lower_bound_is_rejected``、
+    ``test_serial_stencil_rejected`` 覆盖。
+    """
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1), T.SimdVF():
+            for i in T.Parallel(n):
+                C[i] = A[i] + 1.0
+
+    _assert_branch_b(main, "global-memory operand")
+
+
+def test_p1_no_vf_returns_empty():
+    @T.prim_func
+    def main(A: T.Tensor((16,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((16,), "float32")
+            T.copy(A, a_ub)
+
+    assert _p1_inputs(main) == []
+
+
+# ---------------------------------------------------------------------------
+# 三段 pass：carrier 交接、幂等、被拒 nest 不变
+# ---------------------------------------------------------------------------
+
+
+def test_combined_pass_matches_offline_driver():
+    """组合 pass 的输出就是离线 driver（``vectorize_parallel_nests``）的输出。"""
+    func = _p1_kernel_1d()
+    after = _run_combined(func)
+
+    assert not tvm.ir.structural_equal(after.body, func.body, map_free_vars=True)
+    tvm.ir.assert_structural_equal(after.body, vectorize_parallel_nests(func.body), map_free_vars=True)
+    assert _count_parallel_nests(after.body) == 0, "the T.Parallel nest survived the pass"
+    ops = _emitted_ops(after.body)
+    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
+    assert any(name in ("tl.simd.vadd", "tl.simd.vadds") for name in ops)
+
+
+def test_staged_passes_exchange_carriers():
+    func = _p1_kernel_1d()
+
+    lifted = _run_stage(func, at.AscendLiftParallelToArray)
+    assert len(_carriers(lifted.body, "tl.vsimd.array_region")) == 1
+    assert _count_parallel_nests(lifted.body) == 1, "P1 must not rewrite the nest"
+    assert _emitted_ops(lifted.body) == []
+
+    planned = _run_stage(lifted, at.AscendPlanArray)
+    assert _carriers(planned.body, "tl.vsimd.array_region") == []
+    plans = _carriers(planned.body, "tl.vsimd.array_plan")
+    assert len(plans) == 1
+    assert len(plans[0].node.segments) == 1
+    assert _count_parallel_nests(planned.body) == 1
+    # P2 从 P1 region 规划，与直接规划交接 stmt 的 plan 逐字段一致。
+    assert render_plan(plans[0].node) == render_plan(build_plan(_lifted(func)["stmt"]))
+
+    emitted = _run_stage(planned, at.AscendLowerArrayPlan)
+    assert _carriers(emitted.body, "tl.vsimd.array_plan") == []
+    assert _count_parallel_nests(emitted.body) == 0
+    assert "tl.simd.vsts" in _emitted_ops(emitted.body)
+    tvm.ir.assert_structural_equal(emitted.body, _run_combined(func).body, map_free_vars=True)
+
+
+def test_passes_are_idempotent():
+    once = _run_stage(_p1_kernel_1d(), at.AscendLiftParallelToArray)
+    twice = _run_stage(once, at.AscendLiftParallelToArray)
+    assert len(_carriers(twice.body, "tl.vsimd.array_region")) == 1
+
+    combined = _run_combined(_p1_kernel_1d())
+    again = _run_combined(combined)
+    tvm.ir.assert_structural_equal(again.body, combined.body, map_free_vars=True)
+
+
+def test_rejected_nests_fall_through_every_stage():
+    # (a) P1 拒绝（非法内存）⇒ 无载体、IR 逐字节不变；组合 pass 也不动它。
+    n = 256
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(n - 32):
+                    a_ub[i] = a_ub[i + 32]
+
+    illegal = main
+    lifted = _run_stage(illegal, at.AscendLiftParallelToArray)
+    assert _carriers(lifted.body, "tl.vsimd.array_region") == []
+    tvm.ir.assert_structural_equal(lifted.body, illegal.body, map_free_vars=True)
+    tvm.ir.assert_structural_equal(_run_combined(illegal).body, illegal.body, map_free_vars=True)
+
+    # (b) P1 能 lift、P2 拒绝（GM 操作数）⇒ 载体被原样解开，P3 也不动它。
+    gm = _p1_kernel_gm_operand_in_vf()
+    lifted = _run_stage(gm, at.AscendLiftParallelToArray)
+    assert len(_carriers(lifted.body, "tl.vsimd.array_region")) == 1
+
+    planned = _run_stage(lifted, at.AscendPlanArray)
+    assert _carriers(planned.body, "tl.vsimd.array_region") == []
+    assert _carriers(planned.body, "tl.vsimd.array_plan") == []
+    assert _count_parallel_nests(planned.body) == 1
+
+    emitted = _run_stage(planned, at.AscendLowerArrayPlan)
+    tvm.ir.assert_structural_equal(emitted.body, gm.body, map_free_vars=True)
+
+
+# ---------------------------------------------------------------------------
+# 流水线接入：无条件运行
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pass_calls(monkeypatch) -> list:
+    """Record how often the pipeline constructs the pass."""
+    calls: list = []
+    real = at.AscendPolyhedralVectorize
+
+    def spy():
+        calls.append(True)
+        return real()
+
+    monkeypatch.setattr(at, "AscendPolyhedralVectorize", spy)
+    return calls
+
+
+def test_pipeline_vectorizes_by_default(pass_calls):
+    source = _lower_source(_p1_kernel_1d())
+
+    assert pass_calls == [True], "AscendPolyhedralVectorize must run unconditionally"
+    assert "simd_inst::" in source
+    # a_ub[i] + 1.0 → 标量-向量配方（P3 的发射形态，旧 emitter 是 vdup + vadd）。
+    assert "vadds" in source
+
+
+if __name__ == "__main__":
+    import tilelang
+
+    tilelang.testing.main()

@@ -40,8 +40,9 @@ P2  AscendPlanArray             消费 "tl.vsimd.array_region"（只读 region �
       ↓  规划失败 → 去掉载体原样交回（Branch B）
 P3  AscendLowerArrayPlan        消费 "tl.vsimd.array_plan"
       ↓  EmitPlan(program) → T.simd.* TIR（残留 region 载体一律剥除）
-legacy  AscendSimdVFLowerParallel  兜底（未被 P1 lift 或 P2 拒绝的 nest）
 ```
+
+未被 P1 lift 或 P2 拒绝的 nest 原样保留（不再有 legacy emitter 兜底）。
 
 `AscendPolyhedralVectorize` 是组合 pass：在同一个 PrimFunc 上顺序调用
 `LiftParallelToArray → PlanArray → LowerArrayPlan`，等价于把三个 pass 串起来。
@@ -54,15 +55,15 @@ legacy  AscendSimdVFLowerParallel  兜底（未被 P1 lift 或 P2 拒绝的 nest
 | P2 | `tl.vsimd.array_region` 载体 | `tl.vsimd.array_plan` 载体（`VectorProgram`） | 载体替换 |
 | P3 | `tl.vsimd.array_plan` 载体 | `T.simd.*` 语句 | 载体被发射结果替换 |
 
-`pipeline.py` 里的位置（`NormalizeBufferVersion` 之后、`AscendSimdVFLowerParallel`
-之前），由 `tl.ascend.polyhedral.impl` 控制，插入的是组合 pass：
+`pipeline.py` 里的位置（`NormalizeBufferVersion` 之后）**无条件**插入组合 pass：
 
-| 取值        | 行为                                  |
-| --------- | ----------------------------------- |
-| `legacy`（默认） | 不插入新 pass，流水线与改动前完全一致（A7）          |
-| `cpp`     | 插入 `AscendPolyhedralVectorize`（P1→P2→P3） |
+| 行为 |
+| --- |
+| 插入 `AscendPolyhedralVectorize`（P1→P2→P3）；被拒 nest 原样保留为串行循环 |
 
 流水线只接受 C++ 实现；此前的 Python 孪生 pass 仅用于灰度对拍，已删除。
+`AscendSimdVFLowerParallel` 不再接入流水线（P1/P2/P3 取代它，不再有兜底 emitter）。
+PassContext 开关 `tl.ascend.polyhedral.impl` 已删除。
 
 离线 API（`build_plan` / `emit_plan` / `render_plan` / `vectorize_parallel_nests`
 / `finite_difference` / `classify_delta`）**只有 C++ 一个实现**：
@@ -168,12 +169,10 @@ stmt = emit_plan(program)               # T.simd.* TIR
 from tilelang.ascend.analysis.polyhedral_reference import build_plan, emit_plan
 ```
 
-流水线灰度：
+流水线默认行为（无需任何开关）：
 
 ```python
-import tvm
-with tvm.transform.PassContext(config={"tl.ascend.polyhedral.impl": "cpp"}):
-    mod = tilelang.lower(func, target="ascend")
+mod = tilelang.lower(func, target="ascend")
 ```
 
 ### 5.1 常见拒绝原因与改法

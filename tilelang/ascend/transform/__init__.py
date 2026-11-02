@@ -206,7 +206,7 @@ def AscendPlanArray():
 
     Consumes ``tl.vsimd.array_region`` markers and rewrites them to
     ``AttrStmt("tl.vsimd.array_plan")`` carrying the ``VectorProgram``. A nest
-    the planner rejects is unwrapped untouched (legacy lowering takes over).
+    the planner rejects is unwrapped untouched (P3 restores it verbatim).
     """
     return _ffi_api.AscendPlanArray()  # type: ignore
 
@@ -219,10 +219,8 @@ def AscendLowerArrayPlan():
 def AscendPolyhedralVectorize():
     """Replace vectorizable ``T.Parallel`` nests with ``T.simd.*`` (P1 -> P2 -> P3).
 
-    A nest whose plan is rejected is left untouched, so
-    :func:`AscendSimdVFLowerParallel` still lowers it exactly as before. The pass
-    is gated by ``tl.ascend.polyhedral.impl`` (``legacy`` by default, ``cpp`` to
-    enable it).
+    This pass is the pipeline's only ``T.Parallel`` lowering. A nest whose plan
+    is rejected is left untouched (it stays a serial loop; nothing lowers it).
     """
     return _ffi_api.AscendPolyhedralVectorize()  # type: ignore
 

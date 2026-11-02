@@ -92,6 +92,14 @@ Map<String, Any> P2InputToMap(const VSimdP2Input &item) {
   // stays on the C++ side (its access expressions are not stringified).
   if (item.stmt.defined())
     map.Set("stmt", Any(item.stmt));
+  // Layouts are part of the hand-off contract (they decide ND vs NZ stores), so
+  // expose the annotated buffer names even though the typed objects stay C++.
+  Array<String> layout_names;
+  if (item.status == "LIFTED") {
+    for (const auto &entry : item.region.layouts)
+      layout_names.push_back(String(entry.first->name));
+  }
+  map.Set("layouts", Any(layout_names));
   return map;
 }
 

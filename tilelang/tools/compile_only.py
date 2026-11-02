@@ -42,7 +42,7 @@ _PINNED_CUDA_TARGET: dict[str, str] = {"kind": "cuda", "arch": "sm_80"}
 _ERROR_PREFIX = "tilelang compile-only error"
 _CUDA_FFI_MISSING = "CUDA codegen FFI missing (e.g. macOS Metal wheel); use default --target c"
 # Extra PassContext config as a JSON object, e.g.
-#   TL_PASS_CONFIG='{"tl.ascend.polyhedral.impl": "cpp"}' ./run_lower_trace.sh k.py ascend
+#   TL_PASS_CONFIG='{"tl.enable_auto_schedule": false}' ./run_lower_trace.sh k.py ascend
 _PASS_CONFIG_ENV = "TL_PASS_CONFIG"
 
 
@@ -163,8 +163,7 @@ def _pass_context_config() -> dict:
     ``TL_EMIT_LINE_DIRECTIVES`` (older wheels reject the unknown pass key; CI
     merge with main has the option, so CE can map generated C back to the
     example). ``TL_PASS_CONFIG`` (JSON object) is merged on top, which is how
-    opt-in pipeline switches such as ``tl.ascend.polyhedral.impl`` are reached
-    from the CLI.
+    extra pipeline switches are reached from the CLI.
     """
     from tilelang.transform import PassConfigKey
 

@@ -88,9 +88,14 @@ def _raise(result) -> None:
     raise Unsupported(result["message"], diagnostics=list(result["diagnostics"]))
 
 
-def build_plan(stmt, lanes=None):
-    """C++ ``build_plan``: ``T.Parallel`` nest -> :class:`VectorProgram`."""
-    result = _ffi_api.AscendPolyhedralBuildPlan(stmt, lanes)
+def build_plan(stmt, lanes=None, layouts=None):
+    """C++ ``build_plan``: ``T.Parallel`` nest -> :class:`VectorProgram`.
+
+    ``layouts`` is the explicit ``{Buffer: Layout}`` map of the nest's
+    destination buffers (the P1 region hand-off); a buffer without an entry
+    keeps the default ND store, an Ascend NZ entry scatters 32B blocks.
+    """
+    result = _ffi_api.AscendPolyhedralBuildPlan(stmt, lanes, layouts)
     if not result["ok"]:
         _raise(result)
     return result["program"]
@@ -112,9 +117,9 @@ def render_plan(plan):
     return result["text"]
 
 
-def vectorize_parallel_nests(stmt, *, lanes=None):
+def vectorize_parallel_nests(stmt, *, lanes=None, layouts=None):
     """C++ driver: replace every vectorizable ``T.Parallel`` nest in-place."""
-    result = _ffi_api.AscendPolyhedralVectorizeNests(stmt, lanes)
+    result = _ffi_api.AscendPolyhedralVectorizeNests(stmt, lanes, layouts)
     if not result["ok"]:
         _raise(result)
     return result["stmt"]

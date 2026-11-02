@@ -63,16 +63,26 @@ std::vector<std::string> RenderSinglePlan(const VectorPlan& plan,
       {"pre", plan->pre_stores}, {"store", plan->stores}, {"post", plan->post_stores}};
   for (const auto& group : groups) {
     for (const StorePlan& store : group.second) {
-      // Mixed element widths: only the packed stores carry an extra note, so the
-      // render of an ordinary (``full``) plan stays byte-identical.
+      // Mixed element widths / destination layouts: only non-default stores
+      // carry an extra note, so the render of an ordinary plan stays identical.
       const std::string lane_mode = store->store_lane_mode.operator std::string();
-      const std::string lane_note =
+      std::string note =
           lane_mode == "full"
               ? ""
               : " store_lanes=" + lane_mode + "/" + std::to_string(store->store_lanes);
+      const std::string layout_kind = store->layout_kind.operator std::string();
+      if (layout_kind != "nd") {
+        note += " layout=" + layout_kind + "[" +
+                std::to_string(store->nz_block_stride.has_value()
+                                   ? *store->nz_block_stride
+                                   : 0) +
+                ":" +
+                std::to_string(store->nz_elem_stride.has_value() ? *store->nz_elem_stride : 1) +
+                "]";
+      }
       lines.push_back(std::string(group.first) + " " + SinkText(store->spec) + " [" +
                       store->kind_value.operator std::string() + "] mask=" +
-                      (store->mask.has_value() ? "yes" : "no") + lane_note);
+                      (store->mask.has_value() ? "yes" : "no") + note);
       RenderValue(store->value, &lines, 1);
     }
   }

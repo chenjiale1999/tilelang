@@ -56,6 +56,13 @@ class StorePlanNode : public ffi::Object {
   int64_t store_lanes{0};
   ffi::String store_lane_mode{"full"};
   ffi::Optional<int64_t> store_pack_bits;
+  // Destination layout (Stage 2): ``nd`` keeps the plain contiguous store, ``nz``
+  // scatters 32B blocks straight from the register (``vsstb``) using
+  // ``nz_block_stride`` (block distance, in 32B blocks) and ``nz_elem_stride``
+  // (element step inside a block, normally 1).
+  ffi::String layout_kind{"nd"};
+  ffi::Optional<int64_t> nz_block_stride;
+  ffi::Optional<int64_t> nz_elem_stride;
 
   static constexpr const bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StorePlan", StorePlanNode,
@@ -76,7 +83,10 @@ class StorePlanNode : public ffi::Object {
         .def_ro("mask_free_from", &StorePlanNode::mask_free_from)
         .def_ro("store_lanes", &StorePlanNode::store_lanes)
         .def_ro("store_lane_mode", &StorePlanNode::store_lane_mode)
-        .def_ro("store_pack_bits", &StorePlanNode::store_pack_bits);
+        .def_ro("store_pack_bits", &StorePlanNode::store_pack_bits)
+        .def_ro("layout_kind", &StorePlanNode::layout_kind)
+        .def_ro("nz_block_stride", &StorePlanNode::nz_block_stride)
+        .def_ro("nz_elem_stride", &StorePlanNode::nz_elem_stride);
   }
 };
 

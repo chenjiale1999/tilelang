@@ -176,8 +176,8 @@ class VfRegionMarker final : public StmtMutator {
  * the nest body): the plan input is rebuilt from the region through
  * ``RegionToPlanInput``. A nest the planner rejects — or a region whose
  * expansion is not a single parallel chain (a P1 internal inconsistency, not
- * user IR) — is unwrapped exactly as it was, so the legacy lowering still owns
- * it and the function body stays byte-identical.
+ * user IR) — is unwrapped exactly as it was, so the function body stays
+ * byte-identical and the nest stays a serial loop.
  */
 class PlanMarkerReplacer final : public StmtMutator {
  public:
@@ -193,8 +193,16 @@ class PlanMarkerReplacer final : public StmtMutator {
       Stmt input;
       std::string error;
       if (RegionToPlanInput(carrier->region, &input, &error)) {
+        // The rebuilt statement carries the stores but none of the region's
+        // context; hand the typed fields over explicitly (layouts decide ND vs
+        // NZ stores, the rest is the reserved analyzer context).
+        PlanOptions options;
+        options.layouts = carrier->region.layouts;
+        options.assumptions = carrier->region.assumptions;
+        options.bindings = carrier->region.bindings;
+        options.shape_syms = carrier->region.shape_syms;
         try {
-          VectorProgram program = BuildPlan(input);
+          VectorProgram program = BuildPlan(input, std::nullopt, options);
           return AttrStmt(program, kArrayPlanAttr, Integer(1), std::move(nest));
         } catch (const Unsupported&) {
           // Branch B: P1 lifted the nest but P2 cannot plan it.
