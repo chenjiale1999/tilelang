@@ -43,6 +43,28 @@ enum class AccessClass {
   kTrueRandom,  // non-constant Delta, index vector not constructible -> reject
 };
 
+/*!
+ * \brief Storage class of one access (design §2.1.1).
+ *
+ * Global memory is deliberately absent: ``T.SimdVF`` rejects every GM access in
+ * the front-end ``VFChecker`` before P1/P2, so it can never reach this layer.
+ *
+ *  - ``kShared``   : UB (``shared`` / ``shared.dyn``) and any other addressable
+ *                    buffer: normal ``vld`` / ``vsts`` traffic;
+ *  - ``kFragment`` : ``local.fragment``, the user-allocated V-core register tile
+ *                    planned as ``ceil(size / lanes)`` vector registers;
+ *  - ``kPrivate``  : ``local`` / ``local.var`` per-iteration private scalars.
+ */
+enum class StorageClass { kShared, kFragment, kPrivate };
+
+/*! \brief ``StorageClass`` name used by reflection / diagnostics. */
+const std::string& StorageClassName(StorageClass kind);
+/*! \brief Inverse of :func:`StorageClassName`. */
+StorageClass StorageClassFromName(const std::string& name);
+/*! \brief Classify a buffer's storage (design §2.1.1). */
+StorageClass StorageClassOf(const tirx::Buffer& buffer);
+
+
 /*! \brief ``AccessClass.value`` text used by diagnostics / rendering. */
 const std::string& AccessClassName(AccessClass kind);
 /*! \brief Inverse of :func:`AccessClassName`. */
@@ -108,7 +130,7 @@ class AccessInfoNode : public ffi::Object {
   PrimExpr offset;
   bool is_store{false};
   bool indirect{false};
-  bool in_global{false};
+  ffi::String storage{"shared"};
   ffi::String reason;
   // Not reflected: tests never read it, and it is keyed by axis.index.
   std::map<int64_t, AxisClass> per_axis;
@@ -125,7 +147,7 @@ class AccessInfoNode : public ffi::Object {
         .def_ro("offset", &AccessInfoNode::offset)
         .def_ro("is_store", &AccessInfoNode::is_store)
         .def_ro("indirect", &AccessInfoNode::indirect)
-        .def_ro("in_global", &AccessInfoNode::in_global)
+        .def_ro("storage", &AccessInfoNode::storage)
         .def_ro("reason", &AccessInfoNode::reason);
   }
 };

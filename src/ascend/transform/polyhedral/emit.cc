@@ -10,6 +10,8 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -481,11 +483,21 @@ std::string ExprKey(const PrimExpr& expr) {
   return out;
 }
 
-/*! \brief Structural identity of a buffer (never Python object identity). */
+/*!
+ * \brief Identity of a buffer: its data Var plus the structural view fields.
+ *
+ * The data Var identity is mandatory (S0): two ``T.alloc_fragment`` calls with
+ * the same Python name produce two distinct data Vars but identical names,
+ * dtypes, scopes and shapes, so a purely structural key made the P3 ``forward_``
+ * map (and ``store_gen``) alias them and miscompile the second write
+ * (analysis §2.3 / M6).
+ */
 std::string BufferKey(const tirx::Buffer& buffer) {
   // PrintExpr costs microseconds per call and this runs for every buffer of
   // every segment; the fast serializer gives the same equivalence relation.
-  std::string out = buffer->data->name_hint.operator std::string() + "|" +
+  std::string out = "@" +
+                    std::to_string(reinterpret_cast<uintptr_t>(buffer->data.get())) + "|" +
+                    buffer->data->name_hint.operator std::string() + "|" +
                     ffi::DLDataTypeToString(buffer->dtype).operator std::string() + "|" +
                     buffer.scope().operator std::string() + "|(";
   for (size_t i = 0; i < buffer->shape.size(); ++i) {
@@ -546,6 +558,116 @@ std::vector<std::string> LoadBufferKeys(const PrimExpr& expr) {
   return keys;
 }
 
+}  // namespace
+
+/* ------------------------------------------------------------------------- */
+/* fragment register file                                                    */
+/* ------------------------------------------------------------------------- */
+
+/*! \brief C-identifier-safe part of a generated register name. */
+static std::string SanitizeRegName(const std::string& name) {
+  std::string out;
+  for (char c : name) {
+    out += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+  }
+  return out.empty() ? std::string("frag") : out;
+}
+
+/*!
+ * \brief Slot of an access inside a fragment register file.
+ *
+ * ``off(v)`` is affine with ``Δ_v == 1`` (G1), so at emit time — where the chunk
+ * is a literal because register segments are fully unrolled — the slot is
+ * ``off / lanes`` and must be chunk-aligned.
+ */
+static std::optional<int64_t> RegisterSlotOf(const AccessInfo& access,
+                                             const Axis& vector_axis,
+                                             const PrimExpr& lane_base, int64_t lanes,
+                                             arith::Analyzer* analyzer,
+                                             std::string* error) {
+  PrimExpr substituted = tirx::Substitute(
+      access->offset, [&](const tirx::Var& var) -> ffi::Optional<PrimExpr> {
+        if (var.same_as(vector_axis->var)) {
+          return ffi::Optional<PrimExpr>(lane_base);
+        }
+        return ffi::Optional<PrimExpr>();
+      });
+  std::optional<int64_t> offset = ConstInt(analyzer->Simplify(substituted), analyzer);
+  if (!offset.has_value()) {
+    *error = "'" + access->buffer->name.operator std::string() +
+             "' has a non-constant register slot";
+    return std::nullopt;
+  }
+  if (*offset % lanes != 0) {
+    *error = "'" + access->buffer->name.operator std::string() + "' chunk base " +
+             std::to_string(*offset) + " is not aligned to " +
+             std::to_string(lanes) + " lanes";
+    return std::nullopt;
+  }
+  return *offset / lanes;
+}
+
+/*! \brief Whether a plan runs in fragment-register mode. */
+static bool RegisterMode(const VectorPlan& plan) { return !plan->fragment_regs.empty(); }
+
+FragmentRegisterFile FragmentRegisterFile::Build(
+    const ffi::Array<FragmentReg>& regs) {
+  FragmentRegisterFile file;
+  int64_t id = 0;
+  for (const FragmentReg& reg : regs) {
+    if (!reg.defined()) continue;
+    if (file.Find(reg->data) != nullptr) {
+      TVM_FFI_ICHECK(false)
+          << "fragment register file: duplicate data var '"
+          << reg->name.operator std::string()
+          << "' (P2.5 must merge plans by data Var before emitting)";
+    }
+    Entry entry;
+    entry.data = reg->data;
+    entry.name = reg->name.operator std::string();
+    entry.slots = reg->slots;
+    entry.lanes = reg->lanes;
+    entry.dtype = reg->dtype.operator std::string();
+    std::string base = "frag_" + SanitizeRegName(entry.name) + "_" +
+                       std::to_string(id++) ;
+    for (int64_t slot = 0; slot < entry.slots; ++slot) {
+      entry.regs.push_back(tirx::decl_buffer(
+          {IntImm32(1)}, VecDataType(entry.dtype),
+          base + "_r" + std::to_string(slot), "local.var"));
+    }
+    file.index_[entry.data.get()] = file.entries_.size();
+    file.entries_.push_back(std::move(entry));
+  }
+  return file;
+}
+
+const FragmentRegisterFile::Entry* FragmentRegisterFile::Find(
+    const tirx::Var& data) const {
+  auto it = index_.find(data.get());
+  if (it == index_.end()) return nullptr;
+  return &entries_[it->second];
+}
+
+const tirx::Buffer* FragmentRegisterFile::Slot(const tirx::Var& data,
+                                               int64_t slot) const {
+  const Entry* entry = Find(data);
+  if (entry == nullptr || slot < 0 ||
+      slot >= static_cast<int64_t>(entry->regs.size())) {
+    return nullptr;
+  }
+  return &entry->regs[static_cast<size_t>(slot)];
+}
+
+std::vector<tirx::Buffer> FragmentRegisterFile::Buffers() const {
+  std::vector<tirx::Buffer> buffers;
+  for (const Entry& entry : entries_) {
+    for (const tirx::Buffer& reg : entry.regs) buffers.push_back(reg);
+  }
+  return buffers;
+}
+
+namespace {
+
 /* ------------------------------------------------------------------------- */
 /* program-shared prologue                                                   */
 /* ------------------------------------------------------------------------- */
@@ -589,7 +711,8 @@ class Emitter {
           int64_t chunk_min = 0, std::optional<int64_t> chunk_max = std::nullopt,
           ProgramPrologue* shared = nullptr,
           std::map<std::string, CarryEntry>* carry = nullptr, bool allow_carry = false,
-          PairDomain* pair = nullptr, int pair_stream = 0)
+          PairDomain* pair = nullptr, int pair_stream = 0,
+          FragmentRegisterFile* registers = nullptr)
       : plan_(plan),
         chunk_(std::move(chunk)),
         prefix_(std::move(prefix)),
@@ -600,7 +723,8 @@ class Emitter {
         carry_(carry != nullptr ? carry : &owned_carry_),
         allow_carry_(allow_carry),
         pair_(pair),
-        pair_stream_(pair_stream) {
+        pair_stream_(pair_stream),
+        registers_(registers) {
     lane_base_ = chunk_ * IntImm32(plan_->lanes);
     for (const StorePlan& store : plan_->pre_stores) written_buffers_.push_back(store->spec->buffer);
     for (const StorePlan& store : plan_->stores) written_buffers_.push_back(store->spec->buffer);
@@ -631,6 +755,33 @@ class Emitter {
     tirx::Var var = Bind(expr, &prologue_);
     prologue_vars_.insert(var.get());
     return var;
+  }
+
+  /*!
+   * \brief Fold a just-emitted SSA binding back into its consumer value.
+   *
+   * ``Build`` binds every instruction result to a fresh SSA var.  A fragment
+   * register write *is* the definition of that register, so the producer can be
+   * emitted in place (``frag = vadds(...)``) instead of copying through a
+   * temporary (``auto t = vadds(...); frag = t``).  Only a binding that is the
+   * last emitted statement is folded — it was created for this value and cannot
+   * be referenced by earlier statements; memo entries for the removed var are
+   * dropped so later uses rebuild instead of dangling.
+   */
+  PrimExpr InlineFreshBind(const PrimExpr& value) {
+    if (!value.defined() || lets_.empty()) return value;
+    const auto* bind = lets_.back().as<tirx::BindNode>();
+    if (bind == nullptr || !bind->var.same_as(value)) return value;
+    PrimExpr inlined = bind->value;
+    lets_.pop_back();
+    for (auto it = memo_.begin(); it != memo_.end();) {
+      if (it->second.same_as(value)) {
+        it = memo_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return inlined;
   }
 
   /* -- masks ------------------------------------------------------------ */
@@ -864,6 +1015,38 @@ class Emitter {
     promoted_[CachedValueKey(node)] = vector;
   }
 
+  /* -- fragment registers ------------------------------------------------ */
+  FragmentRegisterFile* registers() const { return registers_; }
+  arith::Analyzer* analyzer() { return &analyzer_; }
+
+  /*!
+   * \brief Read one register slot of a fragment access.
+   *
+   * The register chunk has no memory instruction: the value is the ``local.var``
+   * vector itself.  Reading it as a plain ``BufferLoad`` keeps the consumer
+   * expression referencing the register directly (``vmuls(reg, ...)``) instead
+   * of copying it into a temporary first.
+   */
+  PrimExpr RegisterRead(const AccessInfo& access) {
+    const std::string name = access->buffer->name.operator std::string();
+    if (registers_ == nullptr) {
+      throw Unsupported("fragment register: no VF register file for '" + name + "'");
+    }
+    std::string error;
+    std::optional<int64_t> slot =
+        RegisterSlotOf(access, plan_->vector_axis, lane_base_, plan_->lanes,
+                       &analyzer_, &error);
+    if (!slot.has_value()) {
+      throw Unsupported("fragment register: " + error);
+    }
+    const tirx::Buffer* reg = registers_->Slot(access->buffer->data, *slot);
+    if (reg == nullptr) {
+      throw Unsupported("fragment register: '" + name + "' has no register slot " +
+                        std::to_string(*slot));
+    }
+    return tirx::BufferLoad(*reg, {IntImm32(0)});
+  }
+
   void RegisterCarry(const StorePlan& store, const PrimExpr& value, const tirx::Var& axis) {
     carry_->insert_or_assign(
         CachedBufferKey(store->spec->buffer) + "^" + IndexKey(store->spec->indices),
@@ -1042,6 +1225,7 @@ class Emitter {
   std::map<const tirx::BufferNode*, std::string> buffer_keys_;
   PairDomain* pair_;
   int pair_stream_{0};
+  FragmentRegisterFile* registers_{nullptr};
   arith::Analyzer analyzer_;
 };
 
@@ -1064,6 +1248,10 @@ PrimExpr Emitter::Build(const ValueNode& node) {
     tirx::Var var = Bind(Vci(lane_base_, elem), &lets_);
     vci_[key] = var;
     return var;
+  }
+  if (recipe == "reg_load") {
+    // Fragment register read: no memory instruction at all.
+    return RegisterRead(*node->access);
   }
   if (recipe == "vload") {
     std::string fwd_key = CachedBufferKey((*node->access)->buffer) + "^" +
@@ -1217,7 +1405,65 @@ PrimExpr StoreMask(const StorePlan& store, Emitter* emitter, int bits) {
   return mask;
 }
 
+/*! \brief Whether a store needs a read-modify-write merge (predicate / tail). */
+bool StoreNeedsMerge(const StorePlan& store, Emitter* emitter, int bits) {
+  bool predicate = store->mask.has_value() &&
+                   !emitter->GuardFree(store->mask_free_until, store->mask_free_from);
+  bool tail = emitter->TailMask(bits).defined();
+  return predicate || tail;
+}
+
+/*!
+ * \brief Fragment register write: ``reg[slot] = value`` with no memory op.
+ *
+ * A full-chunk write replaces the whole register; a predicated write becomes
+ * ``vsel(value, old, mask)`` (read-modify-write), which P2.5's lifecycle check
+ * only allows once the slot is defined.
+ *
+ * Both the register read and the write stay in the consumer/producer expression
+ * (``reg = vadds(...)``, ``vmuls(reg, ...)``): no temporary copy is emitted.
+ */
+void EmitRegisterWrite(const StorePlan& store, Emitter* emitter, int bits,
+                       bool merge) {
+  const tirx::Buffer& buffer = store->spec->buffer;
+  const std::string name = buffer->name.operator std::string();
+  FragmentRegisterFile* registers = emitter->registers();
+  if (registers == nullptr) {
+    throw Unsupported("fragment register: no VF register file for '" + name + "'");
+  }
+  std::string error;
+  const VectorPlan& plan = emitter->plan();
+  std::optional<int64_t> slot = RegisterSlotOf(
+      store->access, plan->vector_axis, emitter->lane_base(), plan->lanes,
+      emitter->analyzer(), &error);
+  if (!slot.has_value()) {
+    throw Unsupported("fragment register: " + error);
+  }
+  const tirx::Buffer* reg = registers->Slot(buffer->data, *slot);
+  if (reg == nullptr) {
+    throw Unsupported("fragment register: '" + name + "' has no register slot " +
+                      std::to_string(*slot));
+  }
+  PrimExpr value = emitter->InlineFreshBind(emitter->VectorOperand(store->value));
+  if (merge) {
+    PrimExpr mask = StoreMask(store, emitter, bits);
+    PrimExpr old = tirx::BufferLoad(*reg, {IntImm32(0)});
+    value = emitter->InlineFreshBind(emitter->Bind(
+        SimdCall(simd_vsel(), DataTypeOf(store->value->dtype.operator std::string()),
+                 {value, old, mask}),
+        &emitter->lets_));
+  }
+  emitter->lets_.push_back(
+      tirx::BufferStore(*reg, value, {IntImm32(0)}));
+  emitter->NoteWrite(buffer);
+  emitter->NoteStore(store, value);
+}
+
 void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const PrimExpr& mask) {
+  if (store->storage.operator std::string() == "register") {
+    EmitRegisterWrite(store, emitter, bits, StoreNeedsMerge(store, emitter, bits));
+    return;
+  }
   PrimExpr value = emitter->VectorOperand(store->value);
   bool uniform = AccessClassFromName(store->kind_value.operator std::string()) ==
                  AccessClass::kUniform;
@@ -1558,14 +1804,38 @@ std::pair<std::vector<Stmt>, std::vector<Stmt>> StripMine(const VectorPlan& plan
 
 std::pair<std::vector<Stmt>, std::vector<Stmt>> EmitElementwiseChunks(
     const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
-    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry, bool allow_carry) {
+    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    FragmentRegisterFile* registers) {
+  if (RegisterMode(plan)) {
+    // Fragment registers have no dynamic index: every chunk maps to one fixed
+    // slot, so the chunk loop is fully expanded (plan G4 / design §2.3).
+    TVM_FFI_ICHECK(plan->chunks.has_value())
+        << "a register-mode segment needs static chunks (plan contract)";
+    int64_t chunks = *plan->chunks;
+    std::vector<Stmt> prologue;
+    std::vector<Stmt> blocks;
+    for (int64_t index = 0; index < chunks; ++index) {
+      bool masked_tail =
+          index + 1 == chunks && plan->tail.has_value() && *plan->tail != 0;
+      // Fully unrolled chunks share one C scope, so every chunk gets its own
+      // SSA prefix (the loop form relies on the loop body being a scope).
+      Emitter body(plan, IntImm32(index),
+                   prefix + "u" + std::to_string(index) + "_", masked_tail,
+                   index, index + 1, shared, carry, allow_carry, nullptr, 0,
+                   registers);
+      for (const StorePlan& store : plan->stores) EmitStore(plan, store, &body);
+      for (Stmt& stmt : body.prologue_) prologue.push_back(std::move(stmt));
+      for (Stmt& stmt : SeqOfVec(body.lets_)) blocks.push_back(std::move(stmt));
+    }
+    return {prologue, blocks};
+  }
   std::optional<StorePlan> packed = PackedNzStore(plan);
   if (!packed.has_value()) {
     MakeBlock make_block = [&](const PrimExpr& chunk_index, bool masked_tail,
                                const std::string& label, int64_t chunk_min,
                                std::optional<int64_t> chunk_max) -> Block {
       Emitter body(plan, chunk_index, prefix + label, masked_tail, chunk_min, chunk_max, shared,
-                   carry, allow_carry);
+                   carry, allow_carry, nullptr, 0, registers);
       for (const StorePlan& store : plan->stores) EmitStore(plan, store, &body);
       return Block{body.prologue_, body.lets_};
     };
@@ -1741,17 +2011,20 @@ std::vector<Axis> InnerAxes(const VectorPlan& plan, const std::vector<Axis>& hoi
 std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     const VectorPlan& plan, const tirx::Var& chunk, const std::vector<Axis>& hoisted,
     const std::string& prefix, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry);
+    std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    FragmentRegisterFile* registers);
 
 std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
     const std::vector<Axis>& hoisted, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry);
+    std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    FragmentRegisterFile* registers);
 
 std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     const VectorPlan& plan, const tirx::Var& chunk, const std::vector<Axis>& hoisted,
     const std::string& prefix, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry) {
+    std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    FragmentRegisterFile* registers) {
   // A parallel vector axis with inner axes uses the hand-written three-part
   // structure (pre -> for inner: main -> post) so pre/post run once per chunk.
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
@@ -1761,14 +2034,25 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
           "a packed NZ store needs the vector axis to be the innermost axis (split the nest)");
     }
     return EmitParallelAxisParts(plan, chunk, prefix, hoisted, single, shared, carry,
-                                 allow_carry);
+                                 allow_carry, registers);
   }
 
-  Emitter emitter(plan, chunk, prefix, false, 0, std::nullopt, shared, carry, allow_carry);
+  Emitter emitter(plan, chunk, prefix, false, 0, std::nullopt, shared, carry,
+                  allow_carry, nullptr, 0, registers);
   std::set<std::string> written_keys;
   for (const StorePlan& store : plan->pre_stores) written_keys.insert(BufferKey(store->spec->buffer));
   for (const StorePlan& store : plan->stores) written_keys.insert(BufferKey(store->spec->buffer));
   for (const StorePlan& store : plan->post_stores) written_keys.insert(BufferKey(store->spec->buffer));
+  if (RegisterMode(plan) && registers != nullptr) {
+    // A fragment register may be written by an earlier nest inside its own
+    // hoisted outer loop; hoisting the register read to the program prologue
+    // would capture a stale value, so it must never be treated as invariant.
+    for (const auto& entry : registers->entries()) {
+      for (const tirx::Buffer& reg : entry.regs) {
+        written_keys.insert(BufferKey(reg));
+      }
+    }
+  }
 
   std::vector<StorePlan> invariant_pre;
   std::vector<StorePlan> loop_pre;
@@ -1791,7 +2075,8 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     EmitReduce(plan, &emitter);
     main_lets = emitter.TakeLets();
   } else {
-    auto chunks = EmitElementwiseChunks(plan, chunk, prefix, shared, carry, allow_carry);
+    auto chunks = EmitElementwiseChunks(plan, chunk, prefix, shared, carry, allow_carry,
+                                        registers);
     main_prologue = chunks.first;
     main_lets = chunks.second;
   }
@@ -2043,7 +2328,8 @@ void EmitReduce(const VectorPlan& plan, Emitter* emitter) {
 std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
     const std::vector<Axis>& hoisted, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry) {
+    std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    FragmentRegisterFile* registers) {
   TVM_FFI_ICHECK(!ReduceOf(plan).defined())
       << "a parallel vector axis with pre/post must go through the elementwise path";
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
@@ -2108,7 +2394,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     // segments never collide.
     const std::string body_prefix = prefix + label;
     Emitter body_emitter(plan, chunk_var, body_prefix, masked_tail, chunk_min, chunk_max,
-                         shared, carry, allow_carry);
+                         shared, carry, allow_carry, nullptr, 0, registers);
     // A same-address pre write with a uniform value folds into the register
     // initial value instead of a memory write.
     std::map<const StorePlanNode*, StorePlan> folded;
@@ -2288,14 +2574,44 @@ bool SegmentConsumesCarry(const VectorPlan& segment, const std::vector<Axis>& ho
   return true;
 }
 
-Stmt EmitProgram(const VectorProgram& program) {
+/*! \brief Merge register metadata of every segment, keyed by data Var. */
+static ffi::Array<FragmentReg> CollectFragmentRegs(const VectorProgram& program) {
+  ffi::Array<FragmentReg> regs;
+  std::set<const tirx::VarNode*> seen;
+  for (const VectorPlan& segment : program->segments) {
+    for (const FragmentReg& reg : segment->fragment_regs) {
+      if (!reg.defined() || !seen.insert(reg->data.get()).second) continue;
+      regs.push_back(reg);
+    }
+  }
+  return regs;
+}
+
+/*! \brief Declarations of every register buffer (``local.var`` vector). */
+static void DeclareRegisters(const FragmentRegisterFile& file,
+                             std::vector<Stmt>* prologue) {
+  for (const tirx::Buffer& reg : file.Buffers()) {
+    prologue->push_back(tirx::AllocBuffer(reg));
+  }
+}
+
+Stmt EmitProgram(const VectorProgram& program, FragmentRegisterFile* registers) {
   for (const Axis& axis : program->axes) {
     TVM_FFI_ICHECK(axis->is_parallel)
         << "program.axes may only hold hoisted T.Parallel axes";
   }
+  // Standalone emission (``emit_plan``) owns the declarations; the P3 driver
+  // passes the VF-wide file and declares the registers on the SIMD_VF block.
+  FragmentRegisterFile local;
+  const bool owns_registers = registers == nullptr;
+  if (owns_registers) {
+    local = FragmentRegisterFile::Build(CollectFragmentRegs(program));
+    registers = &local;
+  }
   ProgramPrologue shared;
   std::map<std::string, CarryEntry> carry;
   std::vector<Stmt> prologue;
+  if (owns_registers) DeclareRegisters(local, &prologue);
   std::vector<Stmt> bodies;
   for (size_t index = 0; index < program->segments.size(); ++index) {
     tirx::Var seg_chunk("chunk_s" + std::to_string(index), DataType::Int(32));
@@ -2303,7 +2619,8 @@ Stmt EmitProgram(const VectorProgram& program) {
     auto emitted = EmitSegmentStmts(program->segments[index], seg_chunk, hoisted,
                                     "s" + std::to_string(index) + "_",
                                     program->segments.size() == 1, &shared, &carry,
-                                    SegmentConsumesCarry(program->segments[index], hoisted));
+                                    SegmentConsumesCarry(program->segments[index], hoisted),
+                                    registers);
     for (Stmt& stmt : emitted.first) prologue.push_back(std::move(stmt));
     bodies.push_back(emitted.second);
   }
@@ -2320,17 +2637,25 @@ Stmt EmitProgram(const VectorProgram& program) {
 
 }  // namespace
 
-tirx::Stmt EmitPlan(const ffi::ObjectRef& plan) {
+tirx::Stmt EmitPlan(const ffi::ObjectRef& plan, FragmentRegisterFile* registers) {
   if (const auto* program = plan.as<VectorProgramNode>()) {
-    return EmitProgram(ffi::GetRef<VectorProgram>(program));
+    return EmitProgram(ffi::GetRef<VectorProgram>(program), registers);
   }
   const auto* single = plan.as<VectorPlanNode>();
   TVM_FFI_ICHECK(single != nullptr) << "emit_plan expects a VectorPlan or VectorProgram";
   VectorPlan node = ffi::GetRef<VectorPlan>(single);
+  FragmentRegisterFile local;
+  const bool owns_registers = registers == nullptr;
+  if (owns_registers) {
+    local = FragmentRegisterFile::Build(node->fragment_regs);
+    registers = &local;
+  }
   tirx::Var chunk("chunk", DataType::Int(32));
-  auto emitted = EmitSegmentStmts(node, chunk, {}, "", /*single=*/true, nullptr, nullptr, false);
-  if (emitted.first.empty()) return emitted.second;
-  std::vector<Stmt> all = emitted.first;
+  auto emitted = EmitSegmentStmts(node, chunk, {}, "", /*single=*/true, nullptr, nullptr,
+                                  false, registers);
+  std::vector<Stmt> all;
+  if (owns_registers) DeclareRegisters(local, &all);
+  for (Stmt& stmt : emitted.first) all.push_back(std::move(stmt));
   all.push_back(emitted.second);
   return SeqOfVec(all)[0];
 }

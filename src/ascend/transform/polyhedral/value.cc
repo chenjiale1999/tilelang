@@ -778,9 +778,23 @@ ValueNode IndexValue(const AccessInfo& info, const ValueContext& ctx) {
 }
 
 ValueNode LoadNode(const AccessInfo& info, const ValueContext& ctx) {
-  if (info->in_global) {
-    throw Unsupported(
-        "global-memory operand inside T.Parallel (方案 §0 Case II): needs an explicit UB staging copy before the parallel nest");
+  // A register-managed fragment has no memory entity: reading a chunk returns
+  // the whole vector register. P2 proved the access is contiguous and
+  // chunk-aligned (G1/G2), so no memory guard applies.
+  if (StorageClassOf(info->buffer) == StorageClass::kFragment) {
+    std::string name = info->buffer->name.operator std::string();
+    if (!ctx.register_fragments) {
+      throw Unsupported("fragment register: '" + name +
+                        "' is read without a register-mode plan; the fragment "
+                        "must be allocated inside T.SimdVF and planned through P2");
+    }
+    std::string elem =
+        ffi::DLDataTypeToString(info->buffer->dtype.element_of()).operator std::string();
+    ValueSpec spec;
+    spec.recipe = "reg_load";
+    spec.dtype = VecDtype(elem);
+    spec.access = info;
+    return MakeValueNode(std::move(spec));
   }
   // Loads inside lazy conditionals are only legal when the condition holds.
   // Provably safe addresses keep a plain vld; otherwise the guard is attached

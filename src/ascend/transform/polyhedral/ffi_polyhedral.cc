@@ -102,11 +102,17 @@ tvm::transform::Pass MakeStagePass(const char* name,
  * leave the outer ``T.Parallel`` behind, hence pre-order.
  */
 /*! \brief Turn the optional FFI layout map into the planner context. */
-PlanOptions MakePlanOptions(const ffi::Optional<ffi::Map<tirx::Buffer, Layout>>& layouts) {
+PlanOptions MakePlanOptions(const ffi::Optional<ffi::Map<tirx::Buffer, Layout>>& layouts,
+                            const ffi::Optional<ffi::Array<tirx::Buffer>>& vf_alloc_scope) {
   PlanOptions options;
   if (layouts.has_value()) {
     for (const auto& entry : *layouts) {
       options.layouts.emplace_back(entry.first, entry.second);
+    }
+  }
+  if (vf_alloc_scope.has_value()) {
+    for (const tirx::Buffer& buffer : *vf_alloc_scope) {
+      options.vf_alloc_scope.push_back(buffer);
     }
   }
   return options;
@@ -142,9 +148,11 @@ ffi::Array<ffi::Any> AscendPolyhedralAxisClass(const AccessInfo& info, const Axi
 
 ffi::Map<ffi::String, ffi::Any> AscendPolyhedralBuildPlan(
     const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes,
-    ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts) {
+    ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts,
+    ffi::Optional<ffi::Array<tirx::Buffer>> vf_alloc_scope) {
   return Guarded([&]() {
-    VectorProgram program = BuildPlan(stmt, OptionalLanes(lanes), MakePlanOptions(layouts));
+    VectorProgram program =
+        BuildPlan(stmt, OptionalLanes(lanes), MakePlanOptions(layouts, vf_alloc_scope));
     return MakeOk("program", ffi::Any(program));
   });
 }
@@ -162,7 +170,7 @@ ffi::Map<ffi::String, ffi::Any> AscendPolyhedralVectorizeNests(
     const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes,
     ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts) {
   return Guarded([&]() {
-    NestVectorizer vectorizer(OptionalLanes(lanes), MakePlanOptions(layouts));
+    NestVectorizer vectorizer(OptionalLanes(lanes), MakePlanOptions(layouts, std::nullopt));
     return MakeOk("stmt", ffi::Any(vectorizer(stmt)));
   });
 }
@@ -187,6 +195,11 @@ tvm::transform::Pass AscendLiftParallelToArray() {
 /*! \brief P2 pass: consume the P1 region carrier, attach the plan carrier. */
 tvm::transform::Pass AscendPlanArray() {
   return MakeStagePass("tl.AscendPlanArray", PlanArray);
+}
+
+/*! \brief P2.5 pass: VF-level fragment register planning. */
+tvm::transform::Pass AscendPlanFragmentRegisters() {
+  return MakeStagePass("tl.AscendPlanFragmentRegisters", PlanFragmentRegisters);
 }
 
 /*! \brief P3 pass: consume plan carriers, emit ``T.simd.*``. */
@@ -218,6 +231,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.transform.AscendLiftParallelToArray",
                         AscendLiftParallelToArray);
   refl::GlobalDef().def("tl.transform.AscendPlanArray", AscendPlanArray);
+  refl::GlobalDef().def("tl.transform.AscendPlanFragmentRegisters",
+                        AscendPlanFragmentRegisters);
   refl::GlobalDef().def("tl.transform.AscendLowerArrayPlan", AscendLowerArrayPlan);
   refl::GlobalDef().def("tl.transform.AscendPolyhedralVectorize",
                         AscendPolyhedralVectorize);

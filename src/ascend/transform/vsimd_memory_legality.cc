@@ -533,6 +533,7 @@ static std::string SanitizeModel(const std::string &model) {
 
 class LegalityAnalyzer {
 public:
+  std::vector<std::string> nest_statuses;
   LegalityAnalyzer(const FunctionCollector &facts, std::ostringstream *out,
                    const std::vector<PrimExpr> &assumptions,
                    const std::vector<std::pair<Var, PrimExpr>> &bindings,
@@ -614,6 +615,7 @@ public:
         }
       }
       AnalyzeNest_(&nest);
+      nest_statuses.push_back(StatusName(nest.status));
       overall = std::max(overall, nest.status);
       body << "  nest " << nest_index++ << ": domain=";
       for (const LoopInfo &loop : nest.loops) {
@@ -1144,6 +1146,7 @@ class VFVisitor : public StmtExprVisitor {
 public:
   std::ostringstream out;
   std::vector<std::string> statuses;
+  std::vector<VSimdMemoryRegionStatus> region_statuses;
 
   void Run(const PrimFunc &func) {
     FunctionCollector collector;
@@ -1154,10 +1157,20 @@ public:
 
   void VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint == "SIMD_VF") {
+      int vf = vf_index_++;
+      VFAssumeCollector vf_assumes;
+      vf_assumes(op->body);
+      size_t saved_assumptions = assumptions_.size();
+      assumptions_.insert(assumptions_.end(), vf_assumes.assumptions.begin(),
+                          vf_assumes.assumptions.end());
       LegalityAnalyzer analyzer(*facts_, &out, assumptions_, bindings_,
                                 thread_bounds_);
-      statuses.push_back(
-          analyzer.AnalyzeVF(ffi::GetRef<SBlock>(op), vf_index_++));
+      statuses.push_back(analyzer.AnalyzeVF(ffi::GetRef<SBlock>(op), vf));
+      for (size_t i = 0; i < analyzer.nest_statuses.size(); ++i) {
+        region_statuses.push_back(VSimdMemoryRegionStatus{
+            vf, static_cast<int>(i), analyzer.nest_statuses[i]});
+      }
+      assumptions_.resize(saved_assumptions);
       return;
     }
     StmtExprVisitor::VisitStmt_(op);
@@ -1226,6 +1239,13 @@ AnalyzeVSimdMemoryStatuses(const PrimFunc &func) {
   VFVisitor visitor;
   visitor.Run(func);
   return visitor.statuses;
+}
+
+std::vector<VSimdMemoryRegionStatus>
+AnalyzeVSimdMemoryRegions(const PrimFunc &func) {
+  VFVisitor visitor;
+  visitor.Run(func);
+  return visitor.region_statuses;
 }
 
 } // namespace tl

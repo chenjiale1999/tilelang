@@ -37,6 +37,11 @@ namespace polyhedral {
 inline constexpr const char* kArrayRegionAttr = "tl.vsimd.array_region";
 /*! \brief P2 -> P3 carrier attribute (value = the :class:`VectorProgram`). */
 inline constexpr const char* kArrayPlanAttr = "tl.vsimd.array_plan";
+/*!
+ * \brief P2.5 -> P3 VF-level register-map attribute
+ *        (value = :class:`FragmentRegisterMap`).
+ */
+inline constexpr const char* kFragmentRegsAttr = "tl.vsimd.fragment_regs";
 
 /*!
  * \brief P1: run the vsimd analysis and mark every lifted nest.
@@ -61,6 +66,17 @@ TVM_DLL tirx::PrimFunc PlanArray(tirx::PrimFunc func);
  * reaches codegen.
  */
 TVM_DLL tirx::PrimFunc LowerArrayPlan(tirx::PrimFunc func);
+
+/*!
+ * \brief P2.5: VF-level fragment register planning (design §2.6.4).
+ *
+ * Runs after :func:`PlanArray` and before :func:`LowerArrayPlan`. For every
+ * ``SIMD_VF`` block it checks escape (V1), consistency (V3), lifecycle (V4) and
+ * the register budget (V2); on success it attaches
+ * ``tl.vsimd.fragment_regs`` to the block, otherwise it drops *all* plan
+ * carriers under that block (VF-atomic fallback to scalar loops).
+ */
+TVM_DLL tirx::PrimFunc PlanFragmentRegisters(tirx::PrimFunc func);
 
 /*! \brief P1 -> P2 -> P3 in one pass (pipeline entry point). */
 TVM_DLL tirx::PrimFunc VectorizeParallelNests(tirx::PrimFunc func);

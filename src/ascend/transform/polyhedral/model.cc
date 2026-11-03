@@ -28,6 +28,25 @@ StorePlan MakeStorePlan(StoreSpec spec, AccessInfo access, ValueNode value,
   return StorePlan(std::move(node));
 }
 
+FragmentReg MakeFragmentReg(tirx::Var data, std::string name, int64_t slots,
+                            int64_t lanes, std::string dtype) {
+  auto node = ffi::make_object<FragmentRegNode>();
+  node->data = std::move(data);
+  node->name = ffi::String(std::move(name));
+  node->slots = slots;
+  node->lanes = lanes;
+  node->dtype = ffi::String(std::move(dtype));
+  return FragmentReg(std::move(node));
+}
+
+FragmentRegisterMap MakeFragmentRegisterMap(std::vector<FragmentReg> entries) {
+  auto node = ffi::make_object<FragmentRegisterMapNode>();
+  ffi::Array<FragmentReg> array;
+  for (FragmentReg& entry : entries) array.push_back(std::move(entry));
+  node->entries = std::move(array);
+  return FragmentRegisterMap(std::move(node));
+}
+
 ReduceInfo MakeReduceInfo(Axis axis, std::string op, std::string recipe,
                           ValueNode varying, bool accumulate) {
   auto node = ffi::make_object<ReduceInfoNode>();
@@ -69,6 +88,10 @@ ReduceInfo ReduceOf(const VectorPlan& plan) {
 
 bool IsPrivateScope(const tirx::Buffer& buffer) {
   std::string scope = buffer.scope().operator std::string();
+  // A user fragment is a register array, not a per-iteration private scalar
+  // (design §2.1.1): keeping it out of this predicate stops the reduce and
+  // private-scalar branches from claiming it.
+  if (scope == "local.fragment") return false;
   return scope == "local" || scope.compare(0, 6, "local.") == 0;
 }
 
@@ -76,6 +99,9 @@ ValueNode AccumulatorCandidate(const StorePlan& store, const VectorPlan& plan,
                                arith::Analyzer* analyzer) {
   if (store->mask.has_value()) return ValueNode();
   const tirx::Buffer& buffer = store->spec->buffer;
+  // A fragment register has its own read-modify-write path (the register file);
+  // a local.var accumulator would be a second, conflicting storage.
+  if (StorageClassOf(buffer) == StorageClass::kFragment) return ValueNode();
   bool is_private = IsPrivateScope(buffer);
   std::string kind = store->kind_value;
   if (kind == AccessClassName(AccessClass::kUniform)) {
@@ -145,6 +171,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   AccessInfoNode::RegisterReflection();
   StoreSpecNode::RegisterReflection();
   ValueNodeNode::RegisterReflection();
+  FragmentRegNode::RegisterReflection();
+  FragmentRegisterMapNode::RegisterReflection();
   StorePlanNode::RegisterReflection();
   ReduceInfoNode::RegisterReflection();
   VectorPlanNode::RegisterReflection();

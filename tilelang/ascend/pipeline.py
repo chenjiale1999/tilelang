@@ -118,11 +118,18 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.NormalizeBufferVersion()(mod)
-    # P1 -> P2 -> P3 polyhedral vectorizer: the single owner of every
-    # ``T.Parallel`` nest inside ``T.SimdVF``. A nest the planner rejects is
-    # left untouched (it stays a serial loop, no fallback emitter runs after).
-    mod = ascend_transform.AscendPolyhedralVectorize()(mod)
-    # mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+    if pass_ctx.config.get(tilelang.PassConfigKey.TL_ASCEND_VSIMD_VECTORIZE, False):
+        # New path: P1 metadata annotation -> P2 group plan -> P3 span replace.
+        # Rejected groups stay as ``T.Parallel`` and are handled by the legacy
+        # lowering below.
+        if pass_ctx.config.get(tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT, True):
+            mod = ascend_transform.AscendLiftVSimd()(mod)
+        mod = ascend_transform.AscendVectorizeVSimd()(mod)
+        mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+    else:
+        # Legacy P2/P3 path kept as the default until the new path reaches
+        # feature parity. It owns every ``T.Parallel`` nest it can plan.
+        mod = ascend_transform.AscendPolyhedralVectorize()(mod)
     mod = ascend_transform.AscendLowerTileOp()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 

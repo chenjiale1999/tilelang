@@ -88,14 +88,18 @@ def _raise(result) -> None:
     raise Unsupported(result["message"], diagnostics=list(result["diagnostics"]))
 
 
-def build_plan(stmt, lanes=None, layouts=None):
+def build_plan(stmt, lanes=None, layouts=None, vf_alloc_scope=None):
     """C++ ``build_plan``: ``T.Parallel`` nest -> :class:`VectorProgram`.
 
     ``layouts`` is the explicit ``{Buffer: Layout}`` map of the nest's
     destination buffers (the P1 region hand-off); a buffer without an entry
     keeps the default ND store, an Ascend NZ entry scatters 32B blocks.
+
+    ``vf_alloc_scope`` is the enclosing ``SIMD_VF`` allocation set. A fragment
+    access without it is rejected (G0b) instead of planning an un-compilable
+    ``vld``/``vsts``; passing the fragment buffer enables register mode.
     """
-    result = _ffi_api.AscendPolyhedralBuildPlan(stmt, lanes, layouts)
+    result = _ffi_api.AscendPolyhedralBuildPlan(stmt, lanes, layouts, vf_alloc_scope)
     if not result["ok"]:
         _raise(result)
     return result["program"]

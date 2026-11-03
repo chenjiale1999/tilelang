@@ -57,6 +57,11 @@ def AscendAnalyzeVSimdRegion():
     return _ffi_api.AscendAnalyzeVSimdRegion()  # type: ignore
 
 
+def AscendLiftVSimd():
+    """P1 metadata pass: attach per-VF ``tl.vsimd.program`` annotations."""
+    return _ffi_api.AscendLiftVSimd()  # type: ignore
+
+
 def AscendBuildP2PlanInputs(func):
     """Return per-nest P1->P2 inputs (status + optional parallel Stmt).
 
@@ -211,6 +216,36 @@ def AscendPlanArray():
     return _ffi_api.AscendPlanArray()  # type: ignore
 
 
+def AscendPlanVSimd():
+    """P2 pass: plan ``P1_LIFTABLE`` groups into ``tl.vsimd.group_plan``.
+
+    The body is unchanged. A group is planned atomically; any unsupported item
+    marks the whole group ``REJECTED`` so P3 leaves it to the legacy lowering.
+    """
+    return _ffi_api.AscendPlanVSimd()  # type: ignore
+
+
+def AscendEmitVSimd():
+    """P3 pass: emit planned groups and replace their canonical item spans."""
+    return _ffi_api.AscendEmitVSimd()  # type: ignore
+
+
+def AscendVectorizeVSimd():
+    """P2 + P3: plan and emit the new ``tl.vsimd.program`` path."""
+    return _ffi_api.AscendVectorizeVSimd()  # type: ignore
+
+
+def AscendPlanFragmentRegisters():
+    """P2.5 pass: VF-level fragment register planning.
+
+    Checks escape (V1), budget (V2), cross-nest consistency (V3) and lifecycle
+    (V4) for every ``SIMD_VF`` block. On success the block carries
+    ``tl.vsimd.fragment_regs``; on failure every plan carrier of that block is
+    dropped so all its nests fall back to scalar loops atomically.
+    """
+    return _ffi_api.AscendPlanFragmentRegisters()  # type: ignore
+
+
 def AscendLowerArrayPlan():
     """P3 pass: emit every plan carrier as ``tl.simd.*`` TIR."""
     return _ffi_api.AscendLowerArrayPlan()  # type: ignore
@@ -330,9 +365,14 @@ __all__ = [
     "AscendAnalyzeSimdVFCaptureInfo",
     "AscendAnalyzeVSimdRegion",
     "AscendAnalyzeVSimdRegionReport",
+    "AscendLiftVSimd",
     "AscendBuildP2PlanInputs",
     "AscendLiftParallelToArray",
     "AscendPlanArray",
+    "AscendPlanVSimd",
+    "AscendEmitVSimd",
+    "AscendVectorizeVSimd",
+    "AscendPlanFragmentRegisters",
     "AscendLowerArrayPlan",
     "AscendPolyhedralVectorize",
     "AscendSimdVFLowerParallel",

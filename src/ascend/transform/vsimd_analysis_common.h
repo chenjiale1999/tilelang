@@ -31,6 +31,19 @@ inline void AddUndefinedVars(const PrimExpr &expr, VarSet *vars) {
     vars->insert(v);
 }
 
+/*! \brief Collect VF-local tl.assume conditions for PR-A/PR-B. */
+class VFAssumeCollector : public StmtExprVisitor {
+public:
+  std::vector<PrimExpr> assumptions;
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::tilelang_assume ||
+        op->attr_key == "tl.assume") {
+      assumptions.push_back(Downcast<PrimExpr>(op->node));
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+};
+
 /*! \brief One T.Parallel loop level: loop var and its iteration range. */
 struct LoopInfo {
   Var var;

@@ -30,6 +30,66 @@ namespace polyhedral {
 class ReduceInfoNode;
 
 /*!
+ * \brief One user ``T.alloc_fragment`` mapped to a V-core register file.
+ *
+ * The register identity is the fragment's **data Var** (never its name): two
+ * same-name allocations are two entries. ``slots`` is
+ * ``ceil(prod(shape) / lanes)``, i.e. one vector register per chunk.
+ */
+class FragmentRegNode : public ffi::Object {
+ public:
+  tirx::Var data;
+  ffi::String name;
+  int64_t slots{0};
+  int64_t lanes{0};
+  ffi::String dtype;
+
+  static constexpr const bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.FragmentReg", FragmentRegNode,
+                                    ffi::Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<FragmentRegNode>()
+        .def_ro("data", &FragmentRegNode::data)
+        .def_ro("name", &FragmentRegNode::name)
+        .def_ro("slots", &FragmentRegNode::slots)
+        .def_ro("lanes", &FragmentRegNode::lanes)
+        .def_ro("dtype", &FragmentRegNode::dtype);
+  }
+};
+
+class FragmentReg : public ffi::ObjectRef {
+ public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(FragmentReg, ffi::ObjectRef,
+                                             FragmentRegNode);
+  TVM_DEFINE_OBJECT_REF_COW_METHOD(FragmentRegNode);
+};
+
+/*! \brief VF-level register map (``tl.vsimd.fragment_regs`` payload). */
+class FragmentRegisterMapNode : public ffi::Object {
+ public:
+  ffi::Array<FragmentReg> entries;
+
+  static constexpr const bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.FragmentRegisterMap",
+                                    FragmentRegisterMapNode, ffi::Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<FragmentRegisterMapNode>()
+        .def_ro("entries", &FragmentRegisterMapNode::entries);
+  }
+};
+
+class FragmentRegisterMap : public ffi::ObjectRef {
+ public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(FragmentRegisterMap, ffi::ObjectRef,
+                                             FragmentRegisterMapNode);
+  TVM_DEFINE_OBJECT_REF_COW_METHOD(FragmentRegisterMapNode);
+};
+
+/*!
  * \brief Full plan of one write: what, where, predicate / index vector, reduce.
  *
  * ``promote`` is decided once in the plan phase (same principle as the reduce
@@ -63,6 +123,9 @@ class StorePlanNode : public ffi::Object {
   ffi::String layout_kind{"nd"};
   ffi::Optional<int64_t> nz_block_stride;
   ffi::Optional<int64_t> nz_elem_stride;
+  // ``shared`` (normal UB store) or ``register`` (fragment register write, no
+  // memory instruction at all).
+  ffi::String storage{"shared"};
 
   static constexpr const bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StorePlan", StorePlanNode,
@@ -86,7 +149,8 @@ class StorePlanNode : public ffi::Object {
         .def_ro("store_pack_bits", &StorePlanNode::store_pack_bits)
         .def_ro("layout_kind", &StorePlanNode::layout_kind)
         .def_ro("nz_block_stride", &StorePlanNode::nz_block_stride)
-        .def_ro("nz_elem_stride", &StorePlanNode::nz_elem_stride);
+        .def_ro("nz_elem_stride", &StorePlanNode::nz_elem_stride)
+        .def_ro("storage", &StorePlanNode::storage);
   }
 };
 
@@ -148,6 +212,8 @@ class VectorPlanNode : public ffi::Object {
   ffi::Optional<ffi::ObjectRef> reduce;  // ReduceInfo
   ffi::Array<int64_t> guard_boundaries;
   ffi::Array<ffi::String> diagnostics;
+  // Register-mode fragments this segment reads/writes (empty = memory mode).
+  ffi::Array<FragmentReg> fragment_regs;
 
   static constexpr const bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.VectorPlan", VectorPlanNode,
@@ -166,7 +232,8 @@ class VectorPlanNode : public ffi::Object {
         .def_ro("post_stores", &VectorPlanNode::post_stores)
         .def_ro("reduce", &VectorPlanNode::reduce)
         .def_ro("guard_boundaries", &VectorPlanNode::guard_boundaries)
-        .def_ro("diagnostics", &VectorPlanNode::diagnostics);
+        .def_ro("diagnostics", &VectorPlanNode::diagnostics)
+        .def_ro("fragment_regs", &VectorPlanNode::fragment_regs);
   }
 };
 
@@ -209,6 +276,9 @@ class VectorProgram : public ffi::ObjectRef {
 StorePlan MakeStorePlan(StoreSpec spec, AccessInfo access, ValueNode value,
                         ffi::Optional<ValueNode> mask, AccessClass kind,
                         ffi::Optional<ValueNode> index = std::nullopt);
+FragmentReg MakeFragmentReg(tirx::Var data, std::string name, int64_t slots,
+                            int64_t lanes, std::string dtype);
+FragmentRegisterMap MakeFragmentRegisterMap(std::vector<FragmentReg> entries);
 ReduceInfo MakeReduceInfo(Axis axis, std::string op, std::string recipe = "vcadd",
                           ValueNode varying = ValueNode(), bool accumulate = false);
 VectorPlan MakeVectorPlan(ffi::Array<Axis> axes, Axis vector_axis, int64_t lanes,

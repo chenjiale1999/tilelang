@@ -34,6 +34,15 @@ const std::unordered_map<int, std::string>& AccessClassNames() {
   return table;
 }
 
+const std::unordered_map<int, std::string>& StorageClassNames() {
+  static const std::unordered_map<int, std::string> table = {
+      {static_cast<int>(StorageClass::kShared), "shared"},
+      {static_cast<int>(StorageClass::kFragment), "fragment"},
+      {static_cast<int>(StorageClass::kPrivate), "private"},
+  };
+  return table;
+}
+
 bool IsZeroExpr(const PrimExpr& expr) {
   std::optional<int64_t> value = ConstInt(expr, nullptr);
   return value.has_value() && *value == 0;
@@ -61,6 +70,25 @@ AccessClass AccessClassFromName(const std::string& name) {
   }
   TVM_FFI_ICHECK(false) << "unknown access class '" << name << "'";
   return AccessClass::kTrueRandom;
+}
+
+const std::string& StorageClassName(StorageClass kind) {
+  return StorageClassNames().at(static_cast<int>(kind));
+}
+
+StorageClass StorageClassFromName(const std::string& name) {
+  for (const auto& kv : StorageClassNames()) {
+    if (kv.second == name) return static_cast<StorageClass>(kv.first);
+  }
+  TVM_FFI_ICHECK(false) << "unknown storage class '" << name << "'";
+  return StorageClass::kShared;
+}
+
+StorageClass StorageClassOf(const tirx::Buffer& buffer) {
+  std::string scope = buffer.scope().operator std::string();
+  if (scope == "local.fragment") return StorageClass::kFragment;
+  if (scope == "local" || scope == "local.var") return StorageClass::kPrivate;
+  return StorageClass::kShared;
 }
 
 Axis MakeAxis(tirx::Var var, PrimExpr extent, int64_t index, tirx::ForKind kind) {
@@ -210,7 +238,7 @@ AccessInfo ClassifyAccess(const tirx::Buffer& buffer,
   node->offset = offset;
   node->is_store = is_store;
   node->indirect = indirect;
-  node->in_global = buffer.scope() == "global";
+  node->storage = ffi::String(StorageClassName(StorageClassOf(buffer)));
   AccessInfo info(std::move(node));
 
   std::optional<std::string> piecewise_reason =

@@ -189,7 +189,13 @@ public:
     AddLayoutAnnotation(op->annotations);
 
     if (op->name_hint == "SIMD_VF") {
+      VFAssumeCollector vf_assumes;
+      vf_assumes(op->body);
+      size_t local_saved_assumptions = assumptions_.size();
+      assumptions_.insert(assumptions_.end(), vf_assumes.assumptions.begin(),
+                          vf_assumes.assumptions.end());
       AnalyzeVF(op);
+      assumptions_.resize(local_saved_assumptions);
     } else {
       StmtExprVisitor::VisitStmt_(op);
     }

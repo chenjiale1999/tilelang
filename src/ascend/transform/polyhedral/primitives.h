@@ -77,6 +77,20 @@ constexpr int kReduceUnrollLimit = 4;
 /*! \brief Upper bound on guard chunk cuts (plan._GUARD_CUT_LIMIT). */
 constexpr int kGuardCutLimit = 6;
 
+/*!
+ * \brief Manual fragment-register budget (design §2.3).
+ *
+ * A fragment chunk is one ``local.var`` vector register; the slots are pinned
+ * before the automatic SSA temporaries, so the manual pool is capped and the
+ * remaining registers are reserved for masks / value chains. Both constants are
+ * conservative ISA facts until hardware calibration replaces them.
+ */
+constexpr int64_t kMaxVRegsPerVf = 32;
+constexpr int64_t kManualVRegPool = 24;
+constexpr int64_t kAutoTempVRegReserve = kMaxVRegsPerVf - kManualVRegPool;
+/*! \brief Maximum expandable chunk count of a register-mode segment. */
+constexpr int64_t kFragmentUnrollLimit = 16;
+
 /*! \brief One reduction primitive fact: TIR op -> element op -> lane reduce. */
 struct ReducePrimitive {
   std::string tir_op;  // Add / Max / Min

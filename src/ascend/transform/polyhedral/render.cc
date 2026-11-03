@@ -53,6 +53,16 @@ std::vector<std::string> RenderSinglePlan(const VectorPlan& plan,
                   " lanes=" + std::to_string(plan->lanes) +
                   " chunks=" + OptionalIntText(plan->chunks) +
                   " tail=" + OptionalIntText(plan->tail));
+  if (!plan->fragment_regs.empty()) {
+    std::vector<std::string> regs;
+    for (const FragmentReg& reg : plan->fragment_regs) {
+      regs.push_back(reg->name.operator std::string() + ": slots=" +
+                     std::to_string(reg->slots) + " lanes=" +
+                     std::to_string(reg->lanes) + " dtype=" +
+                     reg->dtype.operator std::string());
+    }
+    lines.push_back("fragment_regs=" + PyStrList(regs));
+  }
   ReduceInfo reduce = ReduceOf(plan);
   if (reduce.defined()) {
     lines.push_back("reduce(axis=" + reduce->axis->name.operator std::string() + ", op=" +
@@ -80,6 +90,8 @@ std::vector<std::string> RenderSinglePlan(const VectorPlan& plan,
                 std::to_string(store->nz_elem_stride.has_value() ? *store->nz_elem_stride : 1) +
                 "]";
       }
+      const std::string storage = store->storage.operator std::string();
+      if (storage != "shared") note += " storage=" + storage;
       lines.push_back(std::string(group.first) + " " + SinkText(store->spec) + " [" +
                       store->kind_value.operator std::string() + "] mask=" +
                       (store->mask.has_value() ? "yes" : "no") + note);

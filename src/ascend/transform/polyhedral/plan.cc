@@ -923,7 +923,8 @@ void FoldIdentityInit(VectorPlan& plan) {
     bool folded = false;
     if (pre->kind_value == AccessClassName(AccessClass::kUniform) &&
         !pre->mask.has_value()) {
-      for (const StorePlan& store : plan->stores) {
+      for (size_t store_index = 0; store_index < plan->stores.size(); ++store_index) {
+        const StorePlan& store = plan->stores[store_index];
         ReduceInfo reduce = ReduceOf(store);
         if (!reduce.defined() || !reduce->accumulate) continue;
         if (!(SameBuffer(pre->spec->buffer, store->spec->buffer) &&
@@ -933,7 +934,17 @@ void FoldIdentityInit(VectorPlan& plan) {
         std::string elem = ElemDtype(PyBufferDtypeName(store->spec->buffer));
         PrimExpr identity = ReduceIdentity(reduce->recipe.operator std::string(), elem);
         if (IsSameConst(pre->spec->value, identity)) {
-          reduce.CopyOnWrite()->accumulate = false;
+          // Defect L1: `reduce` is a by-value ObjectRef; mutating its COW copy
+          // alone loses the change. Write the updated reduce back to the store
+          // (the store still has exclusive ownership here, so COW is a no-op
+          // copy of the node we are about to replace).
+          ReduceInfo updated_reduce = reduce;
+          updated_reduce.CopyOnWrite()->accumulate = false;
+          StorePlan updated_store = store;
+          updated_store.CopyOnWrite()->reduce =
+              ffi::Optional<ffi::ObjectRef>(updated_reduce);
+          plan.CopyOnWrite()->stores.Set(static_cast<int64_t>(store_index),
+                                         updated_store);
           folded = true;
           break;
         }
@@ -1288,8 +1299,10 @@ bool HasNzStore(const VectorPlan& plan) {
  * is a clean element-wise body over whole chunk pairs and the packed store owns
  * its destination buffer, so everything else stays ``Unsupported``.
  */
-void ValidatePackedNzSegment(const VectorPlan& plan, const std::optional<int64_t>& extent,
-                             int64_t lanes) {
+void ValidatePackedNzSegment(const VectorPlan& plan,
+                             const std::vector<Axis>& axes,
+                             const Axis& vector_axis,
+                             const std::optional<int64_t>& extent, int64_t lanes) {
   std::optional<size_t> packed;
   for (size_t i = 0; i < plan->stores.size(); ++i) {
     const StorePlan& store = plan->stores[i];
@@ -1305,6 +1318,15 @@ void ValidatePackedNzSegment(const VectorPlan& plan, const std::optional<int64_t
 
   const StorePlan& target = plan->stores[*packed];
   const std::string name = target->spec->buffer->name.operator std::string();
+  // Defect L3: the paired emitter requires the vector axis to be the innermost
+  // axis; without this gate P2 succeeds and P3 rejects the same plan.
+  for (const Axis& axis : axes) {
+    if (axis->index > vector_axis->index) {
+      throw Unsupported("the packed NZ store to '" + name +
+                        "' needs the vector axis to be the innermost axis "
+                        "(split the nest)");
+    }
+  }
   if (*packed != plan->stores.size() - 1) {
     throw Unsupported("the packed NZ store to '" + name +
                       "' must be the last store of the segment (the merged register only exists "
@@ -1439,6 +1461,255 @@ StoreLayoutPlan ClassifyStoreLayout(const StorePlan& store, const PlanOptions& o
   return result;
 }
 
+/* ------------------------------------------------------------------------- */
+/* fragment register planning (G0/G0b + G1-G8)                              */
+/* ------------------------------------------------------------------------- */
+
+/*! \brief One fragment access site of the nest (a store target or a load). */
+struct FragmentAccessSite {
+  tirx::Buffer buffer;
+  ffi::Array<PrimExpr> indices;
+  bool is_store{false};
+};
+
+/*! \brief P2's per-nest fragment decision (design §2.1.2). */
+struct FragmentMode {
+  bool enabled{false};
+  std::vector<FragmentReg> regs;
+};
+
+bool IsRegisterFragment(const tirx::Buffer& buffer) {
+  return StorageClassOf(buffer) == StorageClass::kFragment;
+}
+
+/*! \brief Element dtypes v1 maps onto a vector register (G7). */
+bool FragmentDtypeSupported(const std::string& elem) {
+  static const std::set<std::string> supported = {
+      "int8",    "int16",   "int32",   "uint8",    "uint16",
+      "uint32",  "float16", "bfloat16", "float32"};
+  return supported.count(elem) != 0;
+}
+
+/*!
+ * \brief G6: a fragment layout must be the identity on the flattened index.
+ *
+ * A padded / replicated / permuted fragment layout would make the register slot
+ * of an element depend on more than ``off / lanes``; the register file cannot
+ * represent that, so the nest stays scalar.
+ */
+bool FragmentLayoutIsIdentity(const PlanOptions& options, const tirx::Buffer& buffer) {
+  const Layout* layout = LookupStoreLayout(options, buffer);
+  if (layout == nullptr || !layout->defined()) return true;
+  const auto* fragment = layout->as<FragmentNode>();
+  if (fragment == nullptr) return false;
+  if (!tirx::is_one(fragment->ReplicateExtent())) return false;
+  ffi::Array<PrimExpr> vars;
+  for (size_t i = 0; i < fragment->InputDim(); ++i) {
+    vars.push_back(tirx::Var("frag_i" + std::to_string(i), DataType::Int(32)));
+  }
+  ffi::Array<PrimExpr> forward = (*layout)->Forward(vars);
+  if (forward.size() != vars.size()) return false;
+  for (size_t i = 0; i < forward.size(); ++i) {
+    const auto* var = forward[i].as<tirx::VarNode>();
+    if (var == nullptr || !ffi::GetRef<tirx::Var>(var).same_as(vars[i])) return false;
+  }
+  return true;
+}
+
+/*! \brief Collect every fragment load nested in one expression. */
+void CollectFragmentLoads(const PrimExpr& expr,
+                          std::vector<FragmentAccessSite>* out) {
+  if (!expr.defined()) return;
+  tirx::PostOrderVisit(expr, [&](const ffi::ObjectRef& node) {
+    const auto* load = node.as<tirx::BufferLoadNode>();
+    if (load == nullptr || !IsRegisterFragment(load->buffer)) return;
+    out->push_back(FragmentAccessSite{load->buffer, load->indices, false});
+  });
+}
+
+/*!
+ * \brief G0/G0b + G1-G8 over every fragment access of one nest.
+ *
+ * The decision is atomic per nest: any violation throws, and P2 then attaches
+ * no plan carrier, so the whole nest falls back to the scalar path instead of
+ * producing an un-compilable ``vld``/``vsts`` pair.
+ */
+FragmentMode ClassifyFragmentRegisters(
+    const std::vector<StoreSpec>& pre_specs,
+    const std::vector<StoreSpec>& main_specs,
+    const std::vector<StoreSpec>& post_specs, const std::vector<Axis>& axes,
+    const Axis& vector_axis, int64_t lanes, const PlanOptions& options,
+    arith::Analyzer* analyzer) {
+  std::vector<FragmentAccessSite> sites;
+  auto collect_spec = [&](const StoreSpec& spec, bool is_store) {
+    if (is_store && IsRegisterFragment(spec->buffer)) {
+      sites.push_back(FragmentAccessSite{spec->buffer, spec->indices, true});
+    }
+    CollectFragmentLoads(spec->value, &sites);
+    if (spec->mask.has_value()) CollectFragmentLoads(*spec->mask, &sites);
+    for (const PrimExpr& index : spec->indices) CollectFragmentLoads(index, &sites);
+  };
+  for (const StoreSpec& spec : pre_specs) collect_spec(spec, true);
+  for (const StoreSpec& spec : main_specs) collect_spec(spec, true);
+  for (const StoreSpec& spec : post_specs) collect_spec(spec, true);
+  if (sites.empty()) return FragmentMode();
+
+  // G0b: offline callers have no VF context; never plan a fragment blindly.
+  if (options.vf_alloc_scope.empty()) {
+    throw Unsupported(
+        "fragment register: no VF allocation scope provided; fragment register "
+        "mode requires the P1 region hand-off");
+  }
+  std::set<const tirx::VarNode*> scope;
+  for (const tirx::Buffer& buffer : options.vf_alloc_scope) {
+    scope.insert(buffer->data.get());
+  }
+  std::set<const tirx::VarNode*> axis_vars;
+  for (const Axis& axis : axes) axis_vars.insert(axis->var.get());
+
+  std::optional<int64_t> extent = ConstInt(vector_axis->extent, analyzer);
+  if (!vector_axis->is_parallel) {
+    throw Unsupported("fragment register: the vector axis '" +
+                      vector_axis->name.operator std::string() +
+                      "' must be a T.Parallel axis");
+  }
+  for (const Axis& axis : axes) {
+    if (axis->index > vector_axis->index) {
+      throw Unsupported(
+          "fragment register: the vector axis '" +
+          vector_axis->name.operator std::string() +
+          "' must be the innermost axis of the nest (found inner axis '" +
+          axis->name.operator std::string() + "')");
+    }
+  }
+  if (!extent.has_value()) {
+    throw Unsupported("fragment register: the vector axis extent must be a "
+                      "compile-time constant");
+  }
+  int64_t chunks = (*extent + lanes - 1) / lanes;
+  if (chunks <= 0 || chunks > kFragmentUnrollLimit) {
+    throw Unsupported("fragment register: " + std::to_string(chunks) +
+                      " chunks per nest is outside the expandable range [1, " +
+                      std::to_string(kFragmentUnrollLimit) + "]");
+  }
+
+  FragmentMode mode;
+  mode.enabled = true;
+  std::map<const tirx::VarNode*, FragmentReg> by_data;
+  for (const FragmentAccessSite& site : sites) {
+    const tirx::Buffer& buffer = site.buffer;
+    const std::string name = buffer->name.operator std::string();
+    // G0: the fragment must be allocated by the current VF.
+    if (scope.count(buffer->data.get()) == 0) {
+      throw Unsupported(
+          "fragment register: '" + name +
+          "' is allocated outside this VF; bisheng would capture it as a "
+          "pointer. Move T.alloc_fragment inside T.SimdVF");
+    }
+    // G6: no padded / replicated / permuted fragment layout.
+    if (!FragmentLayoutIsIdentity(options, buffer)) {
+      const Layout* layout = LookupStoreLayout(options, buffer);
+      throw Unsupported("fragment register: '" + name +
+                        "' has a non-identity layout (" +
+                        (layout != nullptr ? (*layout)->DebugOutput()
+                                           : std::string("unknown")) +
+                        ")");
+    }
+    // G7: supported element dtype and matching lane width.
+    std::string elem = ffi::DLDataTypeToString(buffer->dtype.element_of())
+                           .operator std::string();
+    if (!FragmentDtypeSupported(elem)) {
+      throw Unsupported("fragment register: unsupported dtype '" + elem +
+                        "' for '" + name + "'");
+    }
+    if (VRegLanes(elem) != lanes) {
+      throw Unsupported("fragment register: unsupported lane width for '" + name +
+                        "' (fragment " + std::to_string(VRegLanes(elem)) +
+                        " lanes, chunk " + std::to_string(lanes) + ")");
+    }
+    // G7: static, non-empty shape -> a fixed register count.
+    int64_t elems = 1;
+    for (const PrimExpr& dim : buffer->shape) {
+      std::optional<int64_t> value = ConstInt(dim, analyzer);
+      if (!value.has_value() || *value <= 0) {
+        throw Unsupported("fragment register: unsupported shape for '" + name +
+                          "' (all fragment dimensions must be static and positive)");
+      }
+      elems *= *value;
+    }
+    int64_t slots = (elems + lanes - 1) / lanes;
+    if (slots <= 0) {
+      throw Unsupported("fragment register: unsupported shape for '" + name +
+                        "' (empty register file)");
+    }
+
+    AccessInfo info =
+        ClassifyAccess(buffer, site.indices, axes, analyzer, site.is_store);
+    // G1: contiguous along the vector axis (reads *and* writes).
+    AxisClass classified = AxisClassOf(info, vector_axis);
+    if (classified.kind != AccessClass::kContiguous) {
+      throw Unsupported(
+          "fragment register: '" + name + "' is not contiguous along vector axis '" +
+          vector_axis->name.operator std::string() + "' (Δ=" +
+          AccessClassName(classified.kind) +
+          (classified.stride.has_value()
+               ? ", stride=" + std::to_string(*classified.stride)
+               : std::string()) +
+          ")");
+    }
+    // G2/G3/G4: slot = off / lanes must be a compile-time constant that only
+    // depends on the vector axis.
+    for (const tirx::Var& var : FreeVars(info->offset)) {
+      if (var.same_as(vector_axis->var)) continue;
+      if (axis_vars.count(var.get()) != 0) {
+        throw Unsupported("fragment register: '" + name +
+                          "' slot changes along axis '" + var->name_hint +
+                          "'; a register has no dynamic index");
+      }
+      throw Unsupported("fragment register: '" + name +
+                        "' slot is not a compile-time constant");
+    }
+    PrimExpr base_expr =
+        SubstituteVars(info->offset, {{vector_axis->var.get(), IntImm32(0)}});
+    std::optional<int64_t> base = ConstInt(analyzer->Simplify(base_expr), analyzer);
+    if (!base.has_value()) {
+      throw Unsupported("fragment register: '" + name +
+                        "' slot is not a compile-time constant");
+    }
+    if (*base % lanes != 0) {
+      throw Unsupported("fragment register: '" + name + "' chunk base " +
+                        std::to_string(*base) + " is not aligned to " +
+                        std::to_string(lanes) + " lanes");
+    }
+    int64_t base_slot = *base / lanes;
+    if (base_slot + chunks > slots) {
+      throw Unsupported("fragment register: '" + name + "' access spans slot " +
+                        std::to_string(base_slot + chunks - 1) +
+                        " but only " + std::to_string(slots) +
+                        " registers are allocated");
+    }
+    // G8: v1 only writes whole chunks; a partial (tail) chunk would need the
+    // old register value and P2 cannot prove it is initialized across nests.
+    if (site.is_store && (*extent % lanes) != 0) {
+      throw Unsupported("fragment register: '" + name + "' partially writes chunk " +
+                        std::to_string(chunks - 1) +
+                        " before it is initialized; write whole chunks "
+                        "(T.if_then_else fills every lane) or pad the extent");
+    }
+    auto it = by_data.find(buffer->data.get());
+    if (it == by_data.end()) {
+      FragmentReg reg = MakeFragmentReg(buffer->data, name, slots, lanes, elem);
+      by_data.emplace(buffer->data.get(), reg);
+      mode.regs.push_back(reg);
+    } else if (it->second->slots != slots || it->second->lanes != lanes ||
+               it->second->dtype.operator std::string() != elem) {
+      throw Unsupported("fragment register: '" + name +
+                        "' has inconsistent register shapes across its views");
+    }
+  }
+  return mode;
+}
+
 VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                             std::optional<Axis> serial_axis,
                             const std::vector<StoreSpec>& pre_specs,
@@ -1462,6 +1733,13 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   }
 
   std::optional<int64_t> extent = ConstInt(vector_axis->extent, analyzer);
+  // Defect L2: a zero-extent plan has no chunks, and the emitter indexes an
+  // empty statement sequence. Reject it here instead of producing a plan that
+  // crashes (or silently truncates) in P3.
+  if (extent.has_value() && *extent == 0) {
+    throw Unsupported("zero-extent parallel axis '" +
+                      vector_axis->name.operator std::string() + "'");
+  }
   std::optional<int64_t> chunks;
   std::optional<int64_t> tail;
   if (extent.has_value()) {
@@ -1469,11 +1747,33 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     tail = *extent % lanes;
   }
 
+  // Fragment register mode (G0-G8): decided before any value is built, because
+  // a fragment load becomes a ``reg_load`` recipe instead of a ``vload``.
+  FragmentMode fragment = ClassifyFragmentRegisters(
+      pre_specs, main_specs, post_specs, axes, vector_axis, lanes, options, analyzer);
+  if (fragment.enabled) {
+    for (const StoreSpec& spec : pre_specs) {
+      if (IsRegisterFragment(spec->buffer)) {
+        throw Unsupported("fragment register: a pre-loop store to '" +
+                          spec->buffer->name.operator std::string() +
+                          "' has no register form; split the nest");
+      }
+    }
+    for (const StoreSpec& spec : post_specs) {
+      if (IsRegisterFragment(spec->buffer)) {
+        throw Unsupported("fragment register: a post-loop store to '" +
+                          spec->buffer->name.operator std::string() +
+                          "' has no register form; split the nest");
+      }
+    }
+  }
+
   ValueContext ctx;
   ctx.axes = axes;
   ctx.vector_axis = vector_axis;
   ctx.analyzer = analyzer;
   ctx.lanes = lanes;
+  ctx.register_fragments = fragment.enabled;
 
   VectorPlan plan = MakeVectorPlan(ToArray(axes), vector_axis, lanes,
                                    chunks, tail);
@@ -1531,6 +1831,20 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     if (ratio > 1) {
       store.CopyOnWrite()->store_pack_bits = ffi::Optional<int64_t>(2048 / lanes);
     }
+    // Fragment register target (design §2.1.3): no memory instruction is
+    // emitted; the chunk maps to one register slot. A packed / narrowing store
+    // would hand a wider register to a half chunk, which the register file
+    // cannot express (G5).
+    if (fragment.enabled && IsRegisterFragment(spec->buffer)) {
+      const std::string lane_mode =
+          store->store_lane_mode.operator std::string();
+      if (lane_mode != "full") {
+        throw Unsupported("fragment register: '" +
+                          spec->buffer->name.operator std::string() +
+                          "' needs a packed/narrowing store (" + lane_mode + ")");
+      }
+      store.CopyOnWrite()->storage = ffi::String("register");
+    }
     // Destination layout (Stage 2): the classification is applied here, where
     // the plan node is still uniquely owned, so ``CopyOnWrite`` stays in place.
     StoreLayoutPlan layout_plan = ClassifyStoreLayout(store, options, lanes, analyzer);
@@ -1558,6 +1872,11 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   plan.CopyOnWrite()->stores = stores;
   plan.CopyOnWrite()->pre_stores = pre_stores;
   plan.CopyOnWrite()->post_stores = post_stores;
+  if (fragment.enabled) {
+    ffi::Array<FragmentReg> regs;
+    for (const FragmentReg& reg : fragment.regs) regs.push_back(reg);
+    plan.CopyOnWrite()->fragment_regs = regs;
+  }
 
   // Mixed element widths (Stage 1): a chunk narrower than some store register
   // is only proved for the straight-line element-wise subset.
@@ -1579,7 +1898,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   }
   // Stage 2b: a half-register NZ store is widened to a full register by pairing
   // two chunks; that shape has its own segment-level contract.
-  ValidatePackedNzSegment(plan, extent, lanes);
+  ValidatePackedNzSegment(plan, axes, vector_axis, extent, lanes);
 
   // Along a serial axis, pre/post are siblings of the chunk loop and must be
   // lane-uniform; along a parallel axis they live inside the chunk body.
@@ -1629,6 +1948,12 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   }
 
   ReduceInfo reduce = ClassifyReduce(plan, analyzer);
+  if (fragment.enabled && reduce.defined()) {
+    throw Unsupported(
+        "fragment register: a reduction into a fragment register has no register "
+        "form (the cross-lane result is a scalar); keep the fragment element-wise "
+        "or reduce into UB");
+  }
   if (reduce.defined() && partial_lanes) {
     throw Unsupported(
         "a reduction cannot share a segment with a wider-lane store (mixed element widths would "
@@ -1910,6 +2235,21 @@ std::optional<VectorProgram> TryBuildProgram(const Stmt& stmt, arith::Analyzer* 
 VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes,
                         const PlanOptions& options) {
   arith::Analyzer analyzer;
+  // P1 hands over the arithmetic contract of the region. Enter it before any
+  // zero-min / injectivity / lane proof so a VF-local tl.assume is usable here
+  // (the fields used to be write-only).
+  for (const PrimExpr& assumption : options.assumptions) {
+    if (assumption.defined())
+      analyzer.EnterConstraint(assumption);
+  }
+  for (const auto& binding : options.bindings) {
+    // Call-valued bindings are not value aliases (same rule as the old
+    // RestoreBindings helper); binding them would confuse the analyzer.
+    if (binding.first.defined() && binding.second.defined() &&
+        binding.second.as<tirx::CallNode>() == nullptr) {
+      analyzer.Bind(binding.first, binding.second);
+    }
+  }
   std::vector<std::string> notes;
   std::optional<VectorProgram> program =
       TryBuildProgram(stmt, &analyzer, lanes, &notes, options);

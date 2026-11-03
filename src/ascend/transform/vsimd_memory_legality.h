@@ -32,6 +32,16 @@ TVM_DLL ffi::String AnalyzeVSimdMemoryLegality(const tirx::PrimFunc &func);
 TVM_DLL std::vector<std::string>
 AnalyzeVSimdMemoryStatuses(const tirx::PrimFunc &func);
 
+/*! \brief Per-VF/per-nest legality status for per-Region fallback. */
+struct VSimdMemoryRegionStatus {
+  int vf_index{-1};
+  int nest_index{-1};
+  std::string status;
+};
+
+TVM_DLL std::vector<VSimdMemoryRegionStatus>
+AnalyzeVSimdMemoryRegions(const tirx::PrimFunc &func);
+
 } // namespace tl
 } // namespace tvm
 

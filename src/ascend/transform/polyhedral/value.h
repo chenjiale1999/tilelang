@@ -117,6 +117,9 @@ struct ValueContext {
   int64_t guard_free_until{0};
   std::optional<int64_t> guard_free_from;
   int64_t lanes{0};
+  // P2 decided this nest runs in fragment-register mode: a ``local.fragment``
+  // load becomes a register read (``reg_load``) instead of ``vload``.
+  bool register_fragments{false};
 };
 
 /*! \brief Narrow the context to a new guard (no-op when ``guard`` is None). */

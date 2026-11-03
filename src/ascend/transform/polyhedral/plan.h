@@ -38,6 +38,14 @@ struct PlanOptions {
   std::vector<PrimExpr> assumptions;
   std::vector<std::pair<tirx::Var, PrimExpr>> bindings;
   std::vector<tirx::Var> shape_syms;
+  /*!
+   * \brief Buffers allocated by the enclosing ``SIMD_VF`` block (G0).
+   *
+   * An empty vector means "no VF context": any fragment access is rejected
+   * (G0b) instead of silently planning an un-compilable ``vld``/``vsts``.
+   * Only used for validation; it never changes the plan's instructions.
+   */
+  std::vector<tirx::Buffer> vf_alloc_scope;
 };
 
 /*!

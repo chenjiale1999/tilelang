@@ -20,11 +20,10 @@ runtime (no reference module in ``sys.modules``, every entry point owned by
 Covered contract (one test per catalogued case):
 
 * §0 Case I   copy / scalar broadcast, and the no-operand (Copy / Brc) shape;
-* §0 Case II  a global-memory operand is rejected (needs UB staging first);
 * §0 Case III user-allocated ``T.alloc_fragment`` (the V-core register tile) read
   and written directly in ``T.Parallel``: both nests are lifted by P1 and the
-  fragment is planned/emitted as a contiguous ND buffer (fill: UB → reg,
-  consume: reg → UB);
+  fragment is planned/emitted as a V-core **register file** (no ``vld``/``vsts``
+  for the fragment at all);
 * §1 Case I   ``if`` / ``if-else`` (two-arm merged to ``vsel``, single arm to a
   predicated store);
 * §1 Case II  ternary (``T.if_then_else`` / ``tirx.Select``): a *loop-invariant*
@@ -40,7 +39,8 @@ Covered contract (one test per catalogued case):
 * §3 Case II  scalar temporaries (`Bind` aliases) fold into the value DAG;
   ``FloorDiv`` / ``FloorMod`` as a *value* operator strength-reduces to
   ``vshrs`` / ``vand`` for a power-of-two divisor (and is rejected otherwise);
-* §4 Case I   expression subscript: accepted on UB, rejected on a GM operand;
+* §4 Case I   expression subscript: accepted on UB (a GM operand never reaches
+  P2/P3: the front-end ``VFChecker`` rejects it before P1);
 * §4 Case II  high-dimensional flattening (``h[i//16, i%16]``), a strided load
   (``a[2*i]``), a reversal (``a[N-1-i]`` → ``PERMUTE``), and a block-tiled
   fragment layout (``PIECEWISE`` → a per-lane ``vgather2``);
@@ -109,6 +109,7 @@ from tilelang.ascend.analysis.polyhedral import (
     vectorize_parallel_nests,
 )
 from tilelang.layout import (
+    Layout,
     make_ascend_compact_nz_layout,
     make_ascend_major_mn_layout,
     make_ascend_nz_layout,
@@ -229,6 +230,56 @@ def _single_segment(func):
     assert isinstance(program, VectorProgram), "build_plan must always return a VectorProgram"
     assert len(program.segments) == 1, f"expected a single segment, got {len(program.segments)}"
     return program.segments[0]
+
+
+def _fragment_buffer(stmt) -> tirx.Buffer:
+    """The first ``local.fragment`` buffer referenced by *stmt* (VF alloc scope)."""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferStore) and node.buffer.scope() == "local.fragment":
+            found.append(node.buffer)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    assert found, "the nest does not write a local.fragment buffer"
+    return found[0]
+
+
+def _fragment_buffers(stmt) -> list:
+    """Every distinct ``local.fragment`` buffer read or written by *stmt*."""
+    found: list = []
+    seen: set = set()
+
+    def add(buffer):
+        if buffer.scope() != "local.fragment":
+            return
+        key = str(buffer.data)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(buffer)
+
+    def visit(node):
+        if isinstance(node, tirx.BufferStore):
+            add(node.buffer)
+        elif isinstance(node, tirx.BufferLoad):
+            add(node.buffer)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return found
+
+
+def _reg_store_count(stmt) -> int:
+    """Number of ``BufferStore`` statements targeting a ``local.var`` register."""
+    count = 0
+
+    def visit(node):
+        nonlocal count
+        if isinstance(node, tirx.BufferStore) and node.buffer.scope() == "local.var":
+            count += 1
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return count
 
 
 def _emitted_ops(stmt) -> list:
@@ -470,32 +521,18 @@ def test_scalar_broadcast():
     assert "tl.simd.vdup" in _emitted_ops(emit_plan(plan))
 
 
-def test_global_operand_rejected():
-    N = 128
-
-    @T.prim_func
-    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
-        with T.Kernel(1):
-            c = T.alloc_shared((N,), "float32")
-            for i in T.Parallel(N):
-                c[i] = A[i]
-
-    with pytest.raises(Unsupported, match="global-memory operand"):
-        _plan(k)
-
-
 def test_manual_fragment_register_in_parallel():
     """§0 Case III: a user-allocated fragment (the V-core register tile) read and
     written directly in ``T.Parallel`` — the most general shape of a topk-gate
     style kernel, without the statement-level ``if`` that P1 still rejects.
 
     Data has to be staged in UB first (a GM operand inside ``T.SimdVF`` is a
-    front-end semantic error and P2's Branch B), so the kernel has two nests:
-    fill the register tile from UB, then consume it into UB.  Both nests are
-    LIFTED by P1; P2 treats the fragment as a contiguous ND buffer, and P3
-    emits ``vld``/``vsts`` for the register tile (fill) and for the UB write
-    (consume).  This pins the P1/P2/P3 hand-off; giving the fragment *register*
-    semantics in the final codegen is a separate downstream concern.
+    front-end semantic error, rejected by ``VFChecker`` before P1/P2), so the
+    kernel has two nests: fill the register tile from UB, then consume it into
+    UB.  Both nests are LIFTED by P1; P2 turns the fragment into a register file
+    (``storage="register"``) and P3 emits **no** ``vld``/``vsts`` for it: the
+    fill reads UB and writes the ``local.var`` register, the consume reads that
+    register and writes UB.
     """
     N = 64
 
@@ -518,31 +555,452 @@ def test_manual_fragment_register_in_parallel():
     assert [item["status"] for item in items] == ["LIFTED", "LIFTED"]
     assert [_stored_buffers(item["stmt"]) for item in items] == [["frag"], ["c_ub"]]
 
-    fill = build_plan(items[0]["stmt"]).segments[0]
+    scope = [_fragment_buffer(items[0]["stmt"])]
+    fill = build_plan(items[0]["stmt"], vf_alloc_scope=scope).segments[0]
     print(f"p2:\n{fill}")
     assert fill.vector_axis.name == "i"
     assert (fill.lanes, fill.chunks, fill.tail) == (64, 1, 0)
     assert fill.stores[0].kind == AccessClass.CONTIGUOUS
     assert fill.stores[0].spec.buffer.scope() == "local.fragment"
+    assert fill.stores[0].storage == "register"
     assert fill.stores[0].value.recipe == "vadds"
+    assert [(reg.name, reg.slots, reg.lanes) for reg in fill.fragment_regs] == [("frag", 1, 64)]
     fill_ops = _emitted_ops(emit_plan(fill))
     print(f"p3:\n{emit_plan(fill)}")
     print(f"p3:\n{fill_ops}")
-    assert "tl.simd.vld" in fill_ops and "tl.simd.vsts" in fill_ops
+    assert "tl.simd.vld" in fill_ops, "the fill still loads a_ub from UB"
+    assert "tl.simd.vsts" not in fill_ops, "the fragment is a register, not a memory sink"
+    assert _reg_store_count(emit_plan(fill)) == 1
 
-    use = build_plan(items[1]["stmt"]).segments[0]
+    use = build_plan(items[1]["stmt"], vf_alloc_scope=scope).segments[0]
     print(f"p2-2:\n{use}")
     assert use.vector_axis.name == "i"
     assert use.stores[0].kind == AccessClass.CONTIGUOUS
-    assert _recipes(use.stores[0].value) == ["vmuls", "vload", "imm"]
+    assert _recipes(use.stores[0].value) == ["vmuls", "reg_load", "imm"]
     use_ops = _emitted_ops(emit_plan(use))
     print(f"p3-2:\n{emit_plan(use)}")
-    assert "tl.simd.vld" in use_ops and "tl.simd.vsts" in use_ops
+    assert "tl.simd.vld" not in use_ops, "the fragment read is a register read"
+    assert "tl.simd.vsts" in use_ops, "the consume writes c_ub"
+
+    # One combined view of the whole kernel: both nests' plans and the IR they
+    # emit.  Both nests address the same fragment data var, so their register
+    # slots line up; each *offline* emission declares the registers it needs,
+    # while the P3 driver shares one declaration per VF.
+    plans = [fill, use]
+    emitted = [emit_plan(plan) for plan in plans]
+    print("all plans:\n" + "\n".join(str(plan) for plan in plans))
+    print("all ir:\n" + "\n".join(str(stmt) for stmt in emitted))
 
 
 # ---------------------------------------------------------------------------
-# §1 branches / ternaries
+# §0 Case III variants: fragment register file (G0-G8 / V1-V4)
 # ---------------------------------------------------------------------------
+
+
+def _fragment_scope(stmt):
+    return [_fragment_buffer(stmt)]
+
+
+def _reg_alloc_names(stmt) -> list:
+    names: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.AllocBuffer) and node.buffer.scope() == "local.var":
+            names.append(node.buffer.name)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return names
+
+
+def _vf_fragment_regs(stmt) -> list:
+    """The ``tl.vsimd.fragment_regs`` payloads attached to SIMD_VF blocks."""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.SBlock) and node.name_hint == "SIMD_VF":
+            if "tl.vsimd.fragment_regs" in node.annotations:
+                found.append(node.annotations["tl.vsimd.fragment_regs"])
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return found
+
+
+def _vf_alloc_buffers(stmt) -> list:
+    """Allocation list of the single SIMD_VF block in *stmt*."""
+    found: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.SBlock) and node.name_hint == "SIMD_VF":
+            found.append(list(node.alloc_buffers))
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    assert len(found) == 1, f"expected one SIMD_VF block, got {len(found)}"
+    return found[0]
+
+
+def test_fragment_register_multi_chunk_unrolled():
+    """N=256 → 4 slots; every chunk is a compile-time slot (no dynamic index)."""
+    N = 256
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i] + 1.0
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    scope = _fragment_scope(items[0]["stmt"])
+    fill = build_plan(items[0]["stmt"], vf_alloc_scope=scope).segments[0]
+    assert fill.chunks == 4
+    assert [(reg.slots, reg.lanes) for reg in fill.fragment_regs] == [(4, 64)]
+    stmt = emit_plan(fill)
+    assert _reg_store_count(stmt) == 4, "one register write per unrolled chunk"
+    assert len(_reg_alloc_names(stmt)) == 4
+    assert "tl.simd.vsts" not in _emitted_ops(stmt)
+
+    use = build_plan(items[1]["stmt"], vf_alloc_scope=scope).segments[0]
+    assert _recipes(use.stores[0].value) == ["reg_load"]
+    assert "tl.simd.vld" not in _emitted_ops(emit_plan(use))
+
+
+def test_fragment_register_guarded_tail_uses_select():
+    """A value-level ``T.if_then_else`` fills every lane: one ``vsel`` + a write."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = T.if_then_else(i < 64, a_ub[i], T.float32(-3.4e38))
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    fill = build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"])).segments[0]
+    assert fill.tail == 0
+    ops = _emitted_ops(emit_plan(fill))
+    assert "tl.simd.vsel" in ops
+    assert "tl.simd.vsts" not in ops
+    assert _reg_store_count(emit_plan(fill)) == 2
+
+
+def test_fragment_register_partial_write_after_init_merges():
+    """A predicated write to an initialized chunk becomes ``vsel(old, new, mask)``.
+
+    The statement-level ``if`` is not lifted by P1 (design §4 risk 3), so this
+    exercises P2 directly on both nests; P1's control-flow white-list is a
+    separate project.
+    """
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), B: T.Tensor((N,), "float32"),
+          C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            b_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    if a_ub[i] > 0.0:
+                        frag[i] = b_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    nests = _outer_parallel_nests(k)
+    assert len(nests) == 3
+    scope = [_fragment_buffer(nests[0])]
+    fill = build_plan(nests[0], vf_alloc_scope=scope).segments[0]
+    assert fill.stores[0].storage == "register"
+    rewrite = build_plan(nests[1], vf_alloc_scope=scope).segments[0]
+    assert rewrite.stores[0].storage == "register"
+    assert rewrite.stores[0].mask is not None
+    ops = _emitted_ops(emit_plan(rewrite))
+    assert "tl.simd.vsel" in ops
+    assert "tl.simd.vsts" not in ops
+
+
+def test_fragment_register_dynamic_slot_rejected():
+    """G3: the slot must not depend on a non-vector axis."""
+    R, N = 2, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((R, N), "float32"), C: T.Tensor((R, N), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((R, N), "float32")
+            c_ub = T.alloc_shared((R, N), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((R, N), "float32")
+                for r, i in T.Parallel(R, N):
+                    frag[r, i] = a_ub[r, i]
+                for r, i in T.Parallel(R, N):
+                    c_ub[r, i] = frag[r, i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    with pytest.raises(Unsupported, match="slot changes along axis|slot is not a compile-time"):
+        build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"]))
+
+
+def test_fragment_register_non_identity_layout_rejected():
+    """G6: a padded / non-identity fragment layout cannot be a register file."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    frag = _fragment_buffer(items[0]["stmt"])
+    padded = Layout((N,), lambda i: [i // 2])
+    with pytest.raises(Unsupported, match="non-identity layout"):
+        build_plan(items[0]["stmt"], layouts={frag: padded},
+                   vf_alloc_scope=[frag])
+
+
+def test_fragment_register_strided_access_rejected():
+    """G1: fragment reads and writes must both be Δ=1 along the vector axis."""
+    N = 128
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[2 * i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    with pytest.raises(Unsupported, match="not contiguous along vector axis"):
+        build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"]))
+
+
+def test_fragment_alloc_outside_vf_rejected_by_build_plan():
+    """G0: a fragment allocated outside ``T.SimdVF`` is captured as a pointer."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            frag = T.alloc_fragment((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(k)
+    # The VF's own allocation set excludes the outer fragment: G0.
+    with pytest.raises(Unsupported, match="allocated outside this VF"):
+        build_plan(items[0]["stmt"], vf_alloc_scope=[_buffer(k, "a_ub")])
+
+
+def test_fragment_without_vf_scope_rejected():
+    """G0b: an offline plan without the P1 hand-off must not guess registers."""
+    N = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    items = _p1_inputs(main)
+    with pytest.raises(Unsupported, match="no VF allocation scope provided"):
+        build_plan(items[0]["stmt"])
+
+
+def test_fragment_register_escape_rejected():
+    """V1: a fragment also used by ``T.copy`` keeps its memory identity → scalar."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+                T.copy(frag, a_ub)
+            T.copy(c_ub, C)
+
+    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
+    assert len(_carriers(planned.body, "tl.vsimd.array_plan")) == 2
+    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
+    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
+    assert _vf_fragment_regs(gated.body) == []
+    emitted = _run_stage(gated, at.AscendLowerArrayPlan)
+    tvm.ir.assert_structural_equal(emitted.body, k.body, map_free_vars=True)
+
+
+def test_fragment_register_budget_rejected():
+    """V2: more than ``kManualVRegPool`` pinned slots → whole VF falls back."""
+    N, COUNT = 64, 25
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frags = [T.alloc_fragment((N,), "float32") for _ in range(COUNT)]
+                for i in T.Parallel(N):
+                    for frag in frags:
+                        frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frags[0][i]
+            T.copy(c_ub, C)
+
+    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
+    assert _carriers(planned.body, "tl.vsimd.array_plan")
+    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
+    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
+    assert _vf_fragment_regs(gated.body) == []
+
+
+def test_fragment_register_read_before_write_rejected():
+    """V4: reading a chunk before any nest defines it is rejected (VF-atomic)."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+            T.copy(c_ub, C)
+
+    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
+    assert len(_carriers(planned.body, "tl.vsimd.array_plan")) == 2
+    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
+    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
+    assert _vf_fragment_regs(gated.body) == []
+
+
+def test_fragment_register_partial_tail_write_rejected():
+    """G8: a partial (tail) chunk write has no defined old register value."""
+    N = 100
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    frag[i] = a_ub[i]
+                for i in T.Parallel(N):
+                    c_ub[i] = frag[i]
+            T.copy(c_ub, C)
+
+    nests = _outer_parallel_nests(k)
+    frag = _fragment_buffer(nests[0])
+    with pytest.raises(Unsupported, match="partially writes chunk"):
+        build_plan(nests[0], vf_alloc_scope=[frag])
+
+
+def test_fragment_register_same_name_two_allocs_do_not_alias():
+    """M6 regression: two same-name fragments keep two independent register files."""
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N,), "float32")
+            c_ub = T.alloc_shared((N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                first = T.alloc_fragment((N,), "float32")
+                second = T.alloc_fragment((N,), "float32")
+                for i in T.Parallel(N):
+                    first[i] = a_ub[i] + 7.0
+                for i in T.Parallel(N):
+                    second[i] = a_ub[i]
+                    c_ub[i] = first[i]
+            T.copy(c_ub, C)
+
+    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
+    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
+    maps = _vf_fragment_regs(gated.body)
+    assert len(maps) == 1 and len(maps[0].entries) == 2, "two allocations = two entries"
+    emitted = _run_stage(gated, at.AscendLowerArrayPlan)
+    regs = [buffer for buffer in _vf_alloc_buffers(emitted.body)
+            if buffer.scope() == "local.var"]
+    assert len(regs) == 2, "two allocations = two independent register files"
+    assert regs[0].name != regs[1].name, "each allocation gets its own register names"
+
+    # The consume store reads the *first* fragment's register, not the second's.
+    nests = _outer_parallel_nests(k)
+    scope = _fragment_buffers(nests[1])
+    assert len(scope) == 2, "the second nest touches both allocations"
+    consume = build_plan(nests[1], vf_alloc_scope=scope).segments[0]
+    assert [store.storage for store in consume.stores] == ["register", "shared"]
+    assert consume.stores[1].value.recipe == "reg_load"
+    assert not consume.stores[1].value.access.buffer.data.same_as(
+        consume.stores[0].spec.buffer.data), "the two same-name fragments never alias"
 
 
 def test_if_else_merges_into_select():
@@ -1240,23 +1698,6 @@ def test_expression_subscript():
     assert plan.stores[0].kind == AccessClass.CONTIGUOUS
     assert plan.stores[0].value.recipe == "vload"
     assert "tl.simd.vld" in _emitted_ops(emit_plan(plan))
-
-
-def test_expression_subscript_rejected_on_global_operand():
-    """§4 Case I: the *same* expression subscript is rejected when the operand is
-    a GM buffer — an expression subscript inside ``T.Parallel`` needs UB staging
-    first, regardless of how simple the stride is."""
-    S, DK = 16, 64
-
-    @T.prim_func
-    def k(Gb: T.Tensor((2, 1024, 8), "float32"), OUT: T.Tensor((S, DK), "float32")):
-        with T.Kernel(1):
-            gs = T.alloc_shared((S, DK), "float32")
-            for i_s, i_k in T.Parallel(S, DK):
-                gs[i_s, i_k] = Gb[0, 0 * S + i_s, 0]
-
-    with pytest.raises(Unsupported, match="global-memory operand"):
-        _plan(k)
 
 
 def test_expression_subscript_reads_shared_operand_as_uniform():
@@ -2062,27 +2503,28 @@ def test_multi_segment_failure_reason_is_preserved():
     """缺陷 B：某一段构造失败时**不再被吞掉**——段级原因经 ``notes`` 合并进最终
     ``Unsupported.diagnostics``，而不是只剩回落单段路径后那句泛化的「nested serial loop」。
 
-    第二段读 GM 张量 ``A``（未先 staging 到 UB）→ 该段在取值 DAG 构造时抛 Unsupported；
-    整体仍按既有行为拒绝，但原因随诊断一并可见。
+    第二段写 ``bool`` 目标（``T.simd`` 无 bool 向量 store）→ 该段在 store 规划时抛
+    Unsupported；整体仍按既有行为拒绝，但原因随诊断一并可见。
     """
     MS, KS = 64, 8
 
     @T.prim_func
-    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "float32")):
+    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS, KS), "bool")):
         with T.Kernel(1):
             a = T.alloc_shared((MS, KS), "float32")
             c = T.alloc_shared((MS, KS), "float32")
+            flags = T.alloc_shared((MS, KS), "bool")
             for i in T.Parallel(MS):
                 for j in T.serial(KS):
                     c[i, j] = a[i, j] * 2.0
                 for l in T.serial(KS):
-                    c[i, l] = A[i, l]
+                    flags[i, l] = a[i, l] > 0.0
 
     with pytest.raises(Unsupported, match="nested serial loop") as excinfo:
         _plan(k)
     notes = excinfo.value.diagnostics
     assert any(note.startswith("segment 1") for note in notes)
-    assert any("global-memory operand" in note for note in notes)
+    assert any("not supported" in note for note in notes)
 
 
 # ---------------------------------------------------------------------------
@@ -3955,14 +4397,24 @@ def _assert_branch_b(func, match: str, index: int = 0):
         build_plan(_lifted(func, index)["stmt"])
 
 
+def _module_entry(func):
+    """Wrap *func* in a module and return ``(module, entry_name)``."""
+    mod = tvm.IRModule.from_expr(func)
+    names = [gv.name_hint for gv in mod.get_global_vars()]
+    assert len(names) == 1, names
+    return mod, names[0]
+
+
 def _run_stage(func, pass_factory):
     """Run one staged pass (P1 / P2 / P3) on a PrimFunc."""
-    return pass_factory()(tvm.IRModule.from_expr(func))["main"]
+    mod, name = _module_entry(func)
+    return pass_factory()(mod)[name]
 
 
 def _run_combined(func):
     """Run the combined ``AscendPolyhedralVectorize`` pass on a PrimFunc."""
-    return at.AscendPolyhedralVectorize()(tvm.IRModule.from_expr(func))["main"]
+    mod, name = _module_entry(func)
+    return at.AscendPolyhedralVectorize()(mod)[name]
 
 
 def _carriers(stmt, attr_key: str) -> list:
@@ -4068,22 +4520,6 @@ def _p1_kernel_extent(extent: int):
             with T.SimdVF():
                 for i in T.Parallel(extent):
                     c_ub[i] = a_ub[i] + 1.0
-            T.copy(c_ub, C)
-
-    return main
-
-
-def _p1_kernel_gm_operand_in_vf():
-    """GM load inside ``T.SimdVF``: P1 lifts it, P2 rejects it (Branch B)."""
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            c_ub = T.alloc_shared((n,), "float32")
-            with T.SimdVF():
-                for i in T.Parallel(n):
-                    c_ub[i] = A[i]
             T.copy(c_ub, C)
 
     return main
@@ -4394,25 +4830,6 @@ def test_p1_mixed_legality_marks_whole_vf():
     assert all("stmt" not in item for item in items)
 
 
-def test_p1_gm_operand_branch_b():
-    """P1 能 lift、P2 不能 plan：Branch B 是文档化的交接结果，不是 bug。
-
-    其余 Branch B 形状（bool store、非零下界、stencil 尾块）的 P2 拒绝信息
-    已分别由 ``test_bool_store_is_rejected_at_build_time``、
-    ``test_serial_loop_with_non_zero_lower_bound_is_rejected``、
-    ``test_serial_stencil_rejected`` 覆盖。
-    """
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1), T.SimdVF():
-            for i in T.Parallel(n):
-                C[i] = A[i] + 1.0
-
-    _assert_branch_b(main, "global-memory operand")
-
-
 def test_p1_no_vf_returns_empty():
     @T.prim_func
     def main(A: T.Tensor((16,), "float32")):
@@ -4476,7 +4893,7 @@ def test_passes_are_idempotent():
 
 
 def test_rejected_nests_fall_through_every_stage():
-    # (a) P1 拒绝（非法内存）⇒ 无载体、IR 逐字节不变；组合 pass 也不动它。
+    # P1 拒绝（非法内存）⇒ 无载体、IR 逐字节不变；组合 pass 也不动它。
     n = 256
 
     @T.prim_func
@@ -4493,19 +4910,6 @@ def test_rejected_nests_fall_through_every_stage():
     assert _carriers(lifted.body, "tl.vsimd.array_region") == []
     tvm.ir.assert_structural_equal(lifted.body, illegal.body, map_free_vars=True)
     tvm.ir.assert_structural_equal(_run_combined(illegal).body, illegal.body, map_free_vars=True)
-
-    # (b) P1 能 lift、P2 拒绝（GM 操作数）⇒ 载体被原样解开，P3 也不动它。
-    gm = _p1_kernel_gm_operand_in_vf()
-    lifted = _run_stage(gm, at.AscendLiftParallelToArray)
-    assert len(_carriers(lifted.body, "tl.vsimd.array_region")) == 1
-
-    planned = _run_stage(lifted, at.AscendPlanArray)
-    assert _carriers(planned.body, "tl.vsimd.array_region") == []
-    assert _carriers(planned.body, "tl.vsimd.array_plan") == []
-    assert _count_parallel_nests(planned.body) == 1
-
-    emitted = _run_stage(planned, at.AscendLowerArrayPlan)
-    tvm.ir.assert_structural_equal(emitted.body, gm.body, map_free_vars=True)
 
 
 # ---------------------------------------------------------------------------
