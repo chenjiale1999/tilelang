@@ -7,15 +7,9 @@ single-segment cases go through :func:`_single_segment` to take ``segments[0]``)
 plus the emitted ``T.simd.*`` call sequence.  No PTOAS / Bisheng / device
 execution is involved.
 
-**Implementation binding: C++ only.**  Every symbol this file imports from
-``tilelang.ascend.analysis.polyhedral`` is a thin alias of the compiled C++
-implementation (``_cpp`` over TVM FFI): plans, emissions, renders, Δ
-classification and the nest driver are all produced by C++.  The Python
-reference implementation has been moved out to a separate package
-(``tilelang.ascend.analysis.polyhedral_reference``) and is never imported here;
-:func:`test_cpp_implementation_is_the_only_one_loaded` asserts that binding at
-runtime (no reference module in ``sys.modules``, every entry point owned by
-``...polyhedral._cpp``, every plan an FFI ``VectorProgram`` object).
+Every symbol this file imports from ``tilelang.ascend.analysis.polyhedral`` is
+a thin alias of the compiled C++ implementation (``_ffi`` over TVM FFI): plans,
+emissions, renders, Δ classification are all produced by C++.
 
 Covered contract (one test per catalogued case):
 
@@ -68,15 +62,15 @@ Covered contract (one test per catalogued case):
 * 诊断不吞    a multi-segment program/segment carries diagnostics, and a segment
   build failure is merged into the final ``Unsupported.diagnostics`` instead of
   being swallowed by the single-segment fallback.
-* transform   ``vectorize_parallel_nests`` lowers a whole multi-axis nest
-  (outer axes → serial, vector axis → strip-mined chunks).
-* P1→P2 交付  ``AscendBuildP2PlanInputs`` 的接口契约：LIFTED 的 nest 必带一个
-  可直接规划的 ``stmt``（与直接规划原 nest 的 plan/emit 逐字段一致），
-  ``FALLBACK`` / ``OPAQUE`` / Branch B 只带状态不带 ``stmt``。
-* 三段 pass   ``AscendLiftParallelToArray`` → ``AscendPlanArray`` →
-  ``AscendLowerArrayPlan`` 的 carrier 交接、幂等，以及被拒 nest 逐字节不变。
-* 流水线      ``AscendPolyhedralVectorize`` 是唯一的 ``T.Parallel`` 降级路径，
-  默认配置下就运行（没有 impl 开关），生成的设备源码带 ``simd_inst::``。
+* transform   ``emit_plan`` lowers a whole multi-axis nest (outer axes →
+  serial, vector axis → strip-mined chunks).
+* P1 交付      LIFTED 的 nest 可被 ``build_plan`` 直接规划，被拒 nest 在
+  ``tl.vsimd.program`` 中记录为 ``OPAQUE`` 并带 ``reason``（P1 字段全量断言
+  见 ``test_ascend_vsimd_lift.py`` / ``test_ascend_vsimd_region.py``）。
+* 三段 pass   ``AscendLiftVSimd`` → ``AscendPlanVSimd`` → ``AscendEmitVSimd``
+  的 annotation 交接、幂等，以及被拒 nest 逐字节不变。
+* 流水线      ``AscendVectorizeVSimd`` 是新路径（P1 → P2 → P3）的唯一入口，
+  默认配置下就运行；被拒 group 由 ``AscendSimdVFLowerParallel`` 兜底。
 
 The mathematical core (``finite_difference`` / ``classify_delta``) is unit
 tested directly, since every case above is decided by the sign/shape of
@@ -106,7 +100,6 @@ from tilelang.ascend.analysis.polyhedral import (
     emit_plan,
     finite_difference,
     render_plan,
-    vectorize_parallel_nests,
 )
 from tilelang.layout import (
     Layout,
@@ -370,59 +363,6 @@ def _eval_lane(node, lane: int, plan, env: dict | None = None, base: int = 0):
 
 
 # ---------------------------------------------------------------------------
-# implementation binding: C++ only, no Python reference implementation
-# ---------------------------------------------------------------------------
-
-#: Python oracle package that this suite must never load.
-_REFERENCE_PACKAGE = "tilelang.ascend.analysis.polyhedral_reference"
-#: Module that owns every entry point used below (the C++ FFI binding).
-_CPP_MODULE = "tilelang.ascend.analysis.polyhedral._cpp"
-
-
-def test_cpp_implementation_is_the_only_one_loaded():
-    """Every assertion in this file is produced by the compiled implementation.
-
-    Proves the dependency contract at runtime:
-
-    * the Python reference package is not imported by the suite;
-    * each API entry point is owned by ``...polyhedral._cpp`` (FFI), not by a
-      Python module;
-    * the plan objects flowing through the assertions are C++ FFI nodes, not the
-      Python reference dataclasses.
-    """
-    loaded = [
-        module
-        for module in sys.modules
-        if module == _REFERENCE_PACKAGE or module.startswith(_REFERENCE_PACKAGE + ".")
-    ]
-    assert loaded == [], f"the Python reference implementation was imported: {loaded}"
-
-    for name, entry in (
-        ("build_plan", build_plan),
-        ("emit_plan", emit_plan),
-        ("render_plan", render_plan),
-        ("vectorize_parallel_nests", vectorize_parallel_nests),
-        ("finite_difference", finite_difference),
-        ("classify_delta", classify_delta),
-    ):
-        assert entry.__module__ == _CPP_MODULE, f"{name} is not the C++ entry point: {entry.__module__}"
-
-    N = 128
-
-    @T.prim_func
-    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
-        with T.Kernel(1):
-            a = T.alloc_shared((N,), "float32")
-            c = T.alloc_shared((N,), "float32")
-            for i in T.Parallel(N):
-                c[i] = a[i]
-
-    program = build_plan(_first_parallel(k))
-    assert type(program).__module__ == _CPP_MODULE, f"plan came from {type(program).__module__}"
-    assert type(program.segments[0]).__module__ == _CPP_MODULE
-
-
-# ---------------------------------------------------------------------------
 # the mathematical core: Δ(offset) decides everything
 # ---------------------------------------------------------------------------
 
@@ -550,13 +490,14 @@ def test_manual_fragment_register_in_parallel():
                     c_ub[i] = frag[i] * 2.0
             T.copy(c_ub, C)
     print(f"\nfunc:\n{k}")
-    items = _p1_inputs(k)
+    nests = _outer_parallel_nests(k)
+    items = _p1_items(k)
     print(f"p1:\n{items}")
     assert [item["status"] for item in items] == ["LIFTED", "LIFTED"]
-    assert [_stored_buffers(item["stmt"]) for item in items] == [["frag"], ["c_ub"]]
+    assert [_stored_buffers(nest) for nest in nests] == [["frag"], ["c_ub"]]
 
-    scope = [_fragment_buffer(items[0]["stmt"])]
-    fill = build_plan(items[0]["stmt"], vf_alloc_scope=scope).segments[0]
+    scope = [_fragment_buffer(nests[0])]
+    fill = build_plan(nests[0], vf_alloc_scope=scope).segments[0]
     print(f"p2:\n{fill}")
     assert fill.vector_axis.name == "i"
     assert (fill.lanes, fill.chunks, fill.tail) == (64, 1, 0)
@@ -572,7 +513,7 @@ def test_manual_fragment_register_in_parallel():
     assert "tl.simd.vsts" not in fill_ops, "the fragment is a register, not a memory sink"
     assert _reg_store_count(emit_plan(fill)) == 1
 
-    use = build_plan(items[1]["stmt"], vf_alloc_scope=scope).segments[0]
+    use = build_plan(nests[1], vf_alloc_scope=scope).segments[0]
     print(f"p2-2:\n{use}")
     assert use.vector_axis.name == "i"
     assert use.stores[0].kind == AccessClass.CONTIGUOUS
@@ -612,19 +553,6 @@ def _reg_alloc_names(stmt) -> list:
     return names
 
 
-def _vf_fragment_regs(stmt) -> list:
-    """The ``tl.vsimd.fragment_regs`` payloads attached to SIMD_VF blocks."""
-    found: list = []
-
-    def visit(node):
-        if isinstance(node, tirx.SBlock) and node.name_hint == "SIMD_VF":
-            if "tl.vsimd.fragment_regs" in node.annotations:
-                found.append(node.annotations["tl.vsimd.fragment_regs"])
-
-    tirx.stmt_functor.post_order_visit(stmt, visit)
-    return found
-
-
 def _vf_alloc_buffers(stmt) -> list:
     """Allocation list of the single SIMD_VF block in *stmt*."""
     found: list = []
@@ -656,9 +584,9 @@ def test_fragment_register_multi_chunk_unrolled():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
-    scope = _fragment_scope(items[0]["stmt"])
-    fill = build_plan(items[0]["stmt"], vf_alloc_scope=scope).segments[0]
+    nests = _outer_parallel_nests(k)
+    scope = _fragment_scope(nests[0])
+    fill = build_plan(nests[0], vf_alloc_scope=scope).segments[0]
     assert fill.chunks == 4
     assert [(reg.slots, reg.lanes) for reg in fill.fragment_regs] == [(4, 64)]
     stmt = emit_plan(fill)
@@ -666,7 +594,7 @@ def test_fragment_register_multi_chunk_unrolled():
     assert len(_reg_alloc_names(stmt)) == 4
     assert "tl.simd.vsts" not in _emitted_ops(stmt)
 
-    use = build_plan(items[1]["stmt"], vf_alloc_scope=scope).segments[0]
+    use = build_plan(nests[1], vf_alloc_scope=scope).segments[0]
     assert _recipes(use.stores[0].value) == ["reg_load"]
     assert "tl.simd.vld" not in _emitted_ops(emit_plan(use))
 
@@ -689,8 +617,8 @@ def test_fragment_register_guarded_tail_uses_select():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
-    fill = build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"])).segments[0]
+    nest = _outer_parallel_nests(k)[0]
+    fill = build_plan(nest, vf_alloc_scope=_fragment_scope(nest)).segments[0]
     assert fill.tail == 0
     ops = _emitted_ops(emit_plan(fill))
     assert "tl.simd.vsel" in ops
@@ -758,9 +686,9 @@ def test_fragment_register_dynamic_slot_rejected():
                     c_ub[r, i] = frag[r, i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
+    nest = _outer_parallel_nests(k)[0]
     with pytest.raises(Unsupported, match="slot changes along axis|slot is not a compile-time"):
-        build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"]))
+        build_plan(nest, vf_alloc_scope=_fragment_scope(nest))
 
 
 def test_fragment_register_non_identity_layout_rejected():
@@ -781,12 +709,11 @@ def test_fragment_register_non_identity_layout_rejected():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
-    frag = _fragment_buffer(items[0]["stmt"])
+    nest = _outer_parallel_nests(k)[0]
+    frag = _fragment_buffer(nest)
     padded = Layout((N,), lambda i: [i // 2])
     with pytest.raises(Unsupported, match="non-identity layout"):
-        build_plan(items[0]["stmt"], layouts={frag: padded},
-                   vf_alloc_scope=[frag])
+        build_plan(nest, layouts={frag: padded}, vf_alloc_scope=[frag])
 
 
 def test_fragment_register_strided_access_rejected():
@@ -807,9 +734,9 @@ def test_fragment_register_strided_access_rejected():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
+    nest = _outer_parallel_nests(k)[0]
     with pytest.raises(Unsupported, match="not contiguous along vector axis"):
-        build_plan(items[0]["stmt"], vf_alloc_scope=_fragment_scope(items[0]["stmt"]))
+        build_plan(nest, vf_alloc_scope=_fragment_scope(nest))
 
 
 def test_fragment_alloc_outside_vf_rejected_by_build_plan():
@@ -830,10 +757,10 @@ def test_fragment_alloc_outside_vf_rejected_by_build_plan():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(k)
+    nest = _outer_parallel_nests(k)[0]
     # The VF's own allocation set excludes the outer fragment: G0.
     with pytest.raises(Unsupported, match="allocated outside this VF"):
-        build_plan(items[0]["stmt"], vf_alloc_scope=[_buffer(k, "a_ub")])
+        build_plan(nest, vf_alloc_scope=[_buffer(k, "a_ub")])
 
 
 def test_fragment_without_vf_scope_rejected():
@@ -854,9 +781,9 @@ def test_fragment_without_vf_scope_rejected():
                     c_ub[i] = frag[i]
             T.copy(c_ub, C)
 
-    items = _p1_inputs(main)
+    nest = _outer_parallel_nests(main)[0]
     with pytest.raises(Unsupported, match="no VF allocation scope provided"):
-        build_plan(items[0]["stmt"])
+        build_plan(nest)
 
 
 def test_fragment_register_escape_rejected():
@@ -878,12 +805,14 @@ def test_fragment_register_escape_rejected():
                 T.copy(frag, a_ub)
             T.copy(c_ub, C)
 
-    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
-    assert len(_carriers(planned.body, "tl.vsimd.array_plan")) == 2
-    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
-    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
-    assert _vf_fragment_regs(gated.body) == []
-    emitted = _run_stage(gated, at.AscendLowerArrayPlan)
+    mod = _run_plan(_run_lift(k))
+    plans = _group_plans(mod.body)
+    assert plans and all(group.status == "REJECTED" for group in plans[0].groups)
+    # The COPY into the fragment is not a UB copy, and the fragment escapes the
+    # register plan: the whole VF falls back with a diagnostic.
+    assert any("not UB" in group.reason or "outside its register plan" in group.reason
+               for group in plans[0].groups)
+    emitted = _run_new_path(k)
     tvm.ir.assert_structural_equal(emitted.body, k.body, map_free_vars=True)
 
 
@@ -906,11 +835,10 @@ def test_fragment_register_budget_rejected():
                     c_ub[i] = frags[0][i]
             T.copy(c_ub, C)
 
-    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
-    assert _carriers(planned.body, "tl.vsimd.array_plan")
-    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
-    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
-    assert _vf_fragment_regs(gated.body) == []
+    mod = _run_plan(_run_lift(k))
+    plans = _group_plans(mod.body)
+    assert plans and all(group.status == "REJECTED" for group in plans[0].groups)
+    assert any("fragment registers required" in group.reason for group in plans[0].groups)
 
 
 def test_fragment_register_read_before_write_rejected():
@@ -931,11 +859,10 @@ def test_fragment_register_read_before_write_rejected():
                     frag[i] = a_ub[i]
             T.copy(c_ub, C)
 
-    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
-    assert len(_carriers(planned.body, "tl.vsimd.array_plan")) == 2
-    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
-    assert _carriers(gated.body, "tl.vsimd.array_plan") == []
-    assert _vf_fragment_regs(gated.body) == []
+    mod = _run_plan(_run_lift(k))
+    plans = _group_plans(mod.body)
+    assert plans and all(group.status == "REJECTED" for group in plans[0].groups)
+    assert any("uninitialized chunk" in group.reason for group in plans[0].groups)
 
 
 def test_fragment_register_partial_tail_write_rejected():
@@ -982,11 +909,12 @@ def test_fragment_register_same_name_two_allocs_do_not_alias():
                     c_ub[i] = first[i]
             T.copy(c_ub, C)
 
-    planned = _run_stage(_run_stage(k, at.AscendLiftParallelToArray), at.AscendPlanArray)
-    gated = _run_stage(planned, at.AscendPlanFragmentRegisters)
-    maps = _vf_fragment_regs(gated.body)
-    assert len(maps) == 1 and len(maps[0].entries) == 2, "two allocations = two entries"
-    emitted = _run_stage(gated, at.AscendLowerArrayPlan)
+    mod = _run_plan(_run_lift(k))
+    plans = _group_plans(mod.body)
+    assert plans and plans[0].fragment_mode == "register"
+    assert len(plans[0].fragment_regs.entries) == 2, "two allocations = two entries"
+    assert not plans[0].fragment_regs.entries[0].data.same_as(plans[0].fragment_regs.entries[1].data)
+    emitted = _run_new_path(k)
     regs = [buffer for buffer in _vf_alloc_buffers(emitted.body)
             if buffer.scope() == "local.var"]
     assert len(regs) == 2, "two allocations = two independent register files"
@@ -2532,7 +2460,7 @@ def test_multi_segment_failure_reason_is_preserved():
 # ---------------------------------------------------------------------------
 
 
-def test_vectorize_parallel_nests_replaces_parallel():
+def test_plan_emit_replaces_the_parallel_nest():
     N = 128
 
     @T.prim_func
@@ -2543,15 +2471,15 @@ def test_vectorize_parallel_nests_replaces_parallel():
             for i in T.Parallel(N):
                 c[i] = a[i]
 
-    transformed = vectorize_parallel_nests(k.body)
+    stmt = emit_plan(_plan(k))
 
-    kinds = _for_kinds(transformed)
+    kinds = _for_kinds(stmt)
     assert tirx.ForKind.PARALLEL not in kinds, "the T.Parallel nest must be replaced"
     assert kinds.count(tirx.ForKind.SERIAL) == 1  # the single axis -> chunk loop only
-    assert "tl.simd.vld" in _emitted_ops(transformed)
+    assert "tl.simd.vld" in _emitted_ops(stmt)
 
 
-def test_vectorize_parallel_nests_lowers_multidim_nest_as_a_whole():
+def test_plan_emit_lowers_the_multidim_nest_as_a_whole():
     """Top-down lowering: a 2-axis ``T.Parallel(M, K)`` must be consumed *as a
     whole* (outer axis → serial, vector axis ``j`` → strip-mined chunks).  A
     bottom-up walk would replace the inner axis first, stranding the outer
@@ -2566,12 +2494,12 @@ def test_vectorize_parallel_nests_lowers_multidim_nest_as_a_whole():
             for i, j in T.Parallel(M, K):
                 c[i, j] = a[i, j]
 
-    transformed = vectorize_parallel_nests(k.body)
+    stmt = emit_plan(_plan(k))
 
-    kinds = _for_kinds(transformed)
+    kinds = _for_kinds(stmt)
     assert tirx.ForKind.PARALLEL not in kinds, "the whole nest must be lowered"
     assert kinds.count(tirx.ForKind.SERIAL) == 2, "outer axis + chunk loop, no residue"
-    ops = _emitted_ops(transformed)
+    ops = _emitted_ops(stmt)
     assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
 
 
@@ -2594,7 +2522,7 @@ def test_multidim_nest_keeps_every_axis():
     assert plan.vector_axis.name == "j"
 
 
-def test_vectorize_parallel_nests_lowers_multi_serial_program():
+def test_plan_emit_lowers_multi_serial_program():
     """Top-down lowering also consumes a multi-serial ``T.Parallel`` body: the shared
     parallel axis becomes one serial loop, each segment contributes its own chunk loop,
     and source order (``c`` before ``d``) is preserved."""
@@ -2612,13 +2540,13 @@ def test_vectorize_parallel_nests_lowers_multi_serial_program():
                 for l in T.serial(KS):
                     d[i, l] = c[i, l] + 1.0
 
-    transformed = vectorize_parallel_nests(k.body)
+    stmt = emit_plan(_plan(k))
 
-    kinds = _for_kinds(transformed)
+    kinds = _for_kinds(stmt)
     assert tirx.ForKind.PARALLEL not in kinds
     # 两段都展平成满 lane 合成轴：每段一个 chunk 循环。
     assert kinds.count(tirx.ForKind.SERIAL) == 2
-    ops = _emitted_ops(transformed)
+    ops = _emitted_ops(stmt)
     assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
 
 
@@ -3790,7 +3718,7 @@ def test_mixed_width_segment_emits_packed_store_with_part_even():
 
 
 def test_mixed_width_segment_vectorizes_the_whole_nest():
-    stmt = vectorize_parallel_nests(_mixed_width_kernel().body)
+    stmt = emit_plan(_plan(_mixed_width_kernel()))
     assert _count_parallel_nests(stmt) == 0
     text = str(stmt)
     assert "tl.simd.vsts" in text
@@ -4003,7 +3931,7 @@ def test_canonical_nz_store_uses_the_same_block_stride():
 def test_nz_store_vectorizes_the_whole_nest():
     kernel = _nz_2d_kernel()
     layouts = _nz(kernel)
-    stmt = vectorize_parallel_nests(kernel.body, layouts=layouts)
+    stmt = emit_plan(_plan(kernel, layouts))
 
     assert _count_parallel_nests(stmt) == 0
     text = str(stmt)
@@ -4041,9 +3969,10 @@ def test_p1_hand_off_exposes_the_annotated_layouts():
                     c_ub[i, j] = T.exp(a_ub[i, j])
             T.copy(c_ub, C)
 
-    lifted = [item for item in at.AscendBuildP2PlanInputs(k) if item["status"] == "LIFTED"]
+    items = _p1_items(k)
+    lifted = [item for item in items if item["status"] == "LIFTED"]
     assert lifted, "the nest must be lifted"
-    assert list(lifted[0]["layouts"]) == ["c_ub"]
+    assert [entry["buffer"].name for entry in lifted[0]["region"]["layouts"]] == ["c_ub"]
 
 
 def test_explicit_non_nz_layout_is_rejected():
@@ -4256,7 +4185,7 @@ def test_parallel_fa_direct_nz_store_lifts():
 def test_parallel_fa_vectorizes_the_softmax_nest():
     """整条 pass 把 P_ub + P_nz_ub 的 nest 换成 vld2 + part0/1 + vor + vsstb。"""
     func = _parallel_fa()
-    out_func = at.AscendPolyhedralVectorize()(tvm.IRModule({"main": func}))["main"]
+    out_func = _run_new_path(func)
     out = str(out_func)
     _dump_stmt("FA: P1->P2->P3", out)
 
@@ -4276,41 +4205,27 @@ def test_parallel_fa_vectorizes_the_softmax_nest():
     assert str((129 << 16) | 1) in out
 
 
-def test_parallel_fa_scope_has_layout():
-    func = _parallel_fa()
-    infos = at.AscendAnalyzeSimdVFCaptureInfo(func)
-    nz_regions = [
-        info
-        for info in infos
-        if any("P_nz_ub" in str(name) for name in info["captures"])
-    ]
-    assert nz_regions
-    assert any("P_nz_ub" in lane for lane in nz_regions[0]["layouts"])
-
-
 # ===========================================================================
-# P1 -> P2 交付契约（``AscendBuildP2PlanInputs``）、三段 pass 与流水线接入
+# P1 交付、三段 pass 与流水线接入
 # ===========================================================================
 #
-# 这一组钉的是“nest 之外的接口”。P2/P3 的规划与发射语义已由上面各节的
-# 场景用例覆盖（多 store、三元/if、归约、broadcast、transpose/flatten、
-# 混合宽度、NZ 等），这里不再重复 plan 字段，只覆盖三件事：
+# 这一组钉的是“nest 之外的接口”。P1 的 item/group/capture 全量字段由
+# ``test_ascend_vsimd_{lift,region,capture_scope,memory_legality}.py`` 覆盖，
+# P2/P3 的规划与发射语义由上面各节的场景用例覆盖（多 store、三元/if、
+# 归约、broadcast、transpose/flatten、混合宽度、NZ 等）。这里不再重复这些
+# 断言，只覆盖三件事：
 #
-#   * 交付：LIFTED 的 ``stmt`` 能直接喂给 ``build_plan``，并且与直接规划原
-#     ``T.Parallel`` nest 的 plan/emit 逐字段一致；被拒 nest（FALLBACK /
-#     OPAQUE）只带状态、不带 ``stmt``；
-#   * 三段：P1/P2/P3 通过 ``tl.vsimd.array_region`` / ``tl.vsimd.array_plan``
-#     逐段交接，幂等，被拒 nest 逐字节不变；
-#   * 流水线：``AscendPolyhedralVectorize`` 是唯一的 ``T.Parallel`` 降级路径，
+#   * 交付：LIFTED 的 nest 可直接喂给 ``build_plan``；被拒 nest 记录为
+#     OPAQUE/带 reason（P1 侧只留一条代表性用例）；
+#   * 三段：P1/P2/P3 通过 ``tl.vsimd.program`` / ``tl.vsimd.group_plan``
+#     annotation 交接，幂等，被拒 nest 逐字节不变；
+#   * 流水线：``AscendVectorizeVSimd`` 是新路径的唯一入口，
 #     默认 PassContext 下就运行。
 
 
-def _vf_report(func) -> str:
-    return str(at.AscendAnalyzeVSimdRegionReport(func))
-
-
-def _p1_inputs(func):
-    return at.AscendBuildP2PlanInputs(func)
+def _p1_items(func) -> list:
+    """Item facts of the P1 ``tl.vsimd.program`` annotation (per VF)."""
+    return [item for program in _programs(_run_lift(func).body) for item in program["items"]]
 
 
 def _outer_parallel_nests(func) -> list:
@@ -4340,16 +4255,6 @@ def _outer_parallel_nests(func) -> list:
     return nests
 
 
-def _lifted(func, index: int = 0):
-    """The ``index``-th P1 nest as a LIFTED hand-off item (with its ``stmt``)."""
-    items = _p1_inputs(func)
-    assert items, "no P1 nest was reported"
-    item = items[index]
-    assert item["status"] == "LIFTED", item.get("reason")
-    assert "stmt" in item, "LIFTED input must carry a statement"
-    return item
-
-
 def _stored_buffers(stmt) -> list:
     names: list = []
 
@@ -4361,40 +4266,12 @@ def _stored_buffers(stmt) -> list:
     return names
 
 
-def _has_decl_buffer(stmt) -> bool:
-    found: list = []
-
-    def visit(node):
-        if isinstance(node, tirx.DeclBuffer):
-            found.append(node)
-
-    tirx.stmt_functor.post_order_visit(stmt, visit)
-    return bool(found)
-
-
-def _plan_and_emit_parity(func, index: int = 0) -> None:
-    """The P1 hand-off ``stmt`` must plan/emit exactly like the original nest."""
-    item = _lifted(func, index)
-    original_plan = build_plan(_outer_parallel_nests(func)[index])
-    p1_plan = build_plan(item["stmt"])
-    assert render_plan(original_plan) == render_plan(p1_plan)
-    assert tvm.ir.structural_equal(emit_plan(original_plan), emit_plan(p1_plan), map_free_vars=True)
-    _dump_stmt("P1 hand-off stmt", item["stmt"])
-
-
-def _assert_no_stmt_rejected(func, allowed, reason_match: str):
-    items = _p1_inputs(func)
+def _assert_p1_rejected(func, status: str, reason_match: str):
+    items = _p1_items(func)
     assert len(items) == 1
     item = items[0]
-    assert item["status"] in allowed, (item["status"], item.get("reason"))
-    assert "stmt" not in item
+    assert item["status"] == status, (item["status"], item.get("reason"))
     assert reason_match in item["reason"]
-
-
-def _assert_branch_b(func, match: str, index: int = 0):
-    """P1 LIFTED but P2 rejects: the documented Branch B, not a bug."""
-    with pytest.raises(Unsupported, match=match):
-        build_plan(_lifted(func, index)["stmt"])
 
 
 def _module_entry(func):
@@ -4405,32 +4282,49 @@ def _module_entry(func):
     return mod, names[0]
 
 
-def _run_stage(func, pass_factory):
-    """Run one staged pass (P1 / P2 / P3) on a PrimFunc."""
+def _run_lift(func):
+    """P1: attach ``tl.vsimd.program`` to every ``SIMD_VF`` block."""
     mod, name = _module_entry(func)
-    return pass_factory()(mod)[name]
+    return at.AscendLiftVSimd()(mod)[name]
 
 
-def _run_combined(func):
-    """Run the combined ``AscendPolyhedralVectorize`` pass on a PrimFunc."""
+def _run_plan(func):
+    """P2: plan the P1 groups (body unchanged)."""
     mod, name = _module_entry(func)
-    return at.AscendPolyhedralVectorize()(mod)[name]
+    return at.AscendPlanVSimd()(mod)[name]
 
 
-def _carriers(stmt, attr_key: str) -> list:
+def _run_new_path(func):
+    """P1 -> P2 -> P3 on one PrimFunc."""
+    mod, name = _module_entry(func)
+    mod = at.AscendLiftVSimd()(mod)
+    mod = at.AscendPlanVSimd()(mod)
+    return at.AscendEmitVSimd()(mod)[name]
+
+
+def _annotations(stmt, key: str) -> list:
+    """Typed ``key`` annotations of every SBlock in *stmt*."""
     found: list = []
 
     def visit(node):
-        if isinstance(node, tirx.AttrStmt) and node.attr_key == attr_key:
-            found.append(node)
+        if isinstance(node, tirx.SBlock) and key in node.annotations:
+            found.append(node.annotations[key])
 
     tirx.stmt_functor.post_order_visit(stmt, visit)
     return found
 
 
-def _lower_source(func) -> str:
-    """Lower under the default pass context (no impl switch) to device source."""
-    with tvm.target.Target("ascend"), tilelang.transform.PassContext():
+def _group_plans(stmt) -> list:
+    return _annotations(stmt, "tl.vsimd.group_plan")
+
+
+def _programs(stmt) -> list:
+    return _annotations(stmt, "tl.vsimd.program")
+
+
+def _lower_source(func, config=None) -> str:
+    """Lower under the given pass context (default: no override) to device source."""
+    with tvm.target.Target("ascend"), tilelang.transform.PassContext(config=config or {}):
         return tilelang.lower(func, target="ascend").kernel_source
 
 
@@ -4456,60 +4350,6 @@ def _p1_kernel_1d():
     return main
 
 
-def _p1_kernel_2d():
-    m, n = 8, 64
-
-    @T.prim_func
-    def main(A: T.Tensor((m, n), "float32"), C: T.Tensor((m, n), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((m, n), "float32")
-            c_ub = T.alloc_shared((m, n), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i, j in T.Parallel(m, n):
-                    c_ub[i, j] = a_ub[i, j] + 1.0
-            T.copy(c_ub, C)
-
-    return main
-
-
-def _p1_kernel_3d():
-    b0, b1, b2 = 2, 8, 16
-
-    @T.prim_func
-    def main(A: T.Tensor((b0, b1, b2), "float32"), C: T.Tensor((b0, b1, b2), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((b0, b1, b2), "float32")
-            c_ub = T.alloc_shared((b0, b1, b2), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i, j, k in T.Parallel(b0, b1, b2):
-                    c_ub[i, j, k] = a_ub[i, j, k] + 1.0
-            T.copy(c_ub, C)
-
-    return main
-
-
-def _p1_kernel_4d():
-    b0, b1, b2, b3 = 2, 2, 4, 8
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((b0, b1, b2, b3), "float32"),
-        C: T.Tensor((b0, b1, b2, b3), "float32"),
-    ):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((b0, b1, b2, b3), "float32")
-            c_ub = T.alloc_shared((b0, b1, b2, b3), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i, j, k, l in T.Parallel(b0, b1, b2, b3):
-                    c_ub[i, j, k, l] = a_ub[i, j, k, l] + 1.0
-            T.copy(c_ub, C)
-
-    return main
-
-
 def _p1_kernel_extent(extent: int):
     @T.prim_func
     def main(A: T.Tensor((extent,), "float32"), C: T.Tensor((extent,), "float32")):
@@ -4525,124 +4365,19 @@ def _p1_kernel_extent(extent: int):
     return main
 
 
-def _p1_kernel_local_var():
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            c_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                v = T.alloc_var("float32", init=0.0)
-                for i in T.Parallel(n):
-                    c_ub[i] = a_ub[i] + v
-            T.copy(c_ub, C)
-
-    return main
-
-
-def _p1_kernel_opaque_evaluate():
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i in T.Parallel(n):
-                    T.evaluate(T.call_extern("float32", "opaque_side_effect", a_ub[i]))
-
-    return main
-
-
 # ---------------------------------------------------------------------------
-# 交付契约：LIFTED 带可规划的 stmt，拒绝项只带状态
+# 交付契约：LIFTED 的 stmt 可直接规划；被拒 nest 只带状态
 # ---------------------------------------------------------------------------
-
-
-def test_p1_lift_contract_1d():
-    func = _p1_kernel_1d()
-    item = _lifted(func)
-    assert (item["vf_index"], item["nest_index"]) == (0, 0)
-
-    stmt = item["stmt"]
-    assert isinstance(stmt, tirx.For)
-    assert stmt.kind == tirx.ForKind.PARALLEL
-    assert stmt.loop_var.name == "i"
-    assert int(stmt.min) == 0 and int(stmt.extent) == 64
-    assert _for_kinds(stmt) == [tirx.ForKind.PARALLEL]
-    assert _stored_buffers(stmt) == ["c_ub"]
-    assert len(_outer_parallel_nests(func)) == 1
-
-    report = _vf_report(func)
-    assert "VF#0 nest 0: status=LIFTED" in report
-    assert "domain: i in [0, 64)" in report
-    assert "W c_ub[i] = a_ub[i] + T.float32(1.0) shape=[64] axes=[0] dep={0}" in report
-    assert "R a_ub[i] shape=[64] axes=[0] dep={0}" in report
-    assert "for i in range(64)" in report
-    assert "verify: OK" in report
-    assert "tl.vsimd.region" in report
-
-    program = build_plan(stmt)
-    assert isinstance(program, VectorProgram)
-    assert program.axes == []
-    assert len(program.segments) == 1
-    segment = program.segments[0]
-    assert segment.vector_axis.name == "i"
-    assert (segment.lanes, segment.chunks, segment.tail) == (64, 1, 0)
-    assert segment.reduce is None
-    assert len(segment.stores) == 1
-    assert segment.stores[0].kind == AccessClass.CONTIGUOUS
-
-
-def test_p1_lift_contract_2d():
-    func = _p1_kernel_2d()
-    report = _vf_report(func)
-    assert "domain: i in [0, 8) j in [0, 64)" in report
-    assert "shape=[8,64] axes=[0,1] dep={0,1}" in report
-    assert "T.grid(8, 64)" in report
-    assert "verify: OK" in report
-
-    stmt = _lifted(func)["stmt"]
-    assert _for_kinds(stmt) == [tirx.ForKind.PARALLEL] * 2
-    assert (stmt.loop_var.name, int(stmt.extent)) == ("i", 8)
-    assert (stmt.body.loop_var.name, int(stmt.body.extent)) == ("j", 64)
-
-
-@pytest.mark.parametrize(
-    "factory",
-    [_p1_kernel_1d, _p1_kernel_2d, _p1_kernel_3d, _p1_kernel_4d],
-    ids=["1d", "2d", "3d", "4d"],
-)
-def test_p1_stmt_plans_like_the_original_nest(factory):
-    """P1 交接 stmt 的 For 链全为 ``PARALLEL``，plan/emit 与原 nest 一致。"""
-    func = factory()
-    assert _for_kinds(_lifted(func)["stmt"]) == [tirx.ForKind.PARALLEL] * _nest_rank(func)
-    _plan_and_emit_parity(func)
-
-
-def _nest_rank(func) -> int:
-    nest = _outer_parallel_nests(func)[0]
-    rank = 1
-    while isinstance(nest.body, tirx.For):
-        nest = nest.body
-        rank += 1
-    return rank
 
 
 @pytest.mark.parametrize("extent, chunks, tail", [(100, 2, 36), (1, 1, 1)], ids=["tail", "unit"])
-def test_p1_tail_and_unit_extent_plan(extent, chunks, tail):
+def test_plan_tail_and_unit_extent(extent, chunks, tail):
     func = _p1_kernel_extent(extent)
-    segment = build_plan(_lifted(func)["stmt"]).segments[0]
+    segment = build_plan(_outer_parallel_nests(func)[0]).segments[0]
     assert (segment.chunks, segment.tail) == (chunks, tail)
-    _plan_and_emit_parity(func)
-    
 
 
-def test_p1_symbolic_extent_plan():
+def test_plan_symbolic_extent():
     """符号 extent：运行时 chunk 循环 + 符号尾块，plan 不折叠成常量。"""
     e = T.dynamic("E")
 
@@ -4657,118 +4392,8 @@ def test_p1_symbolic_extent_plan():
                     c_ub[i] = a_ub[i] + 1.0
             T.copy(c_ub, C)
 
-    assert "shape_syms:" in _vf_report(main)
-    segment = build_plan(_lifted(main)["stmt"]).segments[0]
+    segment = build_plan(_outer_parallel_nests(main)[0]).segments[0]
     assert segment.chunks is None and segment.tail is None
-    _plan_and_emit_parity(main)
-
-
-def test_p1_view_region_drops_decl_buffer():
-    """局部 view 的 ``DeclBuffer`` 不进入交接 stmt，store 仍引用 view 名。"""
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            base = T.alloc_shared((n,), "float32")
-            T.copy(A, base)
-            with T.SimdVF():
-                for i in T.Parallel(n // 2):
-                    v = T.view(base, shape=(n // 2, 2), dtype="float32")
-                    v[i, 0] = v[i, 0] + 1.0
-            T.copy(base, C)
-
-    report = _vf_report(main)
-    assert "local_views:" in report
-    assert "v -> base" in report
-    assert "decl_buffer" in report
-
-    stmt = _lifted(main)["stmt"]
-    assert not _has_decl_buffer(stmt)
-    assert _stored_buffers(stmt) == ["v"]
-    _plan_and_emit_parity(main)
-
-
-def test_p1_tail_bind_is_inlined_known_boundary():
-    """外层 Bind 被内联（已知边界：emit 文本不同，plan 结构相同）。"""
-    n, bn = 1000, 256
-
-    @T.prim_func
-    def main(A: T.Tensor((n + bn,), "float32"), C: T.Tensor((n + bn,), "float32")):
-        with T.Kernel(T.ceildiv(n, bn)) as bx:
-            a_ub = T.alloc_shared((n + bn,), "float32")
-            c_ub = T.alloc_shared((n + bn,), "float32")
-            T.copy(A, a_ub)
-            tail = T.min(n - bx * bn, bn)
-            with T.SimdVF():
-                for i in T.Parallel(tail):
-                    c_ub[i] = a_ub[i] + 1.0
-            T.copy(c_ub, C)
-
-    stmt = _lifted(main)["stmt"]
-    free = {var.name for var in tirx.analysis.undefined_vars(stmt, [])}
-    assert "tail" not in free
-    assert "bx" in free
-    assert "T.min" in str(stmt)
-    
-    original_plan = build_plan(_outer_parallel_nests(main)[0])
-    p1_plan = build_plan(stmt)
-    assert render_plan(original_plan) == render_plan(p1_plan)
-    # 已知差异：尾块表达式被内联成 T.min(...)，所以只比对 plan 形状。
-    assert not tvm.ir.structural_equal(emit_plan(original_plan), emit_plan(p1_plan), map_free_vars=True)
-
-
-def test_p1_multi_nest_single_vf():
-    n = 64
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            c_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i in T.Parallel(n):
-                    c_ub[i] = a_ub[i] + 1.0
-                for i in T.Parallel(n):
-                    a_ub[i] = c_ub[i] + 2.0
-            T.copy(c_ub, C)
-
-    items = _p1_inputs(main)
-    assert [(item["vf_index"], item["nest_index"]) for item in items] == [(0, 0), (0, 1)]
-    assert [item["status"] for item in items] == ["LIFTED", "LIFTED"]
-    assert _stored_buffers(items[0]["stmt"]) == ["c_ub"]
-    assert _stored_buffers(items[1]["stmt"]) == ["a_ub"]
-
-
-def test_p1_inner_bind_is_opaque():
-    m, n = 8, 64
-
-    @T.prim_func
-    def main(A: T.Tensor((m * n,), "float32"), C: T.Tensor((m * n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((m * n,), "float32")
-            c_ub = T.alloc_shared((m * n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i, j in T.Parallel(m, n):
-                    t = i * n + j
-                    c_ub[t] = a_ub[t] + 1.0
-            T.copy(c_ub, C)
-
-    _assert_no_stmt_rejected(main, {"OPAQUE", "FALLBACK"}, "tirx.Bind")
-
-
-@pytest.mark.parametrize(
-    "factory, allowed, reason",
-    [
-        (_p1_kernel_local_var, {"OPAQUE"}, "local.var"),
-        (_p1_kernel_opaque_evaluate, {"OPAQUE", "FALLBACK"}, "opaque"),
-    ],
-    ids=["local_var", "opaque_evaluate"],
-)
-def test_p1_opaque_statement_keeps_its_status(factory, allowed, reason):
-    _assert_no_stmt_rejected(factory(), allowed, reason)
 
 
 def test_p1_reduction_falls_back():
@@ -4785,115 +4410,56 @@ def test_p1_reduction_falls_back():
                     c_ub[i] += a_ub[i, j]
             T.copy(c_ub, C)
 
-    _assert_no_stmt_rejected(main, {"FALLBACK"}, "ILLEGAL")
-
-
-def test_p1_illegal_memory_falls_back():
-    n = 256
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i in T.Parallel(n - 32):
-                    a_ub[i] = a_ub[i + 32]
-
-    items = _p1_inputs(main)
-    assert len(items) == 1
-    assert items[0]["status"] == "FALLBACK"
-    assert "memory legality is ILLEGAL" in items[0]["reason"]
-    assert "stmt" not in items[0]
-
-
-def test_p1_mixed_legality_marks_whole_vf():
-    """PR-A：按 VF 聚合，一个非法 nest 会拖垮同 VF 的合法兄弟。"""
-    n = 256
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            c_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i in T.Parallel(n - 32):
-                    c_ub[i] = a_ub[i] + 1.0
-                for i in T.Parallel(n - 32):
-                    a_ub[i] = a_ub[i + 32]
-            T.copy(c_ub, C)
-
-    items = _p1_inputs(main)
-    assert len(items) == 2
-    assert [item["status"] for item in items] == ["FALLBACK", "FALLBACK"]
-    assert all("stmt" not in item for item in items)
-
-
-def test_p1_no_vf_returns_empty():
-    @T.prim_func
-    def main(A: T.Tensor((16,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((16,), "float32")
-            T.copy(A, a_ub)
-
-    assert _p1_inputs(main) == []
+    _assert_p1_rejected(main, "OPAQUE", "memory legality is ILLEGAL")
 
 
 # ---------------------------------------------------------------------------
-# 三段 pass：carrier 交接、幂等、被拒 nest 不变
+# 三段 pass：annotation 交接、幂等、被拒 nest 不变
 # ---------------------------------------------------------------------------
 
 
-def test_combined_pass_matches_offline_driver():
-    """组合 pass 的输出就是离线 driver（``vectorize_parallel_nests``）的输出。"""
-    func = _p1_kernel_1d()
-    after = _run_combined(func)
-
-    assert not tvm.ir.structural_equal(after.body, func.body, map_free_vars=True)
-    tvm.ir.assert_structural_equal(after.body, vectorize_parallel_nests(func.body), map_free_vars=True)
-    assert _count_parallel_nests(after.body) == 0, "the T.Parallel nest survived the pass"
-    ops = _emitted_ops(after.body)
-    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
-    assert any(name in ("tl.simd.vadd", "tl.simd.vadds") for name in ops)
-
-
-def test_staged_passes_exchange_carriers():
+def test_staged_passes_exchange_annotations():
     func = _p1_kernel_1d()
 
-    lifted = _run_stage(func, at.AscendLiftParallelToArray)
-    assert len(_carriers(lifted.body, "tl.vsimd.array_region")) == 1
+    lifted = _run_lift(func)
+    programs = _programs(lifted.body)
+    assert len(programs) == 1
+    assert programs[0]["items"][0]["status"] == "LIFTED"
     assert _count_parallel_nests(lifted.body) == 1, "P1 must not rewrite the nest"
     assert _emitted_ops(lifted.body) == []
 
-    planned = _run_stage(lifted, at.AscendPlanArray)
-    assert _carriers(planned.body, "tl.vsimd.array_region") == []
-    plans = _carriers(planned.body, "tl.vsimd.array_plan")
+    planned = _run_plan(lifted)
+    assert programs == _programs(planned.body), "P2 must keep the P1 annotation"
+    plans = _group_plans(planned.body)
     assert len(plans) == 1
-    assert len(plans[0].node.segments) == 1
+    group = plans[0].groups[0]
+    assert group.status == "PLANNED" and len(group.items) == 1
+    assert len(group.items[0].region_plan.segments) == 1
     assert _count_parallel_nests(planned.body) == 1
-    # P2 从 P1 region 规划，与直接规划交接 stmt 的 plan 逐字段一致。
-    assert render_plan(plans[0].node) == render_plan(build_plan(_lifted(func)["stmt"]))
+    # P2 的 plan 与直接规划交接 stmt 的 plan 逐字段一致。
+    assert render_plan(group.items[0].region_plan) == render_plan(
+        build_plan(_outer_parallel_nests(func)[0])
+    )
 
-    emitted = _run_stage(planned, at.AscendLowerArrayPlan)
-    assert _carriers(emitted.body, "tl.vsimd.array_plan") == []
+    emitted = _run_new_path(func)
+    assert _group_plans(emitted.body) == []
     assert _count_parallel_nests(emitted.body) == 0
     assert "tl.simd.vsts" in _emitted_ops(emitted.body)
-    tvm.ir.assert_structural_equal(emitted.body, _run_combined(func).body, map_free_vars=True)
+    tvm.ir.assert_structural_equal(emitted.body, _run_new_path(func).body, map_free_vars=True)
 
 
 def test_passes_are_idempotent():
-    once = _run_stage(_p1_kernel_1d(), at.AscendLiftParallelToArray)
-    twice = _run_stage(once, at.AscendLiftParallelToArray)
-    assert len(_carriers(twice.body, "tl.vsimd.array_region")) == 1
+    once = _run_lift(_p1_kernel_1d())
+    twice = _run_lift(once)
+    assert len(_programs(twice.body)) == 1
 
-    combined = _run_combined(_p1_kernel_1d())
-    again = _run_combined(combined)
+    combined = _run_new_path(_p1_kernel_1d())
+    again = _run_new_path(combined)
     tvm.ir.assert_structural_equal(again.body, combined.body, map_free_vars=True)
 
 
 def test_rejected_nests_fall_through_every_stage():
-    # P1 拒绝（非法内存）⇒ 无载体、IR 逐字节不变；组合 pass 也不动它。
+    # P1 拒绝（非法内存）⇒ 记录为 OPAQUE（不可 lift），IR 逐字节不变；新链路也不动它。
     n = 256
 
     @T.prim_func
@@ -4906,14 +4472,18 @@ def test_rejected_nests_fall_through_every_stage():
                     a_ub[i] = a_ub[i + 32]
 
     illegal = main
-    lifted = _run_stage(illegal, at.AscendLiftParallelToArray)
-    assert _carriers(lifted.body, "tl.vsimd.array_region") == []
-    tvm.ir.assert_structural_equal(lifted.body, illegal.body, map_free_vars=True)
-    tvm.ir.assert_structural_equal(_run_combined(illegal).body, illegal.body, map_free_vars=True)
+    lifted = _run_lift(illegal)
+    # P1 still records the nest, but as an OPAQUE item (memory legality is
+    # ILLEGAL): nothing is liftable, so the body is byte-identical.
+    programs = _programs(lifted.body)
+    assert all(item["status"] != "LIFTED" for program in programs for item in program["items"])
+    # P2 writes no group (nothing is P1_LIFTABLE) and P3 restores the original body.
+    assert all(not plan.groups for plan in _group_plans(_run_plan(lifted).body))
+    tvm.ir.assert_structural_equal(_run_new_path(illegal).body, illegal.body, map_free_vars=True)
 
 
 # ---------------------------------------------------------------------------
-# 流水线接入：无条件运行
+# 流水线接入：P1/P2/P3 同一开关
 # ---------------------------------------------------------------------------
 
 
@@ -4921,23 +4491,23 @@ def test_rejected_nests_fall_through_every_stage():
 def pass_calls(monkeypatch) -> list:
     """Record how often the pipeline constructs the pass."""
     calls: list = []
-    real = at.AscendPolyhedralVectorize
+    real = at.AscendVectorizeVSimd
 
     def spy():
         calls.append(True)
         return real()
 
-    monkeypatch.setattr(at, "AscendPolyhedralVectorize", spy)
+    monkeypatch.setattr(at, "AscendVectorizeVSimd", spy)
     return calls
 
 
-def test_pipeline_vectorizes_by_default(pass_calls):
-    source = _lower_source(_p1_kernel_1d())
+def test_disabling_the_lift_skips_the_whole_chain(pass_calls):
+    _lower_source(
+        _p1_kernel_1d(),
+        config={tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT: False},
+    )
 
-    assert pass_calls == [True], "AscendPolyhedralVectorize must run unconditionally"
-    assert "simd_inst::" in source
-    # a_ub[i] + 1.0 → 标量-向量配方（P3 的发射形态，旧 emitter 是 vdup + vadd）。
-    assert "vadds" in source
+    assert pass_calls == [], "P2/P3 must not run without the P1 annotation"
 
 
 if __name__ == "__main__":

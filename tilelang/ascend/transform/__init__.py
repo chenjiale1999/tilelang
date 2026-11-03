@@ -62,16 +62,6 @@ def AscendLiftVSimd():
     return _ffi_api.AscendLiftVSimd()  # type: ignore
 
 
-def AscendBuildP2PlanInputs(func):
-    """Return per-nest P1->P2 inputs (status + optional parallel Stmt).
-
-    Each item is a dict with ``vf_index``/``nest_index``/``status``/``reason``
-    and, when ``status == "LIFTED"``, ``stmt``: the P1 reference expansion
-    rewritten as a ``For(kParallel)`` chain, ready for ``build_plan``.
-    """
-    return _ffi_api.AscendBuildP2PlanInputs(func)  # type: ignore
-
-
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -195,32 +185,13 @@ def NormalizeAscendFractalStorage():
     return _ffi_api.NormalizeAscendFractalStorage()  # type: ignore
 
 
-def AscendLiftParallelToArray():
-    """P1 pass: mark every nest P1 lifts with its typed region carrier.
-
-    The analysis is the existing read-only P1 lift (memory legality, capture
-    closure, region + expander self-check). A lifted nest is wrapped in
-    ``AttrStmt("tl.vsimd.array_region")``; the nest itself is unchanged and a
-    nest P1 rejects is left exactly as it was.
-    """
-    return _ffi_api.AscendLiftParallelToArray()  # type: ignore
-
-
-def AscendPlanArray():
-    """P2 pass: plan every P1 region carrier.
-
-    Consumes ``tl.vsimd.array_region`` markers and rewrites them to
-    ``AttrStmt("tl.vsimd.array_plan")`` carrying the ``VectorProgram``. A nest
-    the planner rejects is unwrapped untouched (P3 restores it verbatim).
-    """
-    return _ffi_api.AscendPlanArray()  # type: ignore
-
-
 def AscendPlanVSimd():
     """P2 pass: plan ``P1_LIFTABLE`` groups into ``tl.vsimd.group_plan``.
 
     The body is unchanged. A group is planned atomically; any unsupported item
     marks the whole group ``REJECTED`` so P3 leaves it to the legacy lowering.
+    COPY/REDUCE items are planned as synthesized Parallel/reduction nests, and
+    the VF-level fragment register file is decided here as well.
     """
     return _ffi_api.AscendPlanVSimd()  # type: ignore
 
@@ -233,31 +204,6 @@ def AscendEmitVSimd():
 def AscendVectorizeVSimd():
     """P2 + P3: plan and emit the new ``tl.vsimd.program`` path."""
     return _ffi_api.AscendVectorizeVSimd()  # type: ignore
-
-
-def AscendPlanFragmentRegisters():
-    """P2.5 pass: VF-level fragment register planning.
-
-    Checks escape (V1), budget (V2), cross-nest consistency (V3) and lifecycle
-    (V4) for every ``SIMD_VF`` block. On success the block carries
-    ``tl.vsimd.fragment_regs``; on failure every plan carrier of that block is
-    dropped so all its nests fall back to scalar loops atomically.
-    """
-    return _ffi_api.AscendPlanFragmentRegisters()  # type: ignore
-
-
-def AscendLowerArrayPlan():
-    """P3 pass: emit every plan carrier as ``tl.simd.*`` TIR."""
-    return _ffi_api.AscendLowerArrayPlan()  # type: ignore
-
-
-def AscendPolyhedralVectorize():
-    """Replace vectorizable ``T.Parallel`` nests with ``T.simd.*`` (P1 -> P2 -> P3).
-
-    This pass is the pipeline's only ``T.Parallel`` lowering. A nest whose plan
-    is rejected is left untouched (it stays a serial loop; nothing lowers it).
-    """
-    return _ffi_api.AscendPolyhedralVectorize()  # type: ignore
 
 
 def AscendSimdVFLowerParallel():
@@ -366,15 +312,9 @@ __all__ = [
     "AscendAnalyzeVSimdRegion",
     "AscendAnalyzeVSimdRegionReport",
     "AscendLiftVSimd",
-    "AscendBuildP2PlanInputs",
-    "AscendLiftParallelToArray",
-    "AscendPlanArray",
     "AscendPlanVSimd",
     "AscendEmitVSimd",
     "AscendVectorizeVSimd",
-    "AscendPlanFragmentRegisters",
-    "AscendLowerArrayPlan",
-    "AscendPolyhedralVectorize",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",

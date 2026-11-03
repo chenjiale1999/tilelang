@@ -1,12 +1,34 @@
 /*!
- * \file render.cc
- * \brief Human-readable plan rendering.
+ * \file analyze_polyhedral.cc
+ * \brief Offline analysis/planning FFI for the polyhedral P2/P3 implementation.
+ *
+ * These entry points are the test-facing counterpart of the pipeline passes
+ * (``AscendPlanVSimd`` / ``AscendEmitVSimd``): they plan and emit a raw
+ * ``T.Parallel`` nest without P1 annotations, and expose the plan text and the
+ * Δ-classification helpers used by the offline test suite.
+ *
+ * Every entry point converts :class:`polyhedral::Unsupported` into the
+ * ``Map{"ok": false, "message": ..., "diagnostics": [...]}`` shape so the Python
+ * wrapper can re-raise the *identical* ``Unsupported`` (message + diagnostics
+ * ordering are part of the contract, D3).
  */
-#include "render.h"
+#include <tvm/ffi/any.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/map.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/ffi/string.h>
+#include <tvm/ir/transform.h>
+#include <tvm/tirx/function.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "access.h"
+#include "emit.h"
+#include "model.h"
+#include "plan.h"
 #include "primitives.h"
 
 namespace tvm {
@@ -14,6 +36,71 @@ namespace tl {
 namespace polyhedral {
 
 namespace {
+
+ffi::Map<ffi::String, ffi::Any> MakeError(const Unsupported& error) {
+  ffi::Map<ffi::String, ffi::Any> result;
+  result.Set("ok", ffi::Any(false));
+  result.Set("message", ffi::Any(ffi::String(error.message())));
+  ffi::Array<ffi::String> diagnostics;
+  for (const std::string& note : error.diagnostics()) {
+    diagnostics.push_back(note);
+  }
+  result.Set("diagnostics", ffi::Any(diagnostics));
+  return result;
+}
+
+/*! \brief Run ``body`` and bridge ``Unsupported`` into the Map protocol. */
+template <typename Fn>
+ffi::Map<ffi::String, ffi::Any> Guarded(Fn body) {
+  try {
+    return body();
+  } catch (const Unsupported& error) {
+    return MakeError(error);
+  }
+}
+
+/*! \brief ``{ok: true, key: value}`` — the success shape of every entry point. */
+ffi::Map<ffi::String, ffi::Any> MakeOk(ffi::String key, ffi::Any value) {
+  ffi::Map<ffi::String, ffi::Any> result;
+  result.Set("ok", ffi::Any(true));
+  result.Set(key, std::move(value));
+  return result;
+}
+
+/*! \brief ``AxisClass`` -> ``[kind, stride?]`` (the shape Python reads). */
+ffi::Array<ffi::Any> AxisClassToArray(const AxisClass& classified) {
+  ffi::Array<ffi::Any> out;
+  out.push_back(ffi::Any(ffi::String(AccessClassName(classified.kind))));
+  out.push_back(classified.stride.has_value() ? ffi::Any(*classified.stride)
+                                              : ffi::Any());
+  return out;
+}
+
+/*! \brief FFI optional lanes -> ``std::optional<int64_t>`` (empty = derive). */
+std::optional<int64_t> OptionalLanes(const ffi::Optional<int64_t>& lanes) {
+  return lanes.has_value() ? std::optional<int64_t>(*lanes) : std::nullopt;
+}
+
+/*! \brief FFI plan inputs -> ``PlanOptions`` (empty optional = derive). */
+PlanOptions MakePlanOptions(const ffi::Optional<ffi::Map<tirx::Buffer, Layout>>& layouts,
+                            const ffi::Optional<ffi::Array<tirx::Buffer>>& vf_alloc_scope) {
+  PlanOptions options;
+  if (layouts.has_value()) {
+    for (const auto& entry : *layouts) {
+      options.layouts.emplace_back(entry.first, entry.second);
+    }
+  }
+  if (vf_alloc_scope.has_value()) {
+    for (const tirx::Buffer& buffer : *vf_alloc_scope) {
+      options.vf_alloc_scope.push_back(buffer);
+    }
+  }
+  return options;
+}
+
+/* ------------------------------------------------------------------------- */
+/* plan rendering (test oracle)                                              */
+/* ------------------------------------------------------------------------- */
 
 std::string OptionalIntText(const ffi::Optional<int64_t>& value) {
   return value.has_value() ? std::to_string(*value) : "None";
@@ -108,9 +195,7 @@ std::vector<std::string> RenderSinglePlan(const VectorPlan& plan,
   return lines;
 }
 
-}  // namespace
-
-std::string RenderPlan(const ffi::ObjectRef& plan) {
+std::string RenderPlanText(const ffi::ObjectRef& plan) {
   if (const auto* single = plan.as<VectorPlanNode>()) {
     std::vector<std::string> lines = RenderSinglePlan(ffi::GetRef<VectorPlan>(single), {});
     std::string out;
@@ -151,6 +236,60 @@ std::string RenderPlan(const ffi::ObjectRef& plan) {
   std::string out;
   for (size_t i = 0; i < lines.size(); ++i) out += (i == 0 ? "" : "\n") + lines[i];
   return out;
+}
+
+}  // namespace
+
+ffi::Array<ffi::Any> AscendPolyhedralAxisClass(const AccessInfo& info, const Axis& axis) {
+  return AxisClassToArray(AxisClassOf(info, axis));
+}
+
+ffi::Map<ffi::String, ffi::Any> AscendPolyhedralBuildPlan(
+    const tirx::Stmt& stmt, ffi::Optional<int64_t> lanes,
+    ffi::Optional<ffi::Map<tirx::Buffer, Layout>> layouts,
+    ffi::Optional<ffi::Array<tirx::Buffer>> vf_alloc_scope) {
+  return Guarded([&]() {
+    VectorProgram program =
+        BuildPlan(stmt, OptionalLanes(lanes), MakePlanOptions(layouts, vf_alloc_scope));
+    return MakeOk("program", ffi::Any(program));
+  });
+}
+
+ffi::Map<ffi::String, ffi::Any> AscendPolyhedralEmitPlan(const ffi::ObjectRef& plan) {
+  return Guarded([&]() { return MakeOk("stmt", ffi::Any(EmitPlan(plan))); });
+}
+
+ffi::Map<ffi::String, ffi::Any> AscendPolyhedralRenderPlan(const ffi::ObjectRef& plan) {
+  return Guarded(
+      [&]() { return MakeOk("text", ffi::Any(ffi::String(RenderPlanText(plan)))); });
+}
+
+PrimExpr AscendPolyhedralFiniteDifference(const PrimExpr& offset, const tirx::Var& var,
+                                          bool use_analyzer) {
+  arith::Analyzer analyzer;
+  return FiniteDifference(offset, var, use_analyzer ? &analyzer : nullptr);
+}
+
+ffi::Array<ffi::Any> AscendPolyhedralClassifyDelta(const PrimExpr& delta,
+                                                   bool use_analyzer) {
+  arith::Analyzer analyzer;
+  return AxisClassToArray(ClassifyDelta(delta, use_analyzer ? &analyzer : nullptr));
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralAxisClass",
+                        AscendPolyhedralAxisClass);
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralBuildPlan",
+                        AscendPolyhedralBuildPlan);
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralEmitPlan",
+                     AscendPolyhedralEmitPlan);
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralRenderPlan",
+                        AscendPolyhedralRenderPlan);
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralFiniteDifference",
+                        AscendPolyhedralFiniteDifference);
+  refl::GlobalDef().def("tl.transform.AscendPolyhedralClassifyDelta",
+                        AscendPolyhedralClassifyDelta);
 }
 
 }  // namespace polyhedral

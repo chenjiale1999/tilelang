@@ -74,10 +74,11 @@ class PassConfigKey(str, Enum):
     """Disable warp specialization optimization. Default: False"""
 
     TL_ASCEND_SIMD_LIFT = "tl.ascend_simd_lift"
-    """Enable the P1 VSimdProgram metadata pass on Ascend. Default: True."""
+    """Enable the P1 VSimdProgram metadata pass on Ascend. Default: True.
 
-    TL_ASCEND_VSIMD_VECTORIZE = "tl.ascend_vsimd_vectorize"
-    """Enable the new P1 annotation -> P2/P3 vectorization path. Default: False."""
+    Turning it off also disables the P2/P3 group pass (there is no program to
+    plan) and leaves every ``T.Parallel`` nest to the legacy lowering.
+    """
 
     TL_ENABLE_AUTO_SCHEDULE = "tl.enable_auto_schedule"
     """Enable Ascend auto scheduling optimization. Default: True."""

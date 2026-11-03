@@ -20,8 +20,6 @@
 namespace tvm {
 namespace tl {
 
-struct VSimdRegion;
-
 /*! \brief One VSimdProgram item as consumed by P2/P3. */
 struct VSimdProgramItem {
   int index{-1};
@@ -94,16 +92,6 @@ TVM_DLL bool ReadVSimdProgram(
 /*! \brief Verify invariants of a parsed program. */
 TVM_DLL bool VerifyVSimdProgram(const VSimdProgram &program,
                                 std::string *error);
-
-/*!
- * \brief Decode one REGION item's ``region`` payload into the existing
- *        hardware-independent ``VSimdRegion`` struct.
- *
- * The returned region has vf_index/nest_index filled from the program/item.
- */
-TVM_DLL bool ReadVSimdRegion(const ffi::Map<ffi::String, ffi::Any> &item_map,
-                             int vf_index, VSimdRegion *out,
-                             std::string *error);
 
 } // namespace tl
 } // namespace tvm
