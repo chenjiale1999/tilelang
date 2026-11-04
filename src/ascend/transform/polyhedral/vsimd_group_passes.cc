@@ -446,9 +446,8 @@ bool PlanReduceItem(const VSimdProgram &program, const VSimdProgramItem &item,
     return false;
   }
   if (!IsUbScope(payload.src_scope) || !IsUbScope(payload.dst_scope)) {
-    failure->reason = "reduce operands must both be UB ('" +
-                      payload.src->name.operator std::string() + "' / '" +
-                      payload.dst->name.operator std::string() + "')";
+    failure->reason = "reduce operands must both be UB (scope '" +
+                      payload.src_scope + "' / '" + payload.dst_scope + "')"; 
     return false;
   }
   if (payload.src_extents.empty() || payload.dst_extents.empty()) {
@@ -564,7 +563,15 @@ VSimdGroupPlan PlanOneGroup(
     } else {
       failure.reason = "unexpected " + item.kind + " item in a P1_LIFTABLE group";
     }
-    if (!ok) break;
+    if (!ok) {
+      // Name the failing item: a REJECTED group publishes no item plans, so
+      // the reason itself must point at the loop / copy / reduce that blocked
+      // the group.
+      if (!failure.reason.empty()) {
+        failure.reason = "item " + std::to_string(index) + ": " + failure.reason;
+      }
+      break;
+    }
     items.push_back(std::move(plan));
   }
 
