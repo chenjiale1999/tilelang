@@ -14,6 +14,7 @@
 #ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_BODY_H_
 #define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_BODY_H_
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/any.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/string.h>
@@ -22,6 +23,7 @@
 #include <tvm/tirx/stmt.h>
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -83,6 +85,19 @@ std::vector<StoreSpec> NormalizeBody(const tirx::Stmt& stmt, const AliasMap& ali
 /*! \brief Normalize with an inherited predicate (recursion entry point). */
 void NormalizeBodyInto(const tirx::Stmt& stmt, const AliasMap& aliases,
                        std::vector<StoreSpec>* out, ffi::Optional<PrimExpr> mask);
+
+/*!
+ * \brief Expand tile-op calls inside a ``T.Parallel`` body into explicit loops.
+ *
+ * ``T.copy`` becomes an elementwise copy nest and ``T.reduce_*`` becomes a
+ * reduction nest (the reduced dimension stays serial, the destination-mapped
+ * dimensions stay parallel); ``clear=true`` prepends an identity-init nest.
+ * The second element of the result is ``true`` only when at least one call was
+ * expanded. Unsupported shapes throw :class:`Unsupported` instead of leaving
+ * the call in place (which P3 would otherwise drop together with its span).
+ */
+std::pair<tirx::Stmt, bool> ExpandParallelTileOps(const tirx::Stmt& stmt,
+                                                  arith::Analyzer* analyzer);
 
 }  // namespace polyhedral
 }  // namespace tl

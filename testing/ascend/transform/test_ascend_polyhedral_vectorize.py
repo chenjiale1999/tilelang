@@ -176,6 +176,29 @@ def _for_kinds(stmt) -> list:
     return kinds
 
 
+def _simd_masks(stmt, op_name: str) -> list:
+    """The mask argument (3rd operand) of every ``op_name`` call, as text."""
+    masks: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.Call) and str(getattr(node.op, "name", "")) == op_name:
+            masks.append(str(node.args[2]))
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return masks
+
+
+def _loop_var_names(stmt) -> list:
+    names: list = []
+
+    def visit(node):
+        if isinstance(node, tirx.For):
+            names.append(node.loop_var.name)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return names
+
+
 def _plan(func, layouts=None):
     return build_plan(_first_parallel(func), layouts=layouts)
 
@@ -4508,6 +4531,270 @@ def test_disabling_the_lift_skips_the_whole_chain(pass_calls):
     )
 
     assert pass_calls == [], "P2/P3 must not run without the P1 annotation"
+
+
+# ---------------------------------------------------------------------------
+# T.Parallel 体内 tile-op（copy/reduce）：P2 展开 + 分段规划
+# ---------------------------------------------------------------------------
+
+
+def _body_plan(func):
+    # return build_plan(_first_parallel(func))
+    print(f"\n\nfunc:\n{func}")
+    print(f"\n\nfirst_parallel:\n{_first_parallel(func)}")
+    program =  build_plan(_first_parallel(func))
+    print(f"plan:\n{program}")
+    return program
+
+
+def test_parallel_body_copy_is_planned():
+    M, N = 8, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((M, N), "float32"), C: T.Tensor((M, N), "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared((M, N), "float32")
+            c = T.alloc_shared((M, N), "float32")
+            T.copy(A, b)
+            for i in T.Parallel(M):
+                T.copy(b[i, :], c[i, :])
+            T.copy(c, C)
+
+    program = _body_plan(k)
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    # The extent-1 slice dimension is folded away, so the innermost tile
+    # dimension is a full-lane axis and the copy needs no masked gather.
+    assert segment.vector_axis.name == "tile_cp_i1"
+    assert segment.chunks == 1 and segment.tail == 0
+    assert [axis.name for axis in segment.axes] == ["i", "tile_cp_i1"]
+    print(f"emited:\n{emit_plan(program)}")
+    ops = _emitted_ops(emit_plan(program))
+    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
+    assert "tl.simd.vgather2" not in ops
+
+
+def test_parallel_body_reduce_clear_false_is_planned():
+    M, J, K = 8, 8, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((M, J, K), "float32"), C: T.Tensor((M, K), "float32")):
+        with T.Kernel(1):
+            s = T.alloc_shared((M, J, K), "float32")
+            m = T.alloc_shared((M, K), "float32")
+            T.copy(A, s)
+            for i in T.Parallel(M):
+                T.reduce_sum(s[i, :, :], m[i, :], dim=1, clear=False)
+            T.copy(m, C)
+
+    program = _body_plan(k)
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    # The reduced dimension is the innermost serial loop, so the destination
+    # read-modify-write is promoted into a register accumulator.
+    assert segment.vector_axis.name == "tile_rd_i2"
+    assert segment.stores[0].promote is not None
+    assert segment.axes[-1].name == "tile_rd_i1" and not segment.axes[-1].is_parallel
+    print(f"emited:\n{emit_plan(program)}")
+    emitted = emit_plan(program)
+    ops = _emitted_ops(emitted)
+    assert "tl.simd.vld" in ops and "tl.simd.vsts" in ops
+    assert any(op in ops for op in ("tl.simd.vcadd", "tl.simd.vadd"))
+    # One shared write per output vector instead of one per reduction step.
+    assert ops.count("tl.simd.vsts") == 1
+    assert "tl.simd.vgather2" not in ops
+    # The accumulator is declared inside the per-iteration loop, so iterations
+    # never share one register slot (no false WAW/WAR chain across them).
+    text = str(emitted)
+    assert text.index("accs0_0 = T.alloc_buffer") > text.index("for i in range(8):")
+
+
+def test_parallel_body_reduce_clear_true_emits_identity_init():
+    M, J, K = 8, 8, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((M, J, K), "float32"), C: T.Tensor((M, K), "float32")):
+        with T.Kernel(1):
+            s = T.alloc_shared((M, J, K), "float32")
+            m = T.alloc_shared((M, K), "float32")
+            T.copy(A, s)
+            for i in T.Parallel(M):
+                T.reduce_max(s[i, :, :], m[i, :], dim=1, clear=True)
+            T.copy(m, C)
+
+    program = _body_plan(k)
+    # The identity initializer stays in the reduction segment as a pre store, so
+    # it never needs a shared-memory write of its own.
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    assert len(segment.pre_stores) == 1
+    assert segment.pre_stores[0].value.is_uniform
+    assert segment.stores[0].promote is not None
+    emitted = emit_plan(program)
+    print(f"emited:\n{emitted}")
+    ops = _emitted_ops(emitted)
+    assert "tl.simd.vdup" in ops
+    # Only the reduction result is written back; the init is a register value.
+    assert ops.count("tl.simd.vsts") == 1
+    assert "tl.simd.vgather2" not in ops
+    # Per-iteration accumulator slot (see the clear=false case).
+    text = str(emitted)
+    assert text.index("accs0_0 = T.alloc_buffer") > text.index("for i in range(8):")
+
+
+def test_parallel_body_mixed_store_copy_reduce_is_planned():
+    M, N, J, K = 8, 32, 8, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), B: T.Tensor((M, N), "float32"),
+          S: T.Tensor((M, J, K), "float32"), C: T.Tensor((M, N), "float32"),
+          D: T.Tensor((M,), "float32"), E: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            b = T.alloc_shared((M, N), "float32")
+            c = T.alloc_shared((M, N), "float32")
+            s = T.alloc_shared((M, J, K), "float32")
+            m = T.alloc_shared((M, K), "float32")
+            d = T.alloc_shared((M,), "float32")
+            e = T.alloc_shared((M,), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.copy(S, s)
+            for i in T.Parallel(M):
+                d[i] = a[i] + 1.0
+                T.copy(b[i, :], c[i, :])
+                T.reduce_max(s[i, :, :], m[i, :], dim=1, clear=False)
+                e[i] = m[i, 0] * 2.0
+            T.copy(d, D)
+            T.copy(c, C)
+            T.copy(e, E)
+
+    program = _body_plan(k)
+    assert len(program.segments) == 4
+    assert [seg.stores[0].spec.buffer.name for seg in program.segments] == [
+        "d", "c", "m", "e"
+    ]
+    # The copy segment is flattened into full-lane chunks (no gather), while the
+    # reduce segment keeps its serial reduction axis next to the accumulator.
+    copy_segment = program.segments[1]
+    assert copy_segment.tail == 0 and copy_segment.chunks == 4
+    reduce_segment = program.segments[2]
+    assert reduce_segment.stores[0].promote is not None
+    print(f"emited:\n{emit_plan(program)}")
+    emitted = emit_plan(program)
+    ops = _emitted_ops(emitted)
+    assert "tl.simd.vadds" in ops and "tl.simd.vmuls" in ops
+    assert any(op in ops for op in ("tl.simd.vmax", "tl.simd.vcmax"))
+    # Two gathers are legitimate: 'd' needs one because its 8-element domain is
+    # narrower than a register, and 'e' reads a stride-64 column of 'm'.
+    assert ops.count("tl.simd.vgather2") == 2
+    # The program hoists no axis (two segments use 'i' as their lane axis), so
+    # the reduction segment must emit its own serial loop over the outer axis.
+    loops = _loop_var_names(emitted)
+    assert "i" in loops
+    assert loops.count("tile_rd_i1") == 1
+    # No free iteration variable may survive into the emitted body.
+    assert "i = T.int32()" not in str(emitted)
+    # The static tail predicate is shared by every segment that needs it.
+    assert str(emitted).count("update_mask(8, 32)") == 1
+    # Element-wise ops on a tail chunk run under the tail predicate, not the
+    # full mask: inactive gather lanes never enter the datapath.
+    assert set(_simd_masks(emitted, "tl.simd.vadds")) == {"tail8_32"}
+    assert set(_simd_masks(emitted, "tl.simd.vmuls")) == {"tail8_32"}
+    # The reduction accumulator is declared inside the per-iteration loop, so
+    # the eight iterations do not share one register slot.
+    text = str(emitted)
+    assert text.index("accs2_0 = T.alloc_buffer") > text.index("for i in range(8):")
+
+
+def test_parallel_body_two_tileops_keep_source_order():
+    M, N = 8, 32
+
+    @T.prim_func
+    def k(B1: T.Tensor((M, N), "float32"), B2: T.Tensor((M, N), "float32"),
+          C1: T.Tensor((M, N), "float32"), C2: T.Tensor((M, N), "float32")):
+        with T.Kernel(1):
+            b1 = T.alloc_shared((M, N), "float32")
+            b2 = T.alloc_shared((M, N), "float32")
+            c1 = T.alloc_shared((M, N), "float32")
+            c2 = T.alloc_shared((M, N), "float32")
+            T.copy(B1, b1)
+            T.copy(B2, b2)
+            for i in T.Parallel(M):
+                T.copy(b1[i, :], c1[i, :])
+                T.copy(b2[i, :], c2[i, :])
+            T.copy(c1, C1)
+            T.copy(c2, C2)
+
+    program = _body_plan(k)
+    print(f"emited:\n{emit_plan(program)}")
+    # Two adjacent copies touch disjoint buffers over the same domain, so they
+    # share one segment; the chunk loop then interleaves both bodies (one loop,
+    # two independent load/store pairs) instead of running them back to back.
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    assert [store.spec.buffer.name for store in segment.stores] == ["c1", "c2"]
+    assert segment.tail == 0 and segment.chunks == 4
+    emitted = emit_plan(program)
+    assert _loop_var_names(emitted).count("chunk_s0") == 1
+    ops = _emitted_ops(emitted)
+    assert ops.count("tl.simd.vld") == 2 and ops.count("tl.simd.vsts") == 2
+    assert "tl.simd.vgather2" not in ops
+
+
+def test_parallel_body_unsupported_reduce_kind_rejected():
+    M, J, K = 8, 8, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((M, J, K), "float32"), C: T.Tensor((M, K), "float32")):
+        with T.Kernel(1):
+            s = T.alloc_shared((M, J, K), "float32")
+            m = T.alloc_shared((M, K), "float32")
+            T.copy(A, s)
+            for i in T.Parallel(M):
+                T.reduce_absmax(s[i, :, :], m[i, :], dim=1)
+            T.copy(m, C)
+
+    with pytest.raises(Unsupported, match="absmax"):
+        _body_plan(k)
+
+
+def test_parallel_body_copy_global_source_rejected():
+    M, N = 8, 32
+
+    @T.prim_func
+    def k(A: T.Tensor((M, N), "float32"), C: T.Tensor((M, N), "float32")):
+        with T.Kernel(1):
+            c = T.alloc_shared((M, N), "float32")
+            for i in T.Parallel(M):
+                T.copy(A[i, :], c[i, :])
+            T.copy(c, C)
+
+    with pytest.raises(Unsupported, match="not UB"):
+        _body_plan(k)
+
+
+def test_parallel_body_unplannable_store_rejects_the_program():
+    M, N = 8, 32
+
+    @T.prim_func
+    def k(A: T.Tensor((M,), "float32"), B: T.Tensor((M, N), "float32"),
+          C: T.Tensor((M, N), "float32"), D: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M,), "float32")
+            b = T.alloc_shared((M, N), "float32")
+            c = T.alloc_shared((M, N), "float32")
+            d = T.alloc_shared((M,), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            for i in T.Parallel(M):
+                T.copy(b[i, :], c[i, :])
+                d[i // 3] = a[i]
+            T.copy(c, C)
+            T.copy(d, D)
+
+    with pytest.raises(Unsupported, match="tile-op segment planning failed"):
+        _body_plan(k)
 
 
 if __name__ == "__main__":

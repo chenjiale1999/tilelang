@@ -396,6 +396,36 @@ std::optional<std::pair<std::vector<Axis>, Stmt>> AbsorbSerialChain(
   return std::make_pair(std::move(axes), current);
 }
 
+/*!
+ * \brief Absorb a consecutive loop chain of parallel and clean serial loops.
+ *
+ * Used by the expanded tile-op multi-segment path: a body statement may be a
+ * parallel copy/reduce nest whose reduced dimension is serial. A parallel axis
+ * needs no dependence proof; a serial axis keeps the :func:`SerialIsClean`
+ * requirement. Returns ``nullopt`` when the chain cannot be absorbed.
+ */
+std::optional<std::pair<std::vector<Axis>, Stmt>> AbsorbLoopChain(
+    const Stmt& stmt, arith::Analyzer* analyzer, int64_t base_index) {
+  const auto* loop_ptr = stmt.as<tirx::ForNode>();
+  if (loop_ptr == nullptr) return std::nullopt;
+  std::vector<Axis> axes;
+  Stmt current = stmt;
+  while (const auto* current_loop = current.as<tirx::ForNode>()) {
+    const ForKind kind = current_loop->kind;
+    if (kind != ForKind::kParallel && kind != ForKind::kSerial) return std::nullopt;
+    RequireZeroMin(ffi::GetRef<tirx::For>(current_loop), analyzer);
+    if (kind == ForKind::kSerial &&
+        !SerialIsClean(ffi::GetRef<tirx::For>(current_loop), analyzer).first) {
+      return std::nullopt;
+    }
+    axes.push_back(MakeAxis(current_loop->loop_var, current_loop->extent,
+                            base_index + static_cast<int64_t>(axes.size()), kind));
+    current = current_loop->body;
+  }
+  if (axes.empty()) return std::nullopt;
+  return std::make_pair(std::move(axes), current);
+}
+
 /* ------------------------------------------------------------------------- */
 /* scoring / diagnostics                                                     */
 /* ------------------------------------------------------------------------- */
@@ -599,32 +629,43 @@ struct FlattenResult {
 std::optional<FlattenResult> FlattenAxes(const std::vector<Axis>& axes,
                                          arith::Analyzer* analyzer) {
   if (axes.size() < 2) return std::nullopt;
+  // An extent-1 axis carries no lane information: mapping it to 0 keeps the
+  // synthesized axis free of ``range(1)`` padding, so e.g. a sliced tile-op
+  // dimension (``b[i, :]`` keeps a leading 1) does not block flattening.
+  std::vector<Axis> chain;
   std::vector<int64_t> extents;
+  std::map<const tirx::VarNode*, PrimExpr> trivial;
   for (const Axis& axis : axes) {
     std::optional<int64_t> extent = ConstInt(axis->extent, analyzer);
-    if (!extent.has_value() || *extent < 2 || (*extent & (*extent - 1)) != 0) {
-      return std::nullopt;
+    if (!extent.has_value() || *extent < 1) return std::nullopt;
+    if (*extent == 1) {
+      trivial[axis->var.get()] = IntImm32(0);
+      continue;
     }
+    if ((*extent & (*extent - 1)) != 0) return std::nullopt;
+    chain.push_back(axis);
     extents.push_back(*extent);
   }
+  if (chain.size() < 2) return std::nullopt;
   int64_t total = 1;
   for (int64_t extent : extents) total *= extent;
 
   std::string name = "k_";
-  for (size_t i = 0; i < axes.size(); ++i) {
-    name += (i == 0 ? "" : "_") + axes[i]->name.operator std::string();
+  for (size_t i = 0; i < chain.size(); ++i) {
+    name += (i == 0 ? "" : "_") + chain[i]->name.operator std::string();
   }
   tirx::Var var(name, DataType::Int(32));
 
   FlattenResult result;
   result.flat_axis = MakeAxis(var, IntImm32(total), 0, ForKind::kParallel);
   result.total = total;
+  result.mapping = std::move(trivial);
   int64_t suffix = 1;
-  int64_t count = static_cast<int64_t>(axes.size());
+  int64_t count = static_cast<int64_t>(chain.size());
   for (int64_t position = 0; position < count; ++position) {
     // Right-to-left decomposition; the outermost axis is NOT taken modulo, since
     // ``(k // suffix) % E`` would collapse to ``k % (prod E)`` and lose Delta==1.
-    const Axis& axis = axes[static_cast<size_t>(count - 1 - position)];
+    const Axis& axis = chain[static_cast<size_t>(count - 1 - position)];
     int64_t extent = extents[static_cast<size_t>(count - 1 - position)];
     PrimExpr mapping;
     if (position == 0) {
@@ -651,7 +692,18 @@ std::pair<std::optional<SegmentSpecs>, std::string> TryFlatten(
     const std::vector<Stmt>& post_stmts, int64_t lanes, arith::Analyzer* analyzer) {
   if (!pre_stmts.empty() || !post_stmts.empty()) return {std::nullopt, ""};
   if (axes.size() < 2) return {std::nullopt, ""};
-  std::optional<int64_t> innermost = ConstInt(axes.back()->extent, analyzer);
+  // The innermost *real* axis decides whether flattening is needed; a trailing
+  // extent-1 axis carries no lanes.
+  std::optional<int64_t> innermost;
+  int64_t real_axes = 0;
+  for (auto it = axes.rbegin(); it != axes.rend(); ++it) {
+    std::optional<int64_t> extent = ConstInt((*it)->extent, analyzer);
+    if (!extent.has_value()) return {std::nullopt, ""};
+    if (*extent == 1) continue;
+    if (!innermost.has_value()) innermost = extent;
+    ++real_axes;
+  }
+  if (real_axes < 2) return {std::nullopt, ""};
   if (!innermost.has_value() || *innermost >= lanes) return {std::nullopt, ""};
   std::optional<FlattenResult> flat = FlattenAxes(axes, analyzer);
   if (!flat.has_value()) {
@@ -2034,7 +2086,8 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
                                         const AliasMap& aliases, arith::Analyzer* analyzer,
                                         std::optional<int64_t> lanes, bool single,
                                         const std::vector<std::string>& base_notes,
-                                        const PlanOptions& options) {
+                                        const PlanOptions& options,
+                                        bool allow_flatten = true) {
   std::string flatten_word = single ? "nest" : "segment";
   SegmentSpecs specs = PrepareSegment(axes, serial_axis, pre_stmts, main_stmt, post_stmts,
                                       aliases, analyzer, lanes);
@@ -2045,7 +2098,11 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
       AxisDiagnostics(axes, all_infos, load_infos, analyzer, specs.lanes);
   diagnostics.insert(diagnostics.end(), axis_notes.begin(), axis_notes.end());
 
-  auto flattened = TryFlatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes, analyzer);
+  auto flattened = allow_flatten
+                       ? TryFlatten(axes, pre_stmts, main_stmt, post_stmts, specs.lanes,
+                                    analyzer)
+                       : std::pair<std::optional<SegmentSpecs>, std::string>{
+                             std::nullopt, std::string()};
   if (!flattened.second.empty()) diagnostics.push_back(flattened.second);
   if (flattened.first.has_value()) {
     const SegmentSpecs& flat_specs = *flattened.first;
@@ -2117,16 +2174,298 @@ std::pair<VectorPlan, bool> BuildSegment(const std::vector<Axis>& axes,
                                          const std::vector<Stmt>& post_stmts,
                                          const AliasMap& aliases, arith::Analyzer* analyzer,
                                          std::optional<int64_t> lanes,
-                                         const PlanOptions& options) {
+                                         const PlanOptions& options,
+                                         bool allow_flatten = true) {
   return PlanSegment(axes, std::optional<Axis>(serial_axis), pre_stmts, main_stmt, post_stmts,
-                     aliases, analyzer, lanes, /*single=*/false, {}, options);
+                     aliases, analyzer, lanes, /*single=*/false, {}, options, allow_flatten);
+}
+
+/*!
+ * \brief Multi-segment path for an expanded tile-op body.
+ *
+ * Every statement group of the parallel body becomes one segment: consecutive
+ * non-loop statements form a store segment (axes = outer parallel axes), each
+ * loop chain (parallel copy / serial reduction dim) forms a loop segment with
+ * ``outer + chain`` axes. Statements that are siblings of the single innermost
+ * serial loop stay in the same segment as pre/post, so e.g. a reduction's
+ * identity initializer is folded into the accumulator register instead of
+ * becoming a shared-memory write of its own.
+ */
+std::optional<VectorProgram> TryBuildSplitAllProgram(
+    const Stmt& stmt, arith::Analyzer* analyzer, std::optional<int64_t> lanes,
+    std::vector<std::string>* notes, const PlanOptions& options) {
+  auto absorbed = AbsorbParallelChain(stmt, analyzer);
+  const std::vector<Axis>& parallel_axes = absorbed.first;
+  Stmt current = absorbed.second;
+  const auto* seq = current.as<tirx::SeqStmtNode>();
+  if (parallel_axes.empty() || seq == nullptr) return std::nullopt;
+
+  struct SegmentSource {
+    std::vector<Axis> axes;
+    std::optional<Axis> serial_axis;
+    std::vector<Stmt> pre;
+    Stmt main;
+    std::vector<Stmt> post;
+  };
+  AliasMap aliases = CollectAliases(current);
+
+  // A single clean serial loop at the end of a loop chain with siblings before
+  // it: the siblings become the segment's pre stores. That is how a reduction's
+  // identity initializer stays in the same segment as the reduction and folds
+  // into the accumulator register instead of a shared-memory write.
+  auto split_trailing_serial = [&](SegmentSource* source) {
+    const auto* body_seq = source->main.as<tirx::SeqStmtNode>();
+    if (body_seq == nullptr) return;
+    std::vector<size_t> loop_positions;
+    for (size_t pos = 0; pos < body_seq->seq.size(); ++pos) {
+      if (body_seq->seq[pos].as<tirx::ForNode>() != nullptr) loop_positions.push_back(pos);
+    }
+    if (loop_positions.size() != 1) return;
+    const size_t pos = loop_positions[0];
+    tirx::For loop = Downcast<tirx::For>(body_seq->seq[pos]);
+    std::optional<int64_t> min = ConstInt(loop->min, analyzer);
+    auto clean = loop->kind == ForKind::kSerial && min.has_value() && *min == 0
+                     ? SerialIsClean(loop, analyzer)
+                     : std::pair<bool, std::string>{false, ""};
+    if (!clean.first) {
+      if (!clean.second.empty()) RecordSerialReason(notes, loop, clean.second);
+      return;
+    }
+    Axis axis = MakeAxis(loop->loop_var, loop->extent,
+                         static_cast<int64_t>(source->axes.size()), ForKind::kSerial);
+    source->axes.push_back(axis);
+    source->serial_axis = axis;
+    for (size_t i = 0; i < pos; ++i) source->pre.push_back(body_seq->seq[i]);
+    for (size_t i = pos + 1; i < body_seq->seq.size(); ++i)
+      source->post.push_back(body_seq->seq[i]);
+    source->main = loop->body;
+  };
+
+  auto build_loop_source = [&](const Stmt& child) -> SegmentSource {
+    auto chain = AbsorbLoopChain(child, analyzer,
+                                 static_cast<int64_t>(parallel_axes.size()));
+    if (!chain.has_value()) {
+      const auto* loop = child.as<tirx::ForNode>();
+      if (loop != nullptr && loop->kind == ForKind::kSerial) {
+        RecordSerialReason(notes, Downcast<tirx::For>(child),
+                           SerialIsClean(Downcast<tirx::For>(child), analyzer).second);
+      }
+      throw Unsupported(
+          "tile-op segment rejected: a child loop is not a clean parallel/serial chain",
+          *notes);
+    }
+    SegmentSource source;
+    source.axes = parallel_axes;
+    source.axes.insert(source.axes.end(), chain->first.begin(), chain->first.end());
+    for (const Axis& axis : chain->first) {
+      if (!axis->is_parallel) source.serial_axis = axis;
+    }
+    source.main = chain->second;
+    split_trailing_serial(&source);
+    return source;
+  };
+
+  // Identify the identity initializer pattern: every statement before the one
+  // loop chain is a uniform literal store to the same address as a store inside
+  // the chain. Such a body is one segment, so the initializer can be folded.
+  auto identity_init_of = [&](const Stmt& init, const Stmt& chain) -> bool {
+    const auto* store = init.as<tirx::BufferStoreNode>();
+    if (store == nullptr) return false;
+    if (store->value.as<FloatImmNode>() == nullptr &&
+        store->value.as<IntImmNode>() == nullptr) {
+      return false;
+    }
+    ffi::Array<PrimExpr> indices;
+    for (const PrimExpr& index : store->indices) indices.push_back(ApplyAliases(index, aliases));
+    bool matched = false;
+    tirx::PostOrderVisit(chain, [&](const ffi::ObjectRef& node) {
+      const auto* other = node.as<tirx::BufferStoreNode>();
+      if (other == nullptr || matched) return;
+      if (!SameBuffer(other->buffer, store->buffer)) return;
+      if (other->indices.size() != indices.size()) return;
+      tirx::ExprDeepEqual equal;
+      for (size_t i = 0; i < indices.size(); ++i) {
+        if (!equal(ApplyAliases(other->indices[i], aliases), indices[i])) return;
+      }
+      matched = true;
+    });
+    return matched;
+  };
+
+  std::vector<SegmentSource> sources;
+  std::vector<size_t> loop_children;
+  for (size_t i = 0; i < seq->seq.size(); ++i) {
+    if (seq->seq[i].as<tirx::ForNode>() != nullptr) loop_children.push_back(i);
+  }
+  bool merged_init = false;
+  if (loop_children.size() == 1 && loop_children[0] + 1 == seq->seq.size() &&
+      loop_children[0] > 0) {
+    merged_init = true;
+    for (size_t i = 0; i < loop_children[0] && merged_init; ++i) {
+      merged_init = identity_init_of(seq->seq[i], seq->seq[loop_children[0]]);
+    }
+    if (merged_init) {
+      SegmentSource source = build_loop_source(seq->seq[loop_children[0]]);
+      for (size_t i = 0; i < loop_children[0]; ++i) source.pre.push_back(seq->seq[i]);
+      sources.push_back(std::move(source));
+    }
+  }
+
+  if (!merged_init) {
+    std::vector<Stmt> pending;
+    auto flush_pending = [&]() {
+      if (pending.empty()) return;
+      SegmentSource source;
+      source.main = pending.size() == 1 ? pending.front() : SeqStmts(pending);
+      source.axes = parallel_axes;
+      sources.push_back(std::move(source));
+      pending.clear();
+    };
+
+    // Two adjacent pure-parallel loop chains over the same domain and disjoint
+    // buffers become one nest: their chunk loops then interleave (one loop with
+    // both bodies) instead of running back to back, which gives the scheduler
+    // independent load/store pairs to overlap.
+    auto touched_buffers = [](const Stmt& stmt) {
+      std::set<const tirx::VarNode*> buffers;
+      tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef& node) {
+        if (const auto* load = node.as<tirx::BufferLoadNode>()) {
+          buffers.insert(load->buffer->data.get());
+        } else if (const auto* store = node.as<tirx::BufferStoreNode>()) {
+          buffers.insert(store->buffer->data.get());
+        }
+      });
+      return buffers;
+    };
+    auto has_serial_loop = [](const Stmt& stmt) {
+      bool found = false;
+      tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef& node) {
+        const auto* loop = node.as<tirx::ForNode>();
+        if (loop != nullptr && loop->kind == ForKind::kSerial) found = true;
+      });
+      return found;
+    };
+    std::function<bool(const Stmt&, const Stmt&)> same_loop_shape =
+        [&](const Stmt& lhs, const Stmt& rhs) -> bool {
+      const auto* a = lhs.as<tirx::ForNode>();
+      const auto* b = rhs.as<tirx::ForNode>();
+      if (a == nullptr || b == nullptr) return a == nullptr && b == nullptr;
+      tirx::ExprDeepEqual equal;
+      if (a->kind != b->kind || !equal(a->min, b->min) || !equal(a->extent, b->extent)) {
+        return false;
+      }
+      return same_loop_shape(a->body, b->body);
+    };
+    // Rebuild ``lhs`` with ``rhs`` appended to its innermost body; both chains
+    // have the same shape, so the recursion bottoms out together.
+    std::function<Stmt(const Stmt&, const Stmt&)> merge_chain_bodies =
+        [&](const Stmt& lhs, const Stmt& rhs) -> Stmt {
+      const auto* a = lhs.as<tirx::ForNode>();
+      const auto* b = rhs.as<tirx::ForNode>();
+      if (a == nullptr || b == nullptr) return SeqStmts({lhs, rhs});
+      return tirx::For(a->loop_var, a->min, a->extent, a->kind,
+                       merge_chain_bodies(a->body, b->body));
+    };
+    auto zip_loop_vars = [&](const Stmt& lhs, const Stmt& rhs) {
+      std::map<const tirx::VarNode*, PrimExpr> mapping;
+      const tirx::ForNode* a = lhs.as<tirx::ForNode>();
+      const tirx::ForNode* b = rhs.as<tirx::ForNode>();
+      while (a != nullptr && b != nullptr) {
+        mapping[b->loop_var.get()] = a->loop_var;
+        a = a->body.as<tirx::ForNode>();
+        b = b->body.as<tirx::ForNode>();
+      }
+      return mapping;
+    };
+
+    std::optional<Stmt> previous_chain;
+    std::set<const tirx::VarNode*> previous_buffers;
+    for (const Stmt& child : seq->seq) {
+      if (child.as<tirx::ForNode>() == nullptr) {
+        pending.push_back(child);
+        previous_chain.reset();
+        continue;
+      }
+      if (previous_chain.has_value() && !has_serial_loop(child) &&
+          !has_serial_loop(*previous_chain) && same_loop_shape(*previous_chain, child)) {
+        std::set<const tirx::VarNode*> current = touched_buffers(child);
+        bool disjoint = true;
+        for (const tirx::VarNode* buffer : current) {
+          if (previous_buffers.count(buffer) != 0) {
+            disjoint = false;
+            break;
+          }
+        }
+        if (disjoint) {
+          Stmt merged = merge_chain_bodies(
+              *previous_chain, SubstituteVarsStmt(child, zip_loop_vars(*previous_chain, child)));
+          sources.back() = build_loop_source(merged);
+          previous_chain = merged;
+          previous_buffers.insert(current.begin(), current.end());
+          continue;
+        }
+      }
+      flush_pending();
+      sources.push_back(build_loop_source(child));
+      previous_chain = child;
+      previous_buffers = touched_buffers(child);
+    }
+    flush_pending();
+  }
+  if (sources.empty()) return std::nullopt;
+  std::vector<VectorPlan> segments;
+  for (size_t i = 0; i < sources.size(); ++i) {
+    try {
+      // Flatten only loop-free parallel segments: it merges the whole
+      // contiguous domain into a full-lane axis, which is the only way a
+      // contiguous access avoids the masked gather. A segment with a serial
+      // axis must keep its axis table intact (the serial dim is the
+      // accumulator's inner axis).
+      std::pair<VectorPlan, bool> segment =
+          PlanSegment(sources[i].axes, sources[i].serial_axis, sources[i].pre,
+                      sources[i].main, sources[i].post, aliases, analyzer, lanes,
+                      /*single=*/false, {}, options,
+                      /*allow_flatten=*/!sources[i].serial_axis.has_value());
+      segments.push_back(segment.first);
+    } catch (const Unsupported& error) {
+      notes->push_back("segment " + std::to_string(i) + ": " + error.message());
+      for (const std::string& note : error.diagnostics()) notes->push_back("  " + note);
+      throw Unsupported("tile-op segment planning failed: " + error.message(), *notes);
+    }
+  }
+
+  // Only the outer parallel prefix in front of the first consumed vector axis
+  // may be hoisted; each segment carries the full axis table and the emitter
+  // skips hoisted axes by identity.
+  std::vector<int64_t> consumed;
+  for (const VectorPlan& segment : segments) {
+    if (segment->vector_axis->is_parallel) consumed.push_back(segment->vector_axis->index);
+  }
+  std::optional<int64_t> first_consumed;
+  for (int64_t index : consumed) {
+    first_consumed = first_consumed.has_value() ? std::min(*first_consumed, index) : index;
+  }
+  ffi::Array<Axis> hoisted;
+  for (const Axis& axis : parallel_axes) {
+    if (!first_consumed.has_value() || axis->index < *first_consumed)
+      hoisted.push_back(axis);
+  }
+  VectorProgram program = MakeVectorProgram(hoisted, ToArray(segments));
+  ffi::Array<ffi::String> diagnostics;
+  diagnostics.push_back("multi-segment program: " + std::to_string(segments.size()) +
+                        " segments, source order preserved (tile-op expansion)");
+  program.CopyOnWrite()->diagnostics = diagnostics;
+  return program;
 }
 
 /*! \brief Multi-segment path: several sibling clean serial loops. */
 std::optional<VectorProgram> TryBuildProgram(const Stmt& stmt, arith::Analyzer* analyzer,
                                              std::optional<int64_t> lanes,
                                              std::vector<std::string>* notes,
-                                             const PlanOptions& options) {
+                                             const PlanOptions& options,
+                                             bool split_all = false,
+                                             bool allow_flatten = true) {
+  if (split_all) return TryBuildSplitAllProgram(stmt, analyzer, lanes, notes, options);
   auto absorbed = AbsorbParallelChain(stmt, analyzer);
   const std::vector<Axis>& parallel_axes = absorbed.first;
   Stmt current = absorbed.second;
@@ -2251,21 +2590,25 @@ VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes,
     }
   }
   std::vector<std::string> notes;
+  std::pair<tirx::Stmt, bool> expanded = ExpandParallelTileOps(stmt, &analyzer);
+  const bool expanded_tileops = expanded.second;
   std::optional<VectorProgram> program =
-      TryBuildProgram(stmt, &analyzer, lanes, &notes, options);
+      TryBuildProgram(expanded.first, &analyzer, lanes, &notes, options,
+                      /*split_all=*/expanded_tileops,
+                      /*allow_flatten=*/!expanded_tileops);
   if (program.has_value()) return *program;
 
   VectorPlan plan;
   bool flattened = false;
   try {
-    NestSplit split = SplitNest(stmt, &analyzer, &notes);
+    NestSplit split = SplitNest(expanded.first, &analyzer, &notes);
     std::vector<Stmt> pieces = split.pre;
     pieces.push_back(split.main);
     pieces.insert(pieces.end(), split.post.begin(), split.post.end());
     AliasMap aliases = CollectAliases(SeqStmts(pieces));
     auto planned = PlanSegment(split.axes, split.serial_axis, split.pre, split.main,
                                split.post, aliases, &analyzer, lanes, /*single=*/true, notes,
-                               options);
+                               options, /*allow_flatten=*/!expanded_tileops);
     plan = planned.first;
     flattened = planned.second;
   } catch (const Unsupported& error) {

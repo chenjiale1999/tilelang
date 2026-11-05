@@ -842,6 +842,20 @@ class Emitter {
 
   PrimExpr DataMask(const std::string& dtype_like) { return AllMask(MaskBits(dtype_like)); }
 
+  /*!
+   * \brief Predicate for an element-wise instruction.
+   *
+   * A tail chunk only computes ``tail`` lanes. Using the tail predicate keeps
+   * the inactive lanes out of the operation: the store already discards them,
+   * but a full-mask op would push gather garbage (possibly NaN/Inf) through the
+   * datapath. A cross-lane reduction keeps the full mask, because its operands
+   * feed a reduce tree whose own mask/fill already models the tail.
+   */
+  PrimExpr ArithMask(const std::string& dtype_like) {
+    if (ReduceOf(plan_).defined()) return DataMask(dtype_like);
+    return RampMask(MaskBits(dtype_like));
+  }
+
   PrimExpr TailMask(int bits) {
     if (!masked_tail_) return PrimExpr();
     auto key = std::make_pair(std::string("tail"), bits);
@@ -849,7 +863,13 @@ class Emitter {
     if (it != mask_vars_.end()) return it->second;
     PrimExpr var;
     if (plan_->tail.has_value()) {
-      var = PrologueBind(UpdateMask(IntImm32(*plan_->tail), bits));
+      // A static tail predicate does not depend on the segment, so one shared
+      // program-level binding serves every segment that needs it.
+      PrimExpr expr = UpdateMask(IntImm32(*plan_->tail), bits);
+      std::optional<tirx::Var> shared_var = SharedMask(
+          std::make_pair("tail" + std::to_string(*plan_->tail), bits),
+          "tail" + std::to_string(*plan_->tail) + "_" + std::to_string(bits), expr);
+      var = shared_var.has_value() ? *shared_var : PrologueBind(expr);
     } else {
       PrimExpr remaining = plan_->vector_axis->extent - chunk_ * IntImm32(plan_->lanes);
       PrimExpr count = min(remaining, IntImm32(plan_->lanes));
@@ -1313,13 +1333,13 @@ PrimExpr Emitter::Build(const ValueNode& node) {
     if (promoted != memo_.end()) {
       const Op& op = BinaryOp(ScalarToVectorBinary(recipe_str));
       return Bind(SimdCall(op, DataTypeOf(node->dtype.operator std::string()),
-                           {vector, promoted->second, DataMask(node->dtype.operator std::string()),
+                           {vector, promoted->second, ArithMask(node->dtype.operator std::string()),
                             StrImm(ModeZeroing())}),
                   &lets_);
     }
     return Bind(SimdCall(ScalarBinaryOp(recipe_str),
                          DataTypeOf(node->dtype.operator std::string()),
-                         {vector, Scalar(args[1]), DataMask(node->dtype.operator std::string()),
+                         {vector, Scalar(args[1]), ArithMask(node->dtype.operator std::string()),
                           StrImm(ModeZeroing())}),
                 &lets_);
   }
@@ -1327,13 +1347,13 @@ PrimExpr Emitter::Build(const ValueNode& node) {
     return Bind(SimdCall(ScalarBinaryOp(recipe_str),
                          DataTypeOf(node->dtype.operator std::string()),
                          {Value(args[0]), *node->scalar,
-                          DataMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
+                          ArithMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
                 &lets_);
   }
   if (IsElementwiseUnaryRecipe(recipe_str) && args.size() == 1) {
     return Bind(SimdCall(UnaryOp(recipe_str),
                          DataTypeOf(node->dtype.operator std::string()),
-                         {Value(args[0]), DataMask(node->dtype.operator std::string()),
+                         {Value(args[0]), ArithMask(node->dtype.operator std::string()),
                           StrImm(ModeZeroing())}),
                 &lets_);
   }
@@ -1341,7 +1361,7 @@ PrimExpr Emitter::Build(const ValueNode& node) {
     return Bind(SimdCall(BinaryOp(recipe_str),
                          DataTypeOf(node->dtype.operator std::string()),
                          {Value(args[0]), Value(args[1]),
-                          DataMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
+                          ArithMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
                 &lets_);
   }
   if (recipe == "vcmp") {
@@ -2033,8 +2053,20 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
       throw Unsupported(
           "a packed NZ store needs the vector axis to be the innermost axis (split the nest)");
     }
-    return EmitParallelAxisParts(plan, chunk, prefix, hoisted, single, shared, carry,
-                                 allow_carry, registers);
+    std::pair<std::vector<Stmt>, Stmt> parts = EmitParallelAxisParts(
+        plan, chunk, prefix, hoisted, single, shared, carry, allow_carry, registers);
+    // The three-part structure only loops the axes inside the vector axis; an
+    // outer axis that the program does not hoist still needs its serial loop,
+    // otherwise the emitted body references its variable unbound (a multi-
+    // segment program with a lane axis of its own hoists nothing).
+    Stmt body = parts.second;
+    for (auto it = plan->axes.rbegin(); it != plan->axes.rend(); ++it) {
+      const Axis& axis = *it;
+      if (axis->index >= plan->vector_axis->index) continue;
+      if (HasHoisted(hoisted, axis)) continue;
+      body = tirx::For(axis->var, IntImm32(0), axis->extent, ForKind::kSerial, body);
+    }
+    return {parts.first, body};
   }
 
   Emitter emitter(plan, chunk, prefix, false, 0, std::nullopt, shared, carry,
@@ -2439,7 +2471,12 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
           {IntImm32(1)}, DataTypeOf(VecDtype(ElemDtype(store->spec->buffer->dtype))),
           "acc" + body_prefix + std::to_string(body_emitter.counter()), "local.var");
       body_emitter.set_counter(body_emitter.counter() + 1);
-      body_emitter.prologue_.push_back(tirx::AllocBuffer(acc));
+      // The accumulator is declared inside the segment body, not in the program
+      // prologue: an enclosing per-iteration loop then gives every iteration its
+      // own register. One prologue-level slot would be reused by all iterations
+      // and add a false WAW/WAR dependency that blocks overlapping otherwise
+      // independent iterations.
+      body_emitter.lets_.push_back(tirx::AllocBuffer(acc));
       PrimExpr init;
       auto fold_it = folded.find(store.get());
       if (fold_it != folded.end()) {
