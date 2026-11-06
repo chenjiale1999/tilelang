@@ -625,7 +625,8 @@ void NormalizeBodyInto(const tirx::Stmt& stmt, const AliasMap& aliases,
           throw Unsupported(
               "masked branch merging is not supported: one arm of this same-address if/else is itself "
               "predicated (e.g. a nested else-if), so there is no single select condition; "
-              "rewrite it as two consecutive masked stores");
+              "rewrite it as two consecutive masked stores",
+              {}, "body.masked_branch_merge");
         }
         out->push_back(MakeStoreSpec(then_spec->buffer, then_spec->indices, merged, mask));
         return;
@@ -633,21 +634,24 @@ void NormalizeBodyInto(const tirx::Stmt& stmt, const AliasMap& aliases,
     }
 
     throw Unsupported(
-        "divergent branch arms: an if/else whose arms write different locations cannot be vectorized (方案 §8.1)");
+        "divergent branch arms: an if/else whose arms write different locations cannot be vectorized (方案 §8.1)",
+        {}, "body.divergent_branch");
   }
 
   if (const auto* loop = stmt.as<tirx::ForNode>()) {
     throw Unsupported(
         "nested " + ForKindName(loop->kind) +
-        " loop inside T.Parallel is not affine-vectorizable "
-        "(方案 §6): only directly-nested, dependence-free serial loops are absorbed as axes");
+            " loop inside T.Parallel is not affine-vectorizable "
+            "(方案 §6): only directly-nested, dependence-free serial loops are absorbed as axes",
+        {}, "body.nested_loop");
   }
 
   if (stmt.as<tirx::BindNode>() != nullptr) {
     return;
   }
 
-  throw Unsupported("unsupported statement in T.Parallel body: " + TypeKeyTail(stmt));
+  throw Unsupported("unsupported statement in T.Parallel body: " + TypeKeyTail(stmt), {},
+                    "body.unsupported_statement");
 }
 
 std::vector<StoreSpec> NormalizeBody(const tirx::Stmt& stmt, const AliasMap& aliases) {

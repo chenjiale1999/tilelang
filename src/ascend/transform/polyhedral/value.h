@@ -23,6 +23,8 @@
 #include <tvm/ffi/string.h>
 #include <tvm/tirx/expr.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -37,6 +39,128 @@ namespace polyhedral {
 class ValueNodeNode;
 
 /*!
+ * \brief Typed form of ``ValueNodeNode::recipe``.
+ *
+ * ``recipe`` stays a string at the FFI boundary (tests read it by name), but
+ * every consumer inside the compiler dispatches on this id: a ``switch`` over a
+ * closed enum instead of a chain of ``std::string`` comparisons. Unknown
+ * spellings map to ``kUnknown`` and are rejected by the emitter, exactly as the
+ * string form was.
+ */
+enum class ValueRecipe : uint8_t {
+  kUnknown = 0,
+  // Leaves.
+  kImm,
+  kLaneIndex,
+  kVLoad,
+  kVLoadStrided,
+  kGather,
+  kUniformLoad,
+  kUniformExpr,
+  kVbrc,
+  kRegLoad,
+  // Elementwise binary (vector, vector).
+  kVadd,
+  kVsub,
+  kVmul,
+  kVdiv,
+  kVmax,
+  kVmin,
+  kVand,
+  kVor,
+  kVxor,
+  kVshl,
+  kVshr,
+  // Scalar-vector binary (vector, scalar).
+  kVadds,
+  kVmuls,
+  kVmaxs,
+  kVmins,
+  kVshrs,
+  kVshls,
+  // Elementwise unary.
+  kVneg,
+  kVabs,
+  kVexp,
+  kVsqrt,
+  kVln,
+  // Compare / select / convert.
+  kVcmp,
+  kVcmps,
+  kVsel,
+  kVcvt,
+  // Predicate algebra.
+  kPand,
+  kPor,
+  kPnot,
+};
+
+/*! \brief Number of recipe ids (the last enumerator plus one). */
+inline constexpr size_t kValueRecipeCount = static_cast<size_t>(ValueRecipe::kPnot) + 1;
+
+/*!
+ * \brief How a recipe is lowered (one ``switch`` case per family, not per op).
+ *
+ * Recipes that share a lowering share a family, so adding e.g. a new elementwise
+ * binary op needs no change here or in the emitter: only a row in the recipe
+ * table (and the ``T.simd.*`` op table in emit.cc).
+ */
+enum class ValueRecipeFamily : uint8_t {
+  kUnknown = 0,
+  // Leaves with a bespoke lowering.
+  kImm,
+  kLaneIndex,
+  kRegLoad,
+  kVLoad,
+  kVLoadStrided,
+  kGather,
+  // Lane-uniform broadcast forms.
+  kUniform,
+  kVbrc,
+  // Elementwise families (dispatched through the ``simd_*`` op table).
+  kElementwiseBinary,
+  kElementwiseUnary,
+  kScalarVectorBinary,  // the scalar is ``args[1]``
+  kScalarVectorField,   // the scalar is ``node->scalar`` (shift recipes)
+  // Structured value ops.
+  kVcmp,
+  kVcmps,
+  kVsel,
+  kVcvt,
+  // Predicate algebra.
+  kPredicateBinary,
+  kPredicateNot,
+};
+
+/*! \brief Static description of one recipe. */
+struct ValueRecipeInfo {
+  ValueRecipe id;
+  const char* name;
+  ValueRecipeFamily family;
+};
+
+/*! \brief The description of ``recipe`` (``kUnknown`` for unknown ids). */
+const ValueRecipeInfo& ValueRecipeInfoOf(ValueRecipe recipe);
+
+/*! \brief The FFI spelling of a typed recipe. */
+const char* ValueRecipeName(ValueRecipe recipe);
+/*! \brief Parse an FFI recipe name; ``kUnknown`` when it is not a recipe. */
+ValueRecipe ValueRecipeFromName(const std::string& name);
+
+/*! \brief Whether the recipe is a vector-vector elementwise op. */
+bool IsElementwiseBinary(ValueRecipe recipe);
+/*! \brief Whether the recipe is an elementwise unary op. */
+bool IsElementwiseUnary(ValueRecipe recipe);
+/*! \brief Whether the recipe is a vector-scalar elementwise op. */
+bool IsScalarVectorBinary(ValueRecipe recipe);
+/*! \brief Whether the recipe carries a lane-uniform (scalar) value. */
+bool IsUniformValueRecipe(ValueRecipe recipe);
+/*! \brief ``vadd -> vadds``; ``kUnknown`` when there is no scalar variant. */
+ValueRecipe ScalarVariantOf(ValueRecipe recipe);
+/*! \brief ``vadds -> vadd``; ``kUnknown`` when not a scalar-vector recipe. */
+ValueRecipe VectorVariantOf(ValueRecipe recipe);
+
+/*!
  * \brief One value node: a primitive recipe plus its operands.
  *
  * ``predicate`` is the *load guard* (P0-3): the value is only valid on lanes
@@ -48,6 +172,8 @@ class ValueNodeNode;
 class ValueNodeNode : public ffi::Object {
  public:
   ffi::String recipe;
+  /*! \brief Typed ``recipe``; not reflected (the string stays the FFI value). */
+  ValueRecipe id{ValueRecipe::kUnknown};
   ffi::String dtype;
   ffi::Array<ffi::ObjectRef> args;  // ValueNode elements
   ffi::Optional<AccessInfo> access;

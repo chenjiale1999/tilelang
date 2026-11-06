@@ -91,6 +91,18 @@ class FragmentRegisterMap : public ffi::ObjectRef {
 };
 
 /*!
+ * \brief Internal (non-reflected) views of the store's string fields.
+ *
+ * Every ``*_value`` / ``storage`` / ``store_lane_mode`` / ``layout_kind`` field
+ * stays a string because it is part of the FFI contract the Python tests read.
+ * These shadow enums are what the planner and the emitter branch on, so a typo
+ * is caught when the store is built instead of at emission time.
+ */
+enum class StoreStorage { kShared = 0, kRegister };
+enum class StoreLaneMode { kFull = 0, kPkHalf, kPkQuarter };
+enum class StoreLayoutKind { kNd = 0, kNz };
+
+/*!
  * \brief Non-default handling of one store relative to the loop skeleton.
  *
  * The array a store lives in already says whether it is a ``pre`` / ``main`` /
@@ -123,6 +135,11 @@ class StorePlanNode : public ffi::Object {
   ValueNode value;
   ffi::Optional<ValueNode> mask;
   ffi::String kind_value;  // AccessClass name; Python exposes ``kind``
+  // Shadow enums (not reflected): the internal branching surface.
+  AccessClass kind{AccessClass::kContiguous};
+  StoreStorage storage_id{StoreStorage::kShared};
+  StoreLaneMode lane_mode_id{StoreLaneMode::kFull};
+  StoreLayoutKind layout_id{StoreLayoutKind::kNd};
   ffi::Optional<ValueNode> index;
   ffi::Optional<ffi::ObjectRef> reduce;  // ReduceInfo
   ffi::Optional<ValueNode> promote;

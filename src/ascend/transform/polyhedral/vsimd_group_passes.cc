@@ -587,7 +587,7 @@ VSimdGroupPlan PlanOneGroup(
                                      : failure.reason,
                                  failure.diagnostics);
   }
-  VSimdGroupPlan plan = MakeVSimdGroupPlan(group.id, "PLANNED");
+  VSimdGroupPlan plan = MakeVSimdGroupPlan(group.id, VSimdPlanStatus::kPlanned);
   VSimdGroupPlanNode *writer = plan.CopyOnWrite();
   writer->items = Array<VSimdItemPlan>(items.begin(), items.end());
   return plan;
@@ -597,7 +597,7 @@ VSimdGroupPlan PlanOneGroup(
 void CollectPrograms(const VSimdGroupPlan &group,
                      std::vector<VectorProgram> *programs,
                      std::vector<int> *spans) {
-  if (group->status.operator std::string() != "PLANNED") return;
+  if (group->status_id != VSimdPlanStatus::kPlanned) return;
   for (const VSimdItemPlan &item : group->items) {
     if (item->region_plan.has_value()) {
       programs->push_back(*item->region_plan);
@@ -674,7 +674,7 @@ class GroupPlanner final : public StmtMutator {
       LOG(WARNING) << "[vsimd] P2 rejected a VF's groups: " << fragments.reason;
       std::vector<VSimdGroupPlan> rejected;
       for (const VSimdGroupPlan &group : groups) {
-        if (group->status.operator std::string() != "PLANNED") {
+        if (group->status_id != VSimdPlanStatus::kPlanned) {
           rejected.push_back(group);
           continue;
         }
@@ -779,7 +779,7 @@ class GroupEmitter final : public StmtMutator {
     std::map<int, Stmt> replacements;
     bool emit_failed = false;
     for (const VSimdGroupPlan &group : plans->groups) {
-      if (group->status.operator std::string() != "PLANNED") continue;
+      if (group->status_id != VSimdPlanStatus::kPlanned) continue;
       std::vector<int> spans;
       std::vector<Stmt> emitted;
       bool ok = true;

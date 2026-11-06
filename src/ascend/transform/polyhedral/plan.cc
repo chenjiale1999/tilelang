@@ -895,7 +895,8 @@ int64_t SelectSegmentLanes(const SegmentSpecs& specs,
       throw Unsupported(
           "mixed element widths in one segment are not supported with a statement predicate on "
           "store '" +
-          name + "'");
+          name + "'",
+          {}, "body.statement_predicate");
     }
     const auto* cast = spec->value.as<tirx::CastNode>();
     if (ratio == 1) {
@@ -973,7 +974,7 @@ void FoldIdentityInit(VectorPlan& plan) {
   std::vector<StorePlan> kept;
   for (const StorePlan& pre : plan->pre_stores) {
     bool folded = false;
-    if (pre->kind_value == AccessClassName(AccessClass::kUniform) &&
+    if (pre->kind == AccessClass::kUniform &&
         !pre->mask.has_value()) {
       for (size_t store_index = 0; store_index < plan->stores.size(); ++store_index) {
         const StorePlan& store = plan->stores[store_index];
@@ -1155,20 +1156,21 @@ std::pair<ValueNode, int64_t> StripReduce(const ValueNode& value, const std::str
                                           const StoreSpec& site) {
   std::string scalar_recipe;
   ReduceScalarRecipeFor(op, &scalar_recipe);
-  std::set<std::string> spine = {op, scalar_recipe};
+  std::set<ValueRecipe> spine = {ValueRecipeFromName(op),
+                                 ValueRecipeFromName(scalar_recipe)};
   const tirx::Buffer& buffer = site->buffer;
   int64_t accumulated = 0;
   bool repeated = false;
 
   std::function<ValueNode(const ValueNode&)> strip = [&](const ValueNode& node) -> ValueNode {
-    if (node->recipe == "uniform_load" && node->access.has_value() &&
+    if (node->id == ValueRecipe::kUniformLoad && node->access.has_value() &&
         SameBuffer((*node->access)->buffer, buffer) &&
         SameIndices((*node->access)->indices, site->indices)) {
       ++accumulated;
       if (accumulated > 1) repeated = true;
       return ValueNode();
     }
-    if (spine.count(node->recipe.operator std::string()) != 0 && node->args.size() == 2) {
+    if (spine.count(node->id) != 0 && node->args.size() == 2) {
       std::vector<ValueNode> kept;
       for (const ffi::ObjectRef& arg : node->args) {
         ValueNode child = strip(Downcast<ValueNode>(arg));
@@ -1210,7 +1212,9 @@ ReduceInfo PlanReduce(const StorePlan& store, const Axis& vector_axis) {
     throw Unsupported("conditional reduction into '" +
                       buffer->name.operator std::string() +
                       "' is not supported yet: the cross-lane reduction mask only "
-                      "carries the tail predicate, so the guard would be silently dropped (方案 §2 Case II / R3)");
+                      "carries the tail predicate, so the guard would be silently dropped "
+                      "(方案 §2 Case II / R3)",
+                      {}, "reduce.conditional");
   }
   if (!ReadsBuffer(store->value, buffer)) {
     throw Unsupported("store to '" + buffer->name.operator std::string() +
@@ -1379,8 +1383,8 @@ bool HasPartialLaneStore(const VectorPlan& plan) {
 /*! \brief Collect the register widths of every real load in a value DAG. */
 void CollectLoadLanes(const ValueNode& node, std::set<int64_t>* lanes) {
   if (!node.defined()) return;
-  const std::string recipe = node->recipe.operator std::string();
-  if (recipe == "vload" || recipe == "vload_strided" || recipe == "gather") {
+  if (node->id == ValueRecipe::kVLoad || node->id == ValueRecipe::kVLoadStrided ||
+      node->id == ValueRecipe::kGather) {
     lanes->insert(VRegLanes(ElemDtype(node->dtype.operator std::string())));
   }
   for (const ffi::ObjectRef& arg : node->args) {
@@ -1416,9 +1420,8 @@ void ValidatePartialLaneSegment(const VectorPlan& plan,
   }
   for (const StorePlan& store : plan->stores) {
     const std::string name = store->spec->buffer->name.operator std::string();
-    const std::string kind = store->kind_value.operator std::string();
-    if (kind != AccessClassName(AccessClass::kContiguous) &&
-        kind != AccessClassName(AccessClass::kUniform)) {
+    const std::string kind = AccessClassName(store->kind);
+    if (store->kind != AccessClass::kContiguous && store->kind != AccessClass::kUniform) {
       throw Unsupported(
           "mixed element widths in one segment only support contiguous or uniform stores ('" +
           name + "' is " + kind + ")");
@@ -1572,14 +1575,15 @@ StoreLayoutPlan ClassifyStoreLayout(const StorePlan& store, const PlanOptions& o
                       "' would need a quarter-register source; only the half-register packed "
                       "form is implemented");
   }
-  if (store->kind_value != AccessClassName(AccessClass::kContiguous)) {
+  if (store->kind != AccessClass::kContiguous) {
     throw Unsupported("NZ store to '" + name +
                       "' requires a contiguous access along the vector axis (got " +
-                      store->kind_value.operator std::string() + ")");
+                      AccessClassName(store->kind) + ")");
   }
   if (store->mask.has_value()) {
     throw Unsupported("NZ store to '" + name +
-                      "' does not support a statement predicate yet");
+                      "' does not support a statement predicate yet",
+                      {}, "body.statement_predicate");
   }
   const int c0 = AscendC0(buffer->dtype.bits());
   std::optional<int64_t> cols = ConstInt(buffer->shape.back(), analyzer);
@@ -1588,10 +1592,12 @@ StoreLayoutPlan ClassifyStoreLayout(const StorePlan& store, const PlanOptions& o
                       "(" + std::to_string(c0) + " elements), got " + std::to_string(lanes));
   }
   if (!cols.has_value() || *cols % lanes != 0 || lanes > *cols) {
-    throw Unsupported("NZ store to '" + name +
-                      "' needs a static column extent covering a whole number of chunks (cols=" +
-                      (cols.has_value() ? std::to_string(*cols) : std::string("?")) +
-                      ", chunk=" + std::to_string(lanes) + ")");
+    throw Unsupported(
+        "NZ store to '" + name +
+            "' needs a static column extent covering a whole number of chunks (cols=" +
+            (cols.has_value() ? std::to_string(*cols) : std::string("?")) +
+            ", chunk=" + std::to_string(lanes) + ")",
+        {}, "plan.partial_chunks");
   }
   // A half-register source is written in the paired form (Stage 2b): two chunks
   // are merged into one full register, so the columns must cover whole pairs.
@@ -1768,10 +1774,11 @@ FragmentMode ClassifyFragmentRegisters(
     if (!FragmentLayoutIsIdentity(options, buffer)) {
       const Layout* layout = LookupStoreLayout(options, buffer);
       throw Unsupported("fragment register: '" + name +
-                        "' has a non-identity layout (" +
-                        (layout != nullptr ? (*layout)->DebugOutput()
-                                           : std::string("unknown")) +
-                        ")");
+                            "' has a non-identity layout (" +
+                            (layout != nullptr ? (*layout)->DebugOutput()
+                                               : std::string("unknown")) +
+                            ")",
+                        {}, "fragment.non_identity_layout");
     }
     // G7: supported element dtype and matching lane width.
     std::string elem = ffi::DLDataTypeToString(buffer->dtype.element_of())
@@ -1808,12 +1815,13 @@ FragmentMode ClassifyFragmentRegisters(
     if (classified.kind != AccessClass::kContiguous) {
       throw Unsupported(
           "fragment register: '" + name + "' is not contiguous along vector axis '" +
-          vector_axis->name.operator std::string() + "' (Δ=" +
-          AccessClassName(classified.kind) +
-          (classified.stride.has_value()
-               ? ", stride=" + std::to_string(*classified.stride)
-               : std::string()) +
-          ")");
+              vector_axis->name.operator std::string() + "' (Δ=" +
+              AccessClassName(classified.kind) +
+              (classified.stride.has_value()
+                   ? ", stride=" + std::to_string(*classified.stride)
+                   : std::string()) +
+              ")",
+          {}, "fragment.not_contiguous");
     }
     // G2/G3/G4: slot = off / lanes must be a compile-time constant that only
     // depends on the vector axis.
@@ -1984,10 +1992,13 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     store.CopyOnWrite()->store_lanes = register_lanes;
     if (ratio == 2) {
       store.CopyOnWrite()->store_lane_mode = ffi::String("pk_half");
+      store.CopyOnWrite()->lane_mode_id = StoreLaneMode::kPkHalf;
     } else if (ratio == 4) {
       store.CopyOnWrite()->store_lane_mode = ffi::String("pk_quarter");
+      store.CopyOnWrite()->lane_mode_id = StoreLaneMode::kPkQuarter;
     } else {
       store.CopyOnWrite()->store_lane_mode = ffi::String("full");
+      store.CopyOnWrite()->lane_mode_id = StoreLaneMode::kFull;
     }
     if (ratio > 1) {
       store.CopyOnWrite()->store_pack_bits = ffi::Optional<int64_t>(2048 / lanes);
@@ -2005,12 +2016,14 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
                           "' needs a packed/narrowing store (" + lane_mode + ")");
       }
       store.CopyOnWrite()->storage = ffi::String("register");
+      store.CopyOnWrite()->storage_id = StoreStorage::kRegister;
     }
     // Destination layout (Stage 2): the classification is applied here, where
     // the plan node is still uniquely owned, so ``CopyOnWrite`` stays in place.
     StoreLayoutPlan layout_plan = ClassifyStoreLayout(store, options, lanes, analyzer);
     if (layout_plan.nz) {
       store.CopyOnWrite()->layout_kind = ffi::String("nz");
+      store.CopyOnWrite()->layout_id = StoreLayoutKind::kNz;
       store.CopyOnWrite()->nz_block_stride =
           ffi::Optional<int64_t>(layout_plan.block_stride);
       store.CopyOnWrite()->nz_elem_stride = ffi::Optional<int64_t>(1);
@@ -2068,12 +2081,12 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
         {"before", plan->pre_stores}, {"after", plan->post_stores}};
     for (const auto& group : groups) {
       for (const StorePlan& store : group.second) {
-        if (store->kind_value != AccessClassName(AccessClass::kUniform)) {
+        if (store->kind != AccessClass::kUniform) {
           throw Unsupported(
               "a statement " + group.first +
               " the serial loop must be uniform along vector axis '" +
               vector_axis->name.operator std::string() + "' (got " +
-              store->kind_value.operator std::string() + ") (方案 §6 第二步)");
+              AccessClassName(store->kind) + ") (方案 §6 第二步)");
         }
       }
     }
@@ -2097,7 +2110,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     }
     for (const StorePlan& store : plan->stores) {
       bool promoted = store->promote.has_value();
-      if (store->kind_value == AccessClassName(AccessClass::kUniform) &&
+      if (store->kind == AccessClass::kUniform &&
           !store->value->is_uniform && IsPrivateScope(store->spec->buffer) && !promoted) {
         throw Unsupported(
             "store to private scalar '" + store->spec->buffer->name.operator std::string() +
@@ -2132,12 +2145,12 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
         {"before", plan->pre_stores}, {"after", plan->post_stores}};
     for (const auto& group : groups) {
       for (const StorePlan& store : group.second) {
-        if (store->kind_value != AccessClassName(AccessClass::kUniform)) {
+        if (store->kind != AccessClass::kUniform) {
           throw Unsupported(
               "a statement " + group.first +
               " the serial loop must be uniform along the reduction vector axis '" +
               vector_axis->name.operator std::string() + "' (got " +
-              store->kind_value.operator std::string() + ") (方案 §6 第二步)");
+              AccessClassName(store->kind) + ") (方案 §6 第二步)");
         }
       }
     }
@@ -2150,8 +2163,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   // Defect A0: a partial reduction on an absorbed serial axis has no vector form.
   if (!reduce.defined()) {
     for (const StorePlan& store : plan->stores) {
-      if (store->kind_value != AccessClassName(AccessClass::kUniform) ||
-          store->value->is_uniform) {
+      if (store->kind != AccessClass::kUniform || store->value->is_uniform) {
         continue;
       }
       if (vector_axis->is_parallel && store->promote.has_value()) continue;
@@ -2240,11 +2252,14 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
   }
 
   std::vector<std::string> errors;
+  // Specificity survives the per-axis fallback: the first classified reason
+  // (ranked axes are tried in order) becomes the rejection code.
+  std::string first_classified_code;
   std::vector<Axis> ranked = RankVectorAxes(axes, all_infos, load_infos, analyzer, specs.lanes);
   if (ranked.empty()) {
     throw Unsupported(
         "no vectorizable axis: every store is true-random (its index cannot be built in the index-vector channel) on all axes",
-        diagnostics);
+        diagnostics, "plan.no_vector_axis");
   }
   for (const Axis& axis : ranked) {
     VectorPlan plan;
@@ -2253,6 +2268,10 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
     } catch (const Unsupported& error) {
       // Per-axis failure reasons survive even on success (改进 7).
       errors.push_back("axis '" + axis->name.operator std::string() + "': " + error.message());
+      if (first_classified_code.empty() &&
+          error.code() != Unsupported::kDefaultCode) {
+        first_classified_code = error.code();
+      }
       diagnostics.push_back("axis '" + axis->name.operator std::string() + "': " +
                             error.message() + " -> fallback");
       for (const std::string& note : error.diagnostics()) diagnostics.push_back("  " + note);
@@ -2274,7 +2293,9 @@ std::pair<VectorPlan, bool> PlanSegment(const std::vector<Axis>& axes,
   }
   std::string joined;
   for (size_t i = 0; i < errors.size(); ++i) joined += (i == 0 ? "" : "; ") + errors[i];
-  throw Unsupported("no vectorizable axis: " + joined, diagnostics);
+  std::string code =
+      first_classified_code.empty() ? "plan.no_vector_axis" : first_classified_code;
+  throw Unsupported("no vectorizable axis: " + joined, diagnostics, code);
 }
 
 /*! \brief Plan one serial chain segment (multi-segment path). */
@@ -2735,7 +2756,7 @@ VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes,
       for (size_t i = 0; i < notes.size(); ++i) joined += (i == 0 ? "" : "; ") + notes[i];
       std::vector<std::string> merged = notes;
       merged.insert(merged.end(), error.diagnostics().begin(), error.diagnostics().end());
-      throw Unsupported(error.message() + " [" + joined + "]", merged);
+      throw Unsupported(error.message() + " [" + joined + "]", merged, error.code());
     }
     throw;
   }

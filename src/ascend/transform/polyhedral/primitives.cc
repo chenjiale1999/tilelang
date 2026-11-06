@@ -230,37 +230,9 @@ bool BoolUnaryRecipeFor(const std::string& name_lower, std::string* recipe) {
   return true;
 }
 
-bool IsElementwiseUnaryRecipe(const std::string& recipe) {
-  for (const auto& kv : UnaryRecipes()) {
-    if (kv.second == recipe) return true;
-  }
-  return false;
-}
-
-bool IsElementwiseBinaryRecipe(const std::string& recipe) {
-  for (const auto& kv : BinaryRecipes()) {
-    if (kv.second == recipe) return true;
-  }
-  return false;
-}
-
-bool IsScalarVectorRecipe(const std::string& recipe) {
-  for (const auto& kv : VecScalarBinaryTable()) {
-    if (kv.second == recipe) return true;
-  }
-  return false;
-}
-
 std::string VecScalarBinary(const std::string& recipe) {
   auto it = VecScalarBinaryTable().find(recipe);
   return it == VecScalarBinaryTable().end() ? std::string() : it->second;
-}
-
-std::string ScalarToVectorBinary(const std::string& recipe) {
-  for (const auto& kv : VecScalarBinaryTable()) {
-    if (kv.second == recipe) return kv.first;
-  }
-  return std::string();
 }
 
 std::string CompareFlip(const std::string& pred) {
@@ -268,15 +240,6 @@ std::string CompareFlip(const std::string& pred) {
   return it == CompareFlips().end() ? std::string() : it->second;
 }
 
-bool IsUniformRecipe(const std::string& recipe) {
-  // _UNIFORM_RECIPES = ("imm", "uniform_load", "uniform_expr")
-  return recipe == "imm" || recipe == "uniform_load" || recipe == "uniform_expr";
-}
-
-bool IsScalarOnlyRecipe(const std::string& recipe) {
-  // _SCALAR_ONLY_RECIPES = ("imm", "uniform_expr")
-  return recipe == "imm" || recipe == "uniform_expr";
-}
 
 bool IsAtomicName(const std::string& tail) { return tail.find("atomic") != std::string::npos; }
 

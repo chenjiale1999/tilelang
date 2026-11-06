@@ -27,6 +27,13 @@ namespace tvm {
 namespace tl {
 namespace polyhedral {
 
+/*! \brief Typed form of ``VSimdGroupPlanNode::status`` (FFI keeps the string). */
+enum class VSimdPlanStatus : uint8_t {
+  kUnknown = 0,
+  kPlanned,
+  kRejected,
+};
+
 /*!
  * \brief Phase B copy plan: one UB<->UB elementwise / broadcast copy.
  *
@@ -148,6 +155,7 @@ class VSimdGroupPlanNode : public ffi::Object {
  public:
   int64_t group_id{-1};
   ffi::String status;  // PLANNED / REJECTED
+  VSimdPlanStatus status_id{VSimdPlanStatus::kUnknown};
   ffi::String reason;
   ffi::Array<ffi::String> diagnostics;
   ffi::Array<VSimdItemPlan> items;
@@ -234,7 +242,8 @@ TVM_DLL VSimdItemPlan MakeVSimdReduceItemPlan(int64_t item_index,
                                               int64_t span_begin,
                                               int64_t span_end,
                                               VSimdReducePlan plan);
-TVM_DLL VSimdGroupPlan MakeVSimdGroupPlan(int64_t group_id, std::string status);
+TVM_DLL VSimdGroupPlan MakeVSimdGroupPlan(int64_t group_id,
+                                          VSimdPlanStatus status);
 TVM_DLL VSimdGroupPlan MakeRejectedGroupPlan(
     int64_t group_id, std::string reason,
     std::vector<std::string> diagnostics = {});

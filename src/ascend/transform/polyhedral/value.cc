@@ -10,7 +10,9 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <array>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "primitives.h"
@@ -122,13 +124,13 @@ ValueNode BuildCall(const tirx::Call& call, const ValueContext& ctx);
 
 ValueNode NegateUniform(const ValueNode& node) {
   ffi::Optional<PrimExpr> scalar;
-  if (node->recipe == "imm" || node->recipe == "uniform_expr") {
+  if (node->id == ValueRecipe::kImm || node->id == ValueRecipe::kUniformExpr) {
     scalar = node->scalar;
-  } else if (node->recipe == "uniform_load" && node->access.has_value()) {
+  } else if (node->id == ValueRecipe::kUniformLoad && node->access.has_value()) {
     const AccessInfo& access = *node->access;
     scalar = ffi::Optional<PrimExpr>(
         tirx::BufferLoad(access->buffer, access->indices));
-  } else if (node->recipe == "vbrc" && !node->args.empty()) {
+  } else if (node->id == ValueRecipe::kVbrc && !node->args.empty()) {
     return NegateUniform(Downcast<ValueNode>(node->args[0]));
   } else {
     return ValueNode();
@@ -143,7 +145,7 @@ ValueNode NegateUniform(const ValueNode& node) {
 }
 
 ValueNode BroadcastImpl(const ValueNode& node) {
-  if (node->recipe == "vbrc") return node;
+  if (node->id == ValueRecipe::kVbrc) return node;
   ValueSpec spec;
   spec.recipe = "vbrc";
   spec.dtype = VecOf(node->dtype);
@@ -387,14 +389,151 @@ ValueNode BuildCall(const tirx::Call& call, const ValueContext& ctx) {
     std::vector<ValueNode> args = {BuildValue(call->args[0], ctx)};
     return Elementwise(recipe, call, std::move(args), ctx);
   }
-  throw Unsupported("unsupported intrinsic call in T.Parallel body: " + tail);
+  throw Unsupported("unsupported intrinsic call in T.Parallel body: " + tail, {},
+                    "value.unsupported_intrinsic");
 }
 
 }  // namespace
 
+namespace {
+
+/*! \brief The single recipe table: name + lowering family per recipe. */
+const std::vector<ValueRecipeInfo>& ValueRecipeInfos() {
+  static const std::vector<ValueRecipeInfo> infos = {
+      {ValueRecipe::kImm, "imm", ValueRecipeFamily::kImm},
+      {ValueRecipe::kLaneIndex, "lane_index", ValueRecipeFamily::kLaneIndex},
+      {ValueRecipe::kVLoad, "vload", ValueRecipeFamily::kVLoad},
+      {ValueRecipe::kVLoadStrided, "vload_strided", ValueRecipeFamily::kVLoadStrided},
+      {ValueRecipe::kGather, "gather", ValueRecipeFamily::kGather},
+      {ValueRecipe::kUniformLoad, "uniform_load", ValueRecipeFamily::kUniform},
+      {ValueRecipe::kUniformExpr, "uniform_expr", ValueRecipeFamily::kUniform},
+      {ValueRecipe::kVbrc, "vbrc", ValueRecipeFamily::kVbrc},
+      {ValueRecipe::kRegLoad, "reg_load", ValueRecipeFamily::kRegLoad},
+      {ValueRecipe::kVadd, "vadd", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVsub, "vsub", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVmul, "vmul", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVdiv, "vdiv", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVmax, "vmax", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVmin, "vmin", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVand, "vand", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVor, "vor", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVxor, "vxor", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVshl, "vshl", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVshr, "vshr", ValueRecipeFamily::kElementwiseBinary},
+      {ValueRecipe::kVadds, "vadds", ValueRecipeFamily::kScalarVectorBinary},
+      {ValueRecipe::kVmuls, "vmuls", ValueRecipeFamily::kScalarVectorBinary},
+      {ValueRecipe::kVmaxs, "vmaxs", ValueRecipeFamily::kScalarVectorBinary},
+      {ValueRecipe::kVmins, "vmins", ValueRecipeFamily::kScalarVectorBinary},
+      {ValueRecipe::kVshrs, "vshrs", ValueRecipeFamily::kScalarVectorField},
+      {ValueRecipe::kVshls, "vshls", ValueRecipeFamily::kScalarVectorField},
+      {ValueRecipe::kVneg, "vneg", ValueRecipeFamily::kElementwiseUnary},
+      {ValueRecipe::kVabs, "vabs", ValueRecipeFamily::kElementwiseUnary},
+      {ValueRecipe::kVexp, "vexp", ValueRecipeFamily::kElementwiseUnary},
+      {ValueRecipe::kVsqrt, "vsqrt", ValueRecipeFamily::kElementwiseUnary},
+      {ValueRecipe::kVln, "vln", ValueRecipeFamily::kElementwiseUnary},
+      {ValueRecipe::kVcmp, "vcmp", ValueRecipeFamily::kVcmp},
+      {ValueRecipe::kVcmps, "vcmps", ValueRecipeFamily::kVcmps},
+      {ValueRecipe::kVsel, "vsel", ValueRecipeFamily::kVsel},
+      {ValueRecipe::kVcvt, "vcvt", ValueRecipeFamily::kVcvt},
+      {ValueRecipe::kPand, "pand", ValueRecipeFamily::kPredicateBinary},
+      {ValueRecipe::kPor, "por", ValueRecipeFamily::kPredicateBinary},
+      {ValueRecipe::kPnot, "pnot", ValueRecipeFamily::kPredicateNot},
+  };
+  return infos;
+}
+
+/*! \brief Dense id -> info table (the emitter reads this per value node). */
+const std::array<ValueRecipeInfo, kValueRecipeCount>& ValueRecipeInfoTable() {
+  static const auto table = [] {
+    std::array<ValueRecipeInfo, kValueRecipeCount> dense{};
+    for (size_t i = 0; i < kValueRecipeCount; ++i) {
+      dense[i] = {ValueRecipe::kUnknown, "unknown", ValueRecipeFamily::kUnknown};
+    }
+    for (const ValueRecipeInfo& info : ValueRecipeInfos()) {
+      dense[static_cast<size_t>(info.id)] = info;
+    }
+    return dense;
+  }();
+  return table;
+}
+
+}  // namespace
+
+const ValueRecipeInfo& ValueRecipeInfoOf(ValueRecipe recipe) {
+  size_t index = static_cast<size_t>(recipe);
+  const auto& table = ValueRecipeInfoTable();
+  if (index >= table.size()) return table[0];
+  return table[index];
+}
+
+const char* ValueRecipeName(ValueRecipe recipe) {
+  return ValueRecipeInfoOf(recipe).name;
+}
+
+ValueRecipe ValueRecipeFromName(const std::string& name) {
+  static const std::unordered_map<std::string, ValueRecipe> table = [] {
+    std::unordered_map<std::string, ValueRecipe> map;
+    for (const ValueRecipeInfo& info : ValueRecipeInfos()) {
+      map.emplace(info.name, info.id);
+    }
+    return map;
+  }();
+  auto it = table.find(name);
+  return it == table.end() ? ValueRecipe::kUnknown : it->second;
+}
+
+bool IsElementwiseBinary(ValueRecipe recipe) {
+  return ValueRecipeInfoOf(recipe).family == ValueRecipeFamily::kElementwiseBinary;
+}
+
+bool IsElementwiseUnary(ValueRecipe recipe) {
+  return ValueRecipeInfoOf(recipe).family == ValueRecipeFamily::kElementwiseUnary;
+}
+
+bool IsScalarVectorBinary(ValueRecipe recipe) {
+  return ValueRecipeInfoOf(recipe).family == ValueRecipeFamily::kScalarVectorBinary;
+}
+
+bool IsUniformValueRecipe(ValueRecipe recipe) {
+  // ``imm`` is a lane-uniform scalar but keeps its own lowering family.
+  ValueRecipeFamily family = ValueRecipeInfoOf(recipe).family;
+  return family == ValueRecipeFamily::kUniform || family == ValueRecipeFamily::kImm;
+}
+
+ValueRecipe ScalarVariantOf(ValueRecipe recipe) {
+  switch (recipe) {
+    case ValueRecipe::kVadd:
+      return ValueRecipe::kVadds;
+    case ValueRecipe::kVmul:
+      return ValueRecipe::kVmuls;
+    case ValueRecipe::kVmax:
+      return ValueRecipe::kVmaxs;
+    case ValueRecipe::kVmin:
+      return ValueRecipe::kVmins;
+    default:
+      return ValueRecipe::kUnknown;
+  }
+}
+
+ValueRecipe VectorVariantOf(ValueRecipe recipe) {
+  switch (recipe) {
+    case ValueRecipe::kVadds:
+      return ValueRecipe::kVadd;
+    case ValueRecipe::kVmuls:
+      return ValueRecipe::kVmul;
+    case ValueRecipe::kVmaxs:
+      return ValueRecipe::kVmax;
+    case ValueRecipe::kVmins:
+      return ValueRecipe::kVmin;
+    default:
+      return ValueRecipe::kUnknown;
+  }
+}
+
 ValueNode MakeValueNode(ValueSpec spec) {
   auto node = ffi::make_object<ValueNodeNode>();
   node->recipe = spec.recipe;
+  node->id = ValueRecipeFromName(spec.recipe);
   node->dtype = spec.dtype;
   for (const ValueNode& arg : spec.args) node->args.push_back(arg);
   node->access = std::move(spec.access);
@@ -409,10 +548,9 @@ ValueNode MakeValueNode(ValueSpec spec) {
   }
 
   bool is_uniform = false;
-  const std::string& recipe = spec.recipe;
-  if (recipe == "lane_index" || recipe == "vbrc") {
+  if (node->id == ValueRecipe::kLaneIndex || node->id == ValueRecipe::kVbrc) {
     is_uniform = false;
-  } else if (IsUniformRecipe(recipe)) {
+  } else if (IsUniformValueRecipe(node->id)) {
     is_uniform = true;
   } else if (spec.args.empty()) {
     // Other leaf recipes (vload / vload_strided / gather) carry per-lane values.
@@ -559,7 +697,7 @@ ValueNode NegatePredicate(const ValueNode& node) {
     spec.detail = "negated predicate";
     return MakeValueNode(std::move(spec));
   }
-  if (node->recipe == "pnot") {
+  if (node->id == ValueRecipe::kPnot) {
     return Downcast<ValueNode>(node->args[0]);
   }
   ValueSpec spec;
@@ -607,7 +745,7 @@ bool ReadsBuffer(const ValueNode& node, const tirx::Buffer& buffer) {
 
 ValueNode SameAddressLoad(const ValueNode& node, const tirx::Buffer& buffer,
                           const ffi::Array<PrimExpr>& indices) {
-  if ((node->recipe == "vload" || node->recipe == "uniform_load") &&
+  if ((node->id == ValueRecipe::kVLoad || node->id == ValueRecipe::kUniformLoad) &&
       node->access.has_value() && SameBuffer((*node->access)->buffer, buffer) &&
       SameIndices((*node->access)->indices, indices)) {
     return node;
@@ -621,7 +759,7 @@ ValueNode SameAddressLoad(const ValueNode& node, const tirx::Buffer& buffer,
 
 bool ReadsOtherAddress(const ValueNode& node, const tirx::Buffer& buffer,
                        const ffi::Array<PrimExpr>& indices) {
-  if ((node->recipe == "vload" || node->recipe == "uniform_load") &&
+  if ((node->id == ValueRecipe::kVLoad || node->id == ValueRecipe::kUniformLoad) &&
       node->access.has_value() && SameBuffer((*node->access)->buffer, buffer) &&
       !SameIndices((*node->access)->indices, indices)) {
     return true;

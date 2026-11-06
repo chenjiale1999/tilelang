@@ -45,6 +45,7 @@ StorePlan MakeStorePlan(StoreSpec spec, AccessInfo access, ValueNode value,
   node->value = std::move(value);
   node->mask = std::move(mask);
   node->kind_value = AccessClassName(kind);
+  node->kind = kind;
   node->index = std::move(index);
   return StorePlan(std::move(node));
 }
@@ -127,7 +128,7 @@ ValueNode AccumulatorCandidate(const StorePlan& store, const VectorPlan& plan,
   // a local.var accumulator would be a second, conflicting storage.
   if (StorageClassOf(buffer) == StorageClass::kFragment) return ValueNode();
   bool is_private = IsPrivateScope(buffer);
-  std::string kind = store->kind_value;
+  std::string kind = AccessClassName(store->kind);
   if (kind == AccessClassName(AccessClass::kUniform)) {
     if (!is_private) return ValueNode();
   } else if (kind != AccessClassName(AccessClass::kContiguous)) {
@@ -179,10 +180,10 @@ ValueNode AccumulatorCandidate(const StorePlan& store, const VectorPlan& plan,
   }
   if (consumers.empty()) return ValueNode();
   for (const StorePlan& other : consumers) {
-    if (other->kind_value == AccessClassName(AccessClass::kUniform)) return ValueNode();
+    if (other->kind == AccessClass::kUniform) return ValueNode();
   }
   for (const StorePlan& post : plan->post_stores) {
-    if (post->kind_value == AccessClassName(AccessClass::kUniform) &&
+    if (post->kind == AccessClass::kUniform &&
         !post->value->is_uniform && SameBuffer(post->spec->buffer, buffer)) {
       return ValueNode();
     }

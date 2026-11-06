@@ -10,6 +10,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <functional>
@@ -174,44 +175,54 @@ PrimExpr MethodMask(const Op& op, const std::vector<PrimExpr>& args) {
   return SimdCall(op, BoolMaskDtype(), args);
 }
 
-/*! \brief ``getattr(simd, recipe)`` for the scalar-vector binary family. */
-const Op& ScalarBinaryOp(const std::string& recipe) {
-  if (recipe == "vadds") return simd_vadds();
-  if (recipe == "vmuls") return simd_vmuls();
-  if (recipe == "vmaxs") return simd_vmaxs();
-  if (recipe == "vmins") return simd_vmins();
-  if (recipe == "vshrs") return simd_vshrs();
-  if (recipe == "vshls") return simd_vshls();
-  TVM_FFI_ICHECK(false) << "unknown scalar-vector recipe '" << recipe << "'";
-  return simd_vadds();
+/*!
+ * \brief ``T.simd.*`` op of one recipe.
+ *
+ * This table is the only place a recipe is bound to an instruction: adding
+ * e.g. ``vmod`` needs one row here plus one row in the recipe table
+ * (``value.cc``), with no change to the emitter's dispatch.
+ */
+using SimdOpGetter = const Op& (*)();
+
+const std::array<SimdOpGetter, kValueRecipeCount>& SimdOpTable() {
+  static const auto table = [] {
+    std::array<SimdOpGetter, kValueRecipeCount> ops{};
+    ops[static_cast<size_t>(ValueRecipe::kVadd)] = simd_vadd;
+    ops[static_cast<size_t>(ValueRecipe::kVsub)] = simd_vsub;
+    ops[static_cast<size_t>(ValueRecipe::kVmul)] = simd_vmul;
+    ops[static_cast<size_t>(ValueRecipe::kVdiv)] = simd_vdiv;
+    ops[static_cast<size_t>(ValueRecipe::kVmax)] = simd_vmax;
+    ops[static_cast<size_t>(ValueRecipe::kVmin)] = simd_vmin;
+    ops[static_cast<size_t>(ValueRecipe::kVand)] = simd_vand;
+    ops[static_cast<size_t>(ValueRecipe::kVor)] = simd_vor;
+    ops[static_cast<size_t>(ValueRecipe::kVxor)] = simd_vxor;
+    ops[static_cast<size_t>(ValueRecipe::kVshl)] = simd_vshl;
+    ops[static_cast<size_t>(ValueRecipe::kVshr)] = simd_vshr;
+    ops[static_cast<size_t>(ValueRecipe::kVadds)] = simd_vadds;
+    ops[static_cast<size_t>(ValueRecipe::kVmuls)] = simd_vmuls;
+    ops[static_cast<size_t>(ValueRecipe::kVmaxs)] = simd_vmaxs;
+    ops[static_cast<size_t>(ValueRecipe::kVmins)] = simd_vmins;
+    ops[static_cast<size_t>(ValueRecipe::kVshrs)] = simd_vshrs;
+    ops[static_cast<size_t>(ValueRecipe::kVshls)] = simd_vshls;
+    ops[static_cast<size_t>(ValueRecipe::kVneg)] = simd_vneg;
+    ops[static_cast<size_t>(ValueRecipe::kVabs)] = simd_vabs;
+    ops[static_cast<size_t>(ValueRecipe::kVexp)] = simd_vexp;
+    ops[static_cast<size_t>(ValueRecipe::kVsqrt)] = simd_vsqrt;
+    ops[static_cast<size_t>(ValueRecipe::kVln)] = simd_vln;
+    return ops;
+  }();
+  return table;
 }
 
-/*! \brief ``getattr(simd, recipe)`` for the elementwise binary family. */
-const Op& BinaryOp(const std::string& recipe) {
-  if (recipe == "vadd") return simd_vadd();
-  if (recipe == "vsub") return simd_vsub();
-  if (recipe == "vmul") return simd_vmul();
-  if (recipe == "vdiv") return simd_vdiv();
-  if (recipe == "vmax") return simd_vmax();
-  if (recipe == "vmin") return simd_vmin();
-  if (recipe == "vand") return simd_vand();
-  if (recipe == "vor") return simd_vor();
-  if (recipe == "vxor") return simd_vxor();
-  if (recipe == "vshl") return simd_vshl();
-  if (recipe == "vshr") return simd_vshr();
-  TVM_FFI_ICHECK(false) << "unknown binary recipe '" << recipe << "'";
+/*! \brief The ``T.simd.*`` op of ``recipe`` (unknown recipes are a bug). */
+const Op& SimdOpOf(ValueRecipe recipe) {
+  size_t index = static_cast<size_t>(recipe);
+  if (index < kValueRecipeCount && SimdOpTable()[index] != nullptr) {
+    return SimdOpTable()[index]();
+  }
+  TVM_FFI_ICHECK(false) << "recipe '" << ValueRecipeName(recipe)
+                        << "' has no T.simd.* instruction";
   return simd_vadd();
-}
-
-/*! \brief ``getattr(simd, recipe)`` for the elementwise unary family. */
-const Op& UnaryOp(const std::string& recipe) {
-  if (recipe == "vneg") return simd_vneg();
-  if (recipe == "vabs") return simd_vabs();
-  if (recipe == "vexp") return simd_vexp();
-  if (recipe == "vsqrt") return simd_vsqrt();
-  if (recipe == "vln") return simd_vln();
-  TVM_FFI_ICHECK(false) << "unknown unary recipe '" << recipe << "'";
-  return simd_vneg();
 }
 
 /*! \brief Cross-lane reduction op; ``vcadd`` widens 16-bit integer inputs. */
@@ -312,6 +323,28 @@ PrimExpr UnsignedIndex(const PrimExpr& reg) {
 /* structural cache keys                                                     */
 /* ------------------------------------------------------------------------- */
 
+void ExprKeyInto(const PrimExpr& expr, std::string* out);
+
+/*!
+ * \brief Append ``<TypeKeyTail>(a,b)`` when ``expr`` is a binary node.
+ *
+ * All ``tirx`` arithmetic / comparison / logical nodes share the same ``a``/``b``
+ * layout but have no common non-template base, so only the type list is spelled
+ * out; the name comes from the node's own type key, never a parallel table.
+ */
+template <typename Node>
+bool ExprKeyBinary(const PrimExpr& expr, std::string* out) {
+  const auto* op = expr.as<Node>();
+  if (op == nullptr) return false;
+  *out += TypeKeyTail(expr);
+  *out += "(";
+  ExprKeyInto(op->a, out);
+  *out += ",";
+  ExprKeyInto(op->b, out);
+  *out += ")";
+  return true;
+}
+
 /*!
  * \brief Fast structural key of an expression (stand-in for Python ``str(expr)``).
  *
@@ -358,86 +391,24 @@ void ExprKeyInto(const PrimExpr& expr, std::string* out) {
     *out += ")";
     return;
   }
-  const char* binary = nullptr;
-  if (expr.as<tirx::AddNode>()) {
-    binary = "Add";
-  } else if (expr.as<tirx::SubNode>()) {
-    binary = "Sub";
-  } else if (expr.as<tirx::MulNode>()) {
-    binary = "Mul";
-  } else if (expr.as<tirx::DivNode>()) {
-    binary = "Div";
-  } else if (expr.as<tirx::ModNode>()) {
-    binary = "Mod";
-  } else if (expr.as<tirx::FloorDivNode>()) {
-    binary = "FloorDiv";
-  } else if (expr.as<tirx::FloorModNode>()) {
-    binary = "FloorMod";
-  } else if (expr.as<tirx::MinNode>()) {
-    binary = "Min";
-  } else if (expr.as<tirx::MaxNode>()) {
-    binary = "Max";
-  } else if (expr.as<tirx::EQNode>()) {
-    binary = "EQ";
-  } else if (expr.as<tirx::NENode>()) {
-    binary = "NE";
-  } else if (expr.as<tirx::LTNode>()) {
-    binary = "LT";
-  } else if (expr.as<tirx::LENode>()) {
-    binary = "LE";
-  } else if (expr.as<tirx::GTNode>()) {
-    binary = "GT";
-  } else if (expr.as<tirx::GENode>()) {
-    binary = "GE";
-  } else if (expr.as<tirx::AndNode>()) {
-    binary = "And";
-  } else if (expr.as<tirx::OrNode>()) {
-    binary = "Or";
-  }
-  if (binary != nullptr) {
-    *out += binary;
-    *out += "(";
-    PrimExpr a;
-    PrimExpr b;
-    if (const auto* op = expr.as<tirx::AddNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::SubNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::MulNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::DivNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::ModNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::FloorDivNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::FloorModNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::MinNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::MaxNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::EQNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::NENode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::LTNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::LENode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::GTNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::GENode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::AndNode>()) {
-      a = op->a; b = op->b;
-    } else if (const auto* op = expr.as<tirx::OrNode>()) {
-      a = op->a; b = op->b;
-    }
-    ExprKeyInto(a, out);
-    *out += ",";
-    ExprKeyInto(b, out);
-    *out += ")";
+  // Binary / comparison nodes: one generic builder, only the type list below.
+  if (ExprKeyBinary<tirx::AddNode>(expr, out) ||
+      ExprKeyBinary<tirx::SubNode>(expr, out) ||
+      ExprKeyBinary<tirx::MulNode>(expr, out) ||
+      ExprKeyBinary<tirx::DivNode>(expr, out) ||
+      ExprKeyBinary<tirx::ModNode>(expr, out) ||
+      ExprKeyBinary<tirx::FloorDivNode>(expr, out) ||
+      ExprKeyBinary<tirx::FloorModNode>(expr, out) ||
+      ExprKeyBinary<tirx::MinNode>(expr, out) ||
+      ExprKeyBinary<tirx::MaxNode>(expr, out) ||
+      ExprKeyBinary<tirx::EQNode>(expr, out) ||
+      ExprKeyBinary<tirx::NENode>(expr, out) ||
+      ExprKeyBinary<tirx::LTNode>(expr, out) ||
+      ExprKeyBinary<tirx::LENode>(expr, out) ||
+      ExprKeyBinary<tirx::GTNode>(expr, out) ||
+      ExprKeyBinary<tirx::GENode>(expr, out) ||
+      ExprKeyBinary<tirx::AndNode>(expr, out) ||
+      ExprKeyBinary<tirx::OrNode>(expr, out)) {
     return;
   }
   if (const auto* op = expr.as<tirx::NotNode>()) {
@@ -924,14 +895,14 @@ class Emitter {
     if (node->is_uniform) {
       PrimExpr lane_count = tirx::Select(Scalar(node), IntImm32(plan_->lanes), IntImm32(0));
       mask = Bind(UpdateMask(lane_count, bits), &lets_);
-    } else if (node->recipe == "pnot") {
+    } else if (node->id == ValueRecipe::kPnot) {
       mask = Bind(MethodMask(simd_pnot(), {Predicate(Downcast<ValueNode>(node->args[0]), bits),
                                            AllMask(bits)}),
                   &lets_);
-    } else if (node->recipe == "pand") {
+    } else if (node->id == ValueRecipe::kPand) {
       mask = PredicateCombine(Predicate(Downcast<ValueNode>(node->args[0]), bits),
                               Predicate(Downcast<ValueNode>(node->args[1]), bits), bits);
-    } else if (node->recipe == "por") {
+    } else if (node->id == ValueRecipe::kPor) {
       mask = Bind(MethodMask(simd_por(), {Predicate(Downcast<ValueNode>(node->args[0]), bits),
                                           Predicate(Downcast<ValueNode>(node->args[1]), bits),
                                           AllMask(bits)}),
@@ -1018,16 +989,16 @@ class Emitter {
   /* -- scalar operands -------------------------------------------------- */
   PrimExpr Scalar(const ValueNode& node) {
     const std::string& recipe = node->recipe;
-    if (recipe == "imm" || recipe == "uniform_expr") {
+    if (node->id == ValueRecipe::kImm || node->id == ValueRecipe::kUniformExpr) {
       if (!node->scalar.has_value()) {
         throw Unsupported("cannot scalarize vector value '" + recipe + "'");
       }
       return *node->scalar;
     }
-    if (recipe == "uniform_load") {
+    if (node->id == ValueRecipe::kUniformLoad) {
       return Addr(*node->access, /*uniform=*/true);
     }
-    if (recipe == "vbrc") {
+    if (node->id == ValueRecipe::kVbrc) {
       return Scalar(Downcast<ValueNode>(node->args[0]));
     }
     throw Unsupported("cannot scalarize vector value '" + recipe + "'");
@@ -1059,7 +1030,7 @@ class Emitter {
   }
 
   void NoteStore(const StorePlan& store, const PrimExpr& value) {
-    if (AccessClassFromName(store->kind_value.operator std::string()) == AccessClass::kContiguous) {
+    if (store->kind == AccessClass::kContiguous) {
       forward_[CachedBufferKey(store->spec->buffer) + "^" + IndexKey(store->spec->indices)] = value;
     }
   }
@@ -1131,7 +1102,9 @@ class Emitter {
     const std::string& key = CachedValueKey(node);
     auto it = promoted_.find(key);
     if (it != promoted_.end()) return it->second;
-    if (IsScalarOnlyRecipe(node->recipe.operator std::string())) return Dup(node);
+    if (node->id == ValueRecipe::kImm || node->id == ValueRecipe::kUniformExpr) {
+      return Dup(node);
+    }
     return Value(node);
   }
 
@@ -1286,159 +1259,155 @@ class Emitter {
 };
 
 PrimExpr Emitter::Build(const ValueNode& node) {
-  const std::string& recipe = node->recipe;
   const std::vector<ValueNode> args = ArgsOf(node);
+  const std::string dtype = node->dtype.operator std::string();
 
-  if (recipe == "imm") {
-    if (!node->scalar.has_value()) {
-      throw Unsupported("cannot scalarize vector value 'imm'");
+  // Dispatch on the *family*, never on the individual recipe: a new op of an
+  // existing family is a table row in value.cc / SimdOpTable(), not a new case.
+  switch (ValueRecipeInfoOf(node->id).family) {
+    case ValueRecipeFamily::kImm:
+      if (!node->scalar.has_value()) {
+        throw Unsupported("cannot scalarize vector value 'imm'");
+      }
+      return *node->scalar;
+    case ValueRecipeFamily::kLaneIndex: {
+      // Absolute lane value = chunk base + lane id (lane-varying compares).
+      std::string elem = ElemDtype(dtype);
+      auto key = std::make_pair(PrintExpr(lane_base_), elem);
+      auto it = vci_.find(key);
+      if (it != vci_.end()) return it->second;
+      tirx::Var var = Bind(Vci(lane_base_, elem), &lets_);
+      vci_[key] = var;
+      return var;
     }
-    return *node->scalar;
-  }
-  if (recipe == "lane_index") {
-    // Absolute lane value = chunk base + lane id (lane-varying compares).
-    std::string elem = ElemDtype(node->dtype.operator std::string());
-    auto key = std::make_pair(PrintExpr(lane_base_), elem);
-    auto it = vci_.find(key);
-    if (it != vci_.end()) return it->second;
-    tirx::Var var = Bind(Vci(lane_base_, elem), &lets_);
-    vci_[key] = var;
-    return var;
-  }
-  if (recipe == "reg_load") {
-    // Fragment register read: no memory instruction at all.
-    return RegisterRead(*node->access);
-  }
-  if (recipe == "vload") {
-    std::string fwd_key = CachedBufferKey((*node->access)->buffer) + "^" +
-                          IndexKey((*node->access)->indices);
-    auto fwd = forward_.find(fwd_key);
-    if (fwd != forward_.end() &&
-        ffi::DLDataTypeToString(fwd->second.dtype()).operator std::string() ==
-            node->dtype.operator std::string()) {
-      return fwd->second;
+    case ValueRecipeFamily::kRegLoad:
+      // Fragment register read: no memory instruction at all.
+      return RegisterRead(*node->access);
+    case ValueRecipeFamily::kVLoad: {
+      std::string fwd_key =
+          CachedBufferKey((*node->access)->buffer) + "^" + IndexKey((*node->access)->indices);
+      auto fwd = forward_.find(fwd_key);
+      if (fwd != forward_.end() &&
+          ffi::DLDataTypeToString(fwd->second.dtype()).operator std::string() == dtype) {
+        return fwd->second;
+      }
+      if (!masked_tail_ && !PredicateOf(node).defined()) {
+        PrimExpr carried = CarryEntryLookup(fwd_key, dtype);
+        if (carried.defined()) return carried;
+      }
+      int bits = MaskBits(dtype);
+      PrimExpr mask = LoadGuard(node, bits);
+      if (pair_ != nullptr && !mask.defined()) {
+        // De-interleaved pair domain: one ``vld2`` replaces the two contiguous
+        // loads (and the explicit ``vdintlv`` the merge would need).
+        return PairStream(*node->access);
+      }
+      if (!mask.defined()) {
+        return Bind(Vld(Addr(*node->access), (*node->access)->buffer, "NORM"), &lets_);
+      }
+      // vld has no predicate form: the tail/guard case degrades to a masked
+      // vgather2 with the relative lane offsets (D10 / P0-3).
+      return Bind(Vgather2(Addr(*node->access), (*node->access)->buffer,
+                           Vci(IntImm32(0), "uint32"), mask),
+                  &lets_);
     }
-    if (!masked_tail_ && !PredicateOf(node).defined()) {
-      PrimExpr carried = CarryEntryLookup(fwd_key, node->dtype.operator std::string());
-      if (carried.defined()) return carried;
+    case ValueRecipeFamily::kVLoadStrided: {
+      AxisClass classified = AxisClassOf(*node->access, plan_->vector_axis);
+      int bits = MaskBits(dtype);
+      PrimExpr guard = LoadGuard(node, bits);
+      if (!guard.defined()) guard = AllMask(bits);
+      PrimExpr index = Ramp(classified.stride.value_or(0), RampMask(bits));
+      return Bind(
+          Vgather2(Addr(*node->access), (*node->access)->buffer, index, guard), &lets_);
     }
-    int bits = MaskBits(node->dtype.operator std::string());
-    PrimExpr mask = LoadGuard(node, bits);
-    if (pair_ != nullptr && !mask.defined()) {
-      // De-interleaved pair domain: one ``vld2`` replaces the two contiguous
-      // loads (and the explicit ``vdintlv`` the merge would need).
-      return PairStream(*node->access);
+    case ValueRecipeFamily::kGather: {
+      int bits = MaskBits(dtype);
+      PrimExpr mask = LoadGuard(node, bits);
+      if (!mask.defined()) mask = AllMask(bits);
+      PrimExpr index = UnsignedIndex(Value(args[0]));
+      return Bind(Vgather2(IndexAddr(*node->access), (*node->access)->buffer, index, mask),
+                  &lets_);
     }
-    if (!mask.defined()) {
-      return Bind(Vld(Addr(*node->access), (*node->access)->buffer, "NORM"), &lets_);
-    }
-    // vld has no predicate form: the tail/guard case degrades to a masked
-    // vgather2 with the relative lane offsets (D10 / P0-3).
-    return Bind(Vgather2(Addr(*node->access), (*node->access)->buffer, Vci(IntImm32(0), "uint32"),
-                         mask),
-                &lets_);
-  }
-  if (recipe == "vload_strided") {
-    AxisClass classified = AxisClassOf(*node->access, plan_->vector_axis);
-    int bits = MaskBits(node->dtype.operator std::string());
-    PrimExpr guard = LoadGuard(node, bits);
-    if (!guard.defined()) guard = AllMask(bits);
-    PrimExpr index = Ramp(classified.stride.value_or(0), RampMask(bits));
-    return Bind(
-        Vgather2(Addr(*node->access), (*node->access)->buffer, index, guard), &lets_);
-  }
-  if (recipe == "gather") {
-    int bits = MaskBits(node->dtype.operator std::string());
-    PrimExpr mask = LoadGuard(node, bits);
-    if (!mask.defined()) mask = AllMask(bits);
-    PrimExpr index = UnsignedIndex(Value(args[0]));
-    return Bind(Vgather2(IndexAddr(*node->access), (*node->access)->buffer, index, mask), &lets_);
-  }
-  if (recipe == "uniform_load" || recipe == "uniform_expr" || recipe == "vbrc") {
-    ValueNode operand = recipe == "vbrc" ? args[0] : node;
-    return Dup(operand);
-  }
-  const std::string recipe_str = recipe;
-  if (IsScalarVectorRecipe(recipe_str) && args.size() == 2) {
-    // Scalar-vector variant: the "scalar" operand may already be a promoted
-    // vector register (a local.var accumulator), in which case the vector-vector
-    // form is required.
-    PrimExpr vector = Value(args[0]);
-    const std::string& operand_key = CachedValueKey(args[1]);
-    auto promoted = memo_.find(operand_key);
-    if (promoted != memo_.end()) {
-      const Op& op = BinaryOp(ScalarToVectorBinary(recipe_str));
-      return Bind(SimdCall(op, DataTypeOf(node->dtype.operator std::string()),
-                           {vector, promoted->second, ArithMask(node->dtype.operator std::string()),
+    case ValueRecipeFamily::kUniform:
+      return Dup(node);
+    case ValueRecipeFamily::kVbrc:
+      return Dup(args[0]);
+    case ValueRecipeFamily::kScalarVectorBinary: {
+      if (args.size() != 2) break;
+      // Scalar-vector variant: the "scalar" operand may already be a promoted
+      // vector register (a local.var accumulator), in which case the vector-vector
+      // form is required.
+      PrimExpr vector = Value(args[0]);
+      const std::string& operand_key = CachedValueKey(args[1]);
+      auto promoted = memo_.find(operand_key);
+      if (promoted != memo_.end()) {
+        return Bind(SimdCall(SimdOpOf(VectorVariantOf(node->id)), DataTypeOf(dtype),
+                             {vector, promoted->second, ArithMask(dtype),
+                              StrImm(ModeZeroing())}),
+                    &lets_);
+      }
+      return Bind(SimdCall(SimdOpOf(node->id), DataTypeOf(dtype),
+                           {vector, Scalar(args[1]), ArithMask(dtype),
                             StrImm(ModeZeroing())}),
                   &lets_);
     }
-    return Bind(SimdCall(ScalarBinaryOp(recipe_str),
-                         DataTypeOf(node->dtype.operator std::string()),
-                         {vector, Scalar(args[1]), ArithMask(node->dtype.operator std::string()),
-                          StrImm(ModeZeroing())}),
-                &lets_);
+    case ValueRecipeFamily::kScalarVectorField:
+      return Bind(SimdCall(SimdOpOf(node->id), DataTypeOf(dtype),
+                           {Value(args[0]), *node->scalar, ArithMask(dtype),
+                            StrImm(ModeZeroing())}),
+                  &lets_);
+    case ValueRecipeFamily::kElementwiseUnary:
+      if (args.size() != 1) break;
+      return Bind(SimdCall(SimdOpOf(node->id), DataTypeOf(dtype),
+                           {Value(args[0]), ArithMask(dtype), StrImm(ModeZeroing())}),
+                  &lets_);
+    case ValueRecipeFamily::kElementwiseBinary:
+      if (args.size() != 2) break;
+      return Bind(SimdCall(SimdOpOf(node->id), DataTypeOf(dtype),
+                           {Value(args[0]), Value(args[1]), ArithMask(dtype),
+                            StrImm(ModeZeroing())}),
+                  &lets_);
+    case ValueRecipeFamily::kVcmp:
+      return Bind(SimdCall(simd_vcmp(), BoolMaskDtype(),
+                           {Value(args[0]), Value(args[1]),
+                            DataMask(args[0]->dtype.operator std::string()),
+                            StrImm(node->detail.operator std::string())}),
+                  &lets_);
+    case ValueRecipeFamily::kVcmps:
+      return Bind(SimdCall(simd_vcmps(), BoolMaskDtype(),
+                           {Value(args[0]), Scalar(args[1]),
+                            DataMask(args[0]->dtype.operator std::string()),
+                            StrImm(node->detail.operator std::string())}),
+                  &lets_);
+    case ValueRecipeFamily::kVsel: {
+      // args = [cond, true, false]; vsel order is (t, f, mask).
+      PrimExpr true_value = VectorOperand(args[1]);
+      PrimExpr false_value = VectorOperand(args[2]);
+      int bits = MaskBits(ElemDtype(dtype));
+      return Bind(SimdCall(simd_vsel(), DataTypeOf(dtype),
+                           {true_value, false_value, Predicate(args[0], bits)}),
+                  &lets_);
+    }
+    case ValueRecipeFamily::kPredicateBinary: {
+      const Op& op = node->id == ValueRecipe::kPand ? simd_pand() : simd_por();
+      return Bind(MethodMask(op, {Value(args[0]), Value(args[1]), AllMask(kPredicateMaskBits)}),
+                  &lets_);
+    }
+    case ValueRecipeFamily::kPredicateNot:
+      return Bind(MethodMask(simd_pnot(), {Value(args[0]), AllMask(kPredicateMaskBits)}),
+                  &lets_);
+    case ValueRecipeFamily::kVcvt: {
+      PrimExpr src = Value(args[0]);
+      std::string target = node->detail.operator std::string();
+      int bits = std::min(
+          MaskBits(ffi::DLDataTypeToString(src.dtype()).operator std::string()),
+          MaskBits(target));
+      return Bind(Vcvt(src, target, AllMask(bits)), &lets_);
+    }
+    case ValueRecipeFamily::kUnknown:
+      break;
   }
-  if (recipe == "vshrs" || recipe == "vshls") {
-    return Bind(SimdCall(ScalarBinaryOp(recipe_str),
-                         DataTypeOf(node->dtype.operator std::string()),
-                         {Value(args[0]), *node->scalar,
-                          ArithMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
-                &lets_);
-  }
-  if (IsElementwiseUnaryRecipe(recipe_str) && args.size() == 1) {
-    return Bind(SimdCall(UnaryOp(recipe_str),
-                         DataTypeOf(node->dtype.operator std::string()),
-                         {Value(args[0]), ArithMask(node->dtype.operator std::string()),
-                          StrImm(ModeZeroing())}),
-                &lets_);
-  }
-  if (IsElementwiseBinaryRecipe(recipe_str) && args.size() == 2) {
-    return Bind(SimdCall(BinaryOp(recipe_str),
-                         DataTypeOf(node->dtype.operator std::string()),
-                         {Value(args[0]), Value(args[1]),
-                          ArithMask(node->dtype.operator std::string()), StrImm(ModeZeroing())}),
-                &lets_);
-  }
-  if (recipe == "vcmp") {
-    return Bind(SimdCall(simd_vcmp(), BoolMaskDtype(),
-                         {Value(args[0]), Value(args[1]), DataMask(args[0]->dtype.operator std::string()),
-                          StrImm(node->detail.operator std::string())}),
-                &lets_);
-  }
-  if (recipe == "vcmps") {
-    return Bind(SimdCall(simd_vcmps(), BoolMaskDtype(),
-                         {Value(args[0]), Scalar(args[1]),
-                          DataMask(args[0]->dtype.operator std::string()),
-                          StrImm(node->detail.operator std::string())}),
-                &lets_);
-  }
-  if (recipe == "vsel") {
-    // args = [cond, true, false]; vsel order is (t, f, mask).
-    PrimExpr true_value = VectorOperand(args[1]);
-    PrimExpr false_value = VectorOperand(args[2]);
-    int bits = MaskBits(ElemDtype(node->dtype.operator std::string()));
-    return Bind(SimdCall(simd_vsel(),
-                         DataTypeOf(node->dtype.operator std::string()),
-                         {true_value, false_value, Predicate(args[0], bits)}),
-                &lets_);
-  }
-  if (recipe == "pand" || recipe == "por") {
-    const Op& op = recipe == "pand" ? simd_pand() : simd_por();
-    return Bind(MethodMask(op, {Value(args[0]), Value(args[1]), AllMask(kPredicateMaskBits)}),
-                &lets_);
-  }
-  if (recipe == "pnot") {
-    return Bind(MethodMask(simd_pnot(), {Value(args[0]), AllMask(kPredicateMaskBits)}), &lets_);
-  }
-  if (recipe == "vcvt") {
-    PrimExpr src = Value(args[0]);
-    std::string target = node->detail.operator std::string();
-    int bits = std::min(MaskBits(ffi::DLDataTypeToString(src.dtype()).operator std::string()),
-                        MaskBits(target));
-    return Bind(Vcvt(src, target, AllMask(bits)), &lets_);
-  }
-  throw Unsupported("no emitter for value recipe '" + recipe + "'");
+  throw Unsupported("no emitter for value recipe '" + node->recipe.operator std::string() + "'");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1516,16 +1485,16 @@ void EmitRegisterWrite(const StorePlan& store, Emitter* emitter, int bits,
 }
 
 void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const PrimExpr& mask) {
-  if (store->storage.operator std::string() == "register") {
+  if (store->storage_id == StoreStorage::kRegister) {
     EmitRegisterWrite(store, emitter, bits, StoreNeedsMerge(store, emitter, bits));
     return;
   }
   PrimExpr value = emitter->VectorOperand(store->value);
-  bool uniform = AccessClassFromName(store->kind_value.operator std::string()) ==
+  bool uniform = store->kind ==
                  AccessClass::kUniform;
-  const std::string lane_mode = store->store_lane_mode.operator std::string();
-  if (store->layout_kind.operator std::string() == "nz") {
-    if (lane_mode != "full") {
+  const StoreLaneMode lane_mode = store->lane_mode_id;
+  if (store->layout_id == StoreLayoutKind::kNz) {
+    if (lane_mode != StoreLaneMode::kFull) {
       // Only the paired emitter widens a half-register source into a full one
       // (``EmitPackedNzStore``); scattering it here would write stale lanes.
       throw Unsupported("a half-register NZ store must be emitted in the paired form");
@@ -1543,12 +1512,13 @@ void EmitVectorWrite(const StorePlan& store, Emitter* emitter, int bits, const P
     return;
   }
   std::string dist;
-  if (lane_mode == "pk_half" || lane_mode == "pk_quarter") {
+  if (lane_mode == StoreLaneMode::kPkHalf || lane_mode == StoreLaneMode::kPkQuarter) {
     // Mixed element widths: the value register is wider than the chunk, so the
     // store must write exactly ``plan.lanes`` elements through the packed form
     // (verified cast-kernel recipe: ``vcvt`` with ``PART_EVEN`` + ``PK_B*``).
     int64_t pack_bits = store->store_pack_bits.has_value() ? *store->store_pack_bits : bits;
-    dist = (lane_mode == "pk_half" ? "PK_B" : "PK4_B") + std::to_string(pack_bits);
+    dist = (lane_mode == StoreLaneMode::kPkHalf ? "PK_B" : "PK4_B") +
+           std::to_string(pack_bits);
   } else {
     dist = (uniform ? "ONEPT_B" : "NORM_B") + std::to_string(bits);
   }
@@ -1632,18 +1602,22 @@ void EmitPackedNzStore(const StorePlan& store, Emitter* even, const PrimExpr& ev
  */
 bool LaneLocalValue(const ValueNode& node) {
   if (!node.defined() || node->predicate.has_value()) return false;
-  const std::string recipe = node->recipe.operator std::string();
-  if (recipe == "imm" || recipe == "uniform_expr" || recipe == "uniform_load" ||
-      recipe == "vbrc" || recipe == "vload") {
-    return true;
-  }
-  if (recipe == "vcvt" && node->args.size() == 1) {
-    return LaneLocalValue(Downcast<ValueNode>(node->args[0]));
+  switch (ValueRecipeInfoOf(node->id).family) {
+    case ValueRecipeFamily::kImm:
+    case ValueRecipeFamily::kUniform:
+    case ValueRecipeFamily::kVbrc:
+    case ValueRecipeFamily::kVLoad:
+      return true;
+    case ValueRecipeFamily::kVcvt:
+      return node->args.size() == 1 &&
+             LaneLocalValue(Downcast<ValueNode>(node->args[0]));
+    default:
+      break;
   }
   // Scalar-vector recipes carry the scalar as the second argument node.
-  const bool unary = IsElementwiseUnaryRecipe(recipe) && node->args.size() == 1;
-  const bool binary = IsElementwiseBinaryRecipe(recipe) && node->args.size() == 2;
-  const bool scalar_binary = IsScalarVectorRecipe(recipe) && node->args.size() == 2;
+  const bool unary = IsElementwiseUnary(node->id) && node->args.size() == 1;
+  const bool binary = IsElementwiseBinary(node->id) && node->args.size() == 2;
+  const bool scalar_binary = IsScalarVectorBinary(node->id) && node->args.size() == 2;
   if (!unary && !binary && !scalar_binary) return false;
   for (const ffi::ObjectRef& arg : node->args) {
     if (!LaneLocalValue(Downcast<ValueNode>(arg))) return false;
@@ -1654,7 +1628,7 @@ bool LaneLocalValue(const ValueNode& node) {
 /*! \brief Whether a whole chunk pair can be emitted in the de-interleaved domain. */
 bool PairDomainAllowed(const VectorPlan& plan, const StorePlan& packed) {
   for (const StorePlan& store : plan->stores) {
-    if (store->kind_value != AccessClassName(AccessClass::kContiguous)) return false;
+    if (store->kind != AccessClass::kContiguous) return false;
     if (store->mask.has_value()) return false;
     if (!store.same_as(packed) &&
         store->store_lane_mode.operator std::string() != "full") {
@@ -1696,7 +1670,7 @@ void EmitStore(const VectorPlan& plan, const StorePlan& store, Emitter* emitter)
   std::string elem = ElemDtype(store->spec->buffer->dtype);
   int bits = MaskBits(elem);
   PrimExpr mask = StoreMask(store, emitter, bits);
-  AccessClass kind = AccessClassFromName(store->kind_value.operator std::string());
+  AccessClass kind = store->kind;
 
   if (kind == AccessClass::kContiguous || kind == AccessClass::kUniform) {
     EmitVectorWrite(store, emitter, bits, mask);
@@ -1719,7 +1693,7 @@ void EmitStore(const VectorPlan& plan, const StorePlan& store, Emitter* emitter)
 
   if (!store->index.has_value()) {
     throw Unsupported("no per-lane index vector for a " +
-                      store->kind_value.operator std::string() + " store");
+                      AccessClassName(store->kind) + " store");
   }
   PrimExpr index = UnsignedIndex(emitter->Value(*store->index));
   emitter->lets_.push_back(
@@ -1729,11 +1703,11 @@ void EmitStore(const VectorPlan& plan, const StorePlan& store, Emitter* emitter)
 }
 
 void EmitOuterStore(const StorePlan& store, Emitter* emitter) {
-  AccessClass kind = AccessClassFromName(store->kind_value.operator std::string());
+  AccessClass kind = store->kind;
   if (kind != AccessClass::kUniform) {
     throw Unsupported(
         "a statement outside the serial loop must be uniform along the vector axis (got " +
-        store->kind_value.operator std::string() + ")");
+        AccessClassName(store->kind) + ")");
   }
   std::string elem = ElemDtype(store->spec->buffer->dtype);
   int bits = MaskBits(elem);
@@ -2280,18 +2254,24 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
 /* reduction emission                                                        */
 /* ------------------------------------------------------------------------- */
 
+/*! \brief Typed elementwise op that combines two registers in a reduction. */
+ValueRecipe ReduceElementRecipe(const ReduceInfo& reduce) {
+  std::string element_op;
+  ReduceElementFor(reduce->recipe.operator std::string(), &element_op);
+  return ValueRecipeFromName(element_op);
+}
+
 void EmitReduceTail(const StorePlan& store, Emitter* emitter, const ReduceInfo& reduce,
                     const std::string& elem, int bits, PrimExpr acc) {
   PrimExpr lane0 = emitter->Lane0Mask(bits);
   if (reduce->accumulate) {
-    std::string element_op;
-    ReduceElementFor(reduce->recipe.operator std::string(), &element_op);
+    const ValueRecipe element_op = ReduceElementRecipe(reduce);
     PrimExpr old = emitter->Addr(store->access, /*uniform=*/true);
     std::string acc_elem =
         ElemDtype(ffi::DLDataTypeToString(acc.dtype()).operator std::string());
     if (acc_elem == elem) {
       acc = emitter->Bind(
-          SimdCall(ScalarBinaryOp(VecScalarBinary(element_op)),
+          SimdCall(SimdOpOf(ScalarVariantOf(element_op)),
                    DataTypeOf(ffi::DLDataTypeToString(acc.dtype()).operator std::string()),
                    {acc, old, lane0, StrImm(ModeZeroing())}),
           &emitter->lets_);
@@ -2299,7 +2279,7 @@ void EmitReduceTail(const StorePlan& store, Emitter* emitter, const ReduceInfo& 
       PrimExpr old_vec = emitter->Bind(
           Vld(old, store->spec->buffer, "BRC_B" + std::to_string(bits)), &emitter->lets_);
       acc = emitter->Bind(
-          SimdCall(BinaryOp(element_op),
+          SimdCall(SimdOpOf(element_op),
                    DataTypeOf(ffi::DLDataTypeToString(acc.dtype()).operator std::string()),
                    {acc, old_vec, lane0, StrImm(ModeZeroing())}),
           &emitter->lets_);
@@ -2335,8 +2315,7 @@ void EmitReduceUnrolled(const VectorPlan& plan, const StorePlan& store, Emitter*
   std::string elem = ElemDtype(store->spec->buffer->dtype);
   int bits = MaskBits(elem);
   PrimExpr mask = emitter->AllMask(bits);
-  std::string element_op;
-  ReduceElementFor(reduce->recipe.operator std::string(), &element_op);
+  const ValueRecipe element_op = ReduceElementRecipe(reduce);
 
   bool has_tail = plan->tail.has_value() && *plan->tail != 0;
   PrimExpr fill;
@@ -2362,7 +2341,7 @@ void EmitReduceUnrolled(const VectorPlan& plan, const StorePlan& store, Emitter*
     std::vector<PrimExpr> merged;
     for (size_t k = 0; k + 1 < chains.size(); k += 2) {
       merged.push_back(emitter->Bind(
-          SimdCall(BinaryOp(element_op),
+          SimdCall(SimdOpOf(element_op),
                    DataTypeOf(ffi::DLDataTypeToString(chains[k].dtype()).operator std::string()),
                    {chains[k], chains[k + 1], lane0, StrImm(ModeZeroing())}),
           &emitter->lets_));
@@ -2379,8 +2358,7 @@ void EmitReduceLoop(const VectorPlan& plan, const StorePlan& store, Emitter* emi
   std::string elem = ElemDtype(store->spec->buffer->dtype);
   int bits = MaskBits(elem);
   PrimExpr mask = emitter->AllMask(bits);
-  std::string element_op;
-  ReduceElementFor(reduce->recipe.operator std::string(), &element_op);
+  const ValueRecipe element_op = ReduceElementRecipe(reduce);
   PrimExpr identity = ReduceIdentity(reduce->recipe.operator std::string(), elem);
 
   tirx::Buffer acc = tirx::decl_buffer(
@@ -2407,7 +2385,7 @@ void EmitReduceLoop(const VectorPlan& plan, const StorePlan& store, Emitter* emi
     PrimExpr reduced = EmitReduceChunk(plan, store, &body, reduce, bits, mask, fill);
     PrimExpr lane0 = emitter->Lane0Mask(bits);
     PrimExpr total = body.Bind(
-        SimdCall(BinaryOp(element_op),
+        SimdCall(SimdOpOf(element_op),
                  DataTypeOf(ffi::DLDataTypeToString(reduced.dtype()).operator std::string()),
                  {tirx::BufferLoad(acc, {IntImm32(0)}), reduced, lane0, StrImm(ModeZeroing())}),
         &body.lets_);
@@ -2543,8 +2521,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
       auto fold_it = folded.find(store.get());
       if (fold_it != folded.end()) {
         init = body_emitter.Dup(fold_it->second->value);
-      } else if (AccessClassFromName(store->kind_value.operator std::string()) ==
-                 AccessClass::kContiguous) {
+      } else if (store->kind == AccessClass::kContiguous) {
         init = body_emitter.Value(old);
       } else {
         init = body_emitter.Dup(old);
@@ -2583,8 +2560,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
       PrimExpr value = tirx::BufferLoad(acc, {IntImm32(0)});
       if (superseded.count(store.get()) == 0) {
         int bits = MaskBits(ElemDtype(store->spec->buffer->dtype));
-        if (AccessClassFromName(store->kind_value.operator std::string()) ==
-            AccessClass::kContiguous) {
+        if (store->kind == AccessClass::kContiguous) {
           PrimExpr mask = StoreMask(store, &body_emitter, bits);
           body_emitter.lets_.push_back(tirx::Evaluate(
               Vsts(body_emitter.Addr(store->access), store->spec->buffer, value, mask,
@@ -2606,8 +2582,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
         if (!HasHoisted(hoisted, axis)) before_axis_hoisted = false;
       }
       if (carry != nullptr && superseded.count(store.get()) == 0 && !store->mask.has_value() &&
-          AccessClassFromName(store->kind_value.operator std::string()) ==
-              AccessClass::kContiguous &&
+          store->kind == AccessClass::kContiguous &&
           plan->chunks.has_value() && *plan->chunks == 1 &&
           !(plan->tail.has_value() && *plan->tail != 0) && before_axis_hoisted) {
         body_emitter.RegisterCarry(store, value, plan->vector_axis->var);

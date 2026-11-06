@@ -9,9 +9,11 @@ without any re-construction. Only two derived members need a Python-side helper:
   reflected field would shadow a Python property of the same name;
 * :meth:`AccessInfo.axis_class` — a method, forwarded to the C++ side.
 
-Rejections arrive as ``{"ok": False, "message": ..., "diagnostics": [...]}`` and
-are re-raised as :class:`Unsupported` with the exact same text and diagnostic
-order (D3).
+Rejections arrive as
+``{"ok": False, "code": ..., "message": ..., "diagnostics": [...]}`` and are
+re-raised as :class:`Unsupported` carrying the same reason code, text and
+diagnostic order (D3). Assert on :attr:`Unsupported.code`; the message text is
+free to change.
 
 The two value types below are the only Python-owned definitions: an enum and an
 exception cannot cross the FFI boundary as objects, so they mirror the C++
@@ -56,14 +58,23 @@ class AccessClass(str, enum.Enum):
 class Unsupported(Exception):
     """Raised when a nest cannot be vectorized; carries the diagnostic reason(s).
 
+    ``code`` 是稳定的拒绝类别（如 ``body.nested_loop``、``plan.no_vector_axis``），
+    测试应断言它而不是英文文案；尚未分类的拒绝统一为 ``"unsupported"``。
     ``diagnostics`` 收集本次规划过程中**全部卡点**（每根候选轴的分类摘要与失败
     原因），这样上层能一次性看到所有阻碍，而不是只拿到第一个失败原因（改进 7）。
     ``build_plan`` 会填充它；直接 ``str(err)`` 仍然是单行摘要。
     """
 
-    def __init__(self, message: str, *, diagnostics: list[str] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: list[str] | None = None,
+        code: str = "unsupported",
+    ):
         super().__init__(message)
         self.diagnostics: list[str] = list(diagnostics or [])
+        self.code: str = code
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +139,11 @@ class VectorProgram(Node):
 
 
 def _raise(result) -> None:
-    raise Unsupported(result["message"], diagnostics=list(result["diagnostics"]))
+    raise Unsupported(
+        result["message"],
+        diagnostics=list(result["diagnostics"]),
+        code=result["code"],
+    )
 
 
 def build_plan(stmt, lanes=None, layouts=None, vf_alloc_scope=None):

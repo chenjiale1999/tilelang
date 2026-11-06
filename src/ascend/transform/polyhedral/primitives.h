@@ -37,17 +37,26 @@ namespace polyhedral {
  */
 class Unsupported : public std::exception {
  public:
+  /*! \brief Code of a rejection that has not been classified yet. */
+  static constexpr const char* kDefaultCode = "unsupported";
+
   explicit Unsupported(std::string message,
-                       std::vector<std::string> diagnostics = {})
-      : message_(std::move(message)), diagnostics_(std::move(diagnostics)) {}
+                       std::vector<std::string> diagnostics = {},
+                       std::string code = kDefaultCode)
+      : message_(std::move(message)),
+        diagnostics_(std::move(diagnostics)),
+        code_(std::move(code)) {}
 
   const char* what() const noexcept override { return message_.c_str(); }
   const std::string& message() const { return message_; }
   const std::vector<std::string>& diagnostics() const { return diagnostics_; }
+  /*! \brief Stable reason code; free-form ``message`` must not be matched on. */
+  const std::string& code() const { return code_; }
 
  private:
   std::string message_;
   std::vector<std::string> diagnostics_;
+  std::string code_;
 };
 
 /*! \brief Hardware predicate dtype: every ``T.simd.*`` predicate is boolx256. */
@@ -129,23 +138,10 @@ bool ComparePredFor(const std::string& name_lower, std::string* pred);
 bool BoolBinaryRecipeFor(const std::string& name_lower, std::string* recipe);
 /*! \brief Boolean unary recipe keyed by lower-cased tail (pnot). */
 bool BoolUnaryRecipeFor(const std::string& name_lower, std::string* recipe);
-/*! \brief Whether ``recipe`` is one of the elementwise unary recipes. */
-bool IsElementwiseUnaryRecipe(const std::string& recipe);
-/*! \brief Whether ``recipe`` is one of the elementwise binary recipes. */
-bool IsElementwiseBinaryRecipe(const std::string& recipe);
-/*! \brief Whether ``recipe`` is one of the scalar-vector binary recipes. */
-bool IsScalarVectorRecipe(const std::string& recipe);
-
 /*! \brief Vector -> scalar-vector variant (vadd -> vadds); empty when none. */
 std::string VecScalarBinary(const std::string& recipe);
-/*! \brief Scalar-vector -> vector variant (vadds -> vadd); empty when none. */
-std::string ScalarToVectorBinary(const std::string& recipe);
 /*! \brief Predicate flip when the operands of a comparison are swapped. */
 std::string CompareFlip(const std::string& pred);
-/*! \brief Whether a recipe carries a lane-uniform (scalar) value. */
-bool IsUniformRecipe(const std::string& recipe);
-/*! \brief Whether a recipe only carries a scalar and needs ``vdup`` first. */
-bool IsScalarOnlyRecipe(const std::string& recipe);
 /*! \brief Whether the tail is an atomic op (``tl.atomic_add`` ...). */
 bool IsAtomicName(const std::string& tail);
 /*! \brief Whether ``node_name`` is an allowed index-vector operator. */

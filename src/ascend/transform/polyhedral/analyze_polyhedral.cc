@@ -40,6 +40,7 @@ namespace {
 ffi::Map<ffi::String, ffi::Any> MakeError(const Unsupported& error) {
   ffi::Map<ffi::String, ffi::Any> result;
   result.Set("ok", ffi::Any(false));
+  result.Set("code", ffi::Any(ffi::String(error.code())));
   result.Set("message", ffi::Any(ffi::String(error.message())));
   ffi::Array<ffi::String> diagnostics;
   for (const std::string& note : error.diagnostics()) {
@@ -180,7 +181,7 @@ std::vector<std::string> RenderSinglePlan(const VectorPlan& plan,
       const std::string storage = store->storage.operator std::string();
       if (storage != "shared") note += " storage=" + storage;
       lines.push_back(std::string(group.first) + " " + SinkText(store->spec) + " [" +
-                      store->kind_value.operator std::string() + "] mask=" +
+                      AccessClassName(store->kind) + "] mask=" +
                       (store->mask.has_value() ? "yes" : "no") + note);
       RenderValue(store->value, &lines, 1);
     }

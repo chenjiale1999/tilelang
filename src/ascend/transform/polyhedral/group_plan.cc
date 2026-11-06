@@ -80,10 +80,12 @@ VSimdItemPlan MakeVSimdReduceItemPlan(int64_t item_index, int64_t span_begin,
   return VSimdItemPlan(std::move(node));
 }
 
-VSimdGroupPlan MakeVSimdGroupPlan(int64_t group_id, std::string status) {
+VSimdGroupPlan MakeVSimdGroupPlan(int64_t group_id, VSimdPlanStatus status) {
   auto node = ffi::make_object<VSimdGroupPlanNode>();
   node->group_id = group_id;
-  node->status = ffi::String(std::move(status));
+  node->status = ffi::String(status == VSimdPlanStatus::kPlanned ? "PLANNED"
+                                                                 : "REJECTED");
+  node->status_id = status;
   return VSimdGroupPlan(std::move(node));
 }
 
@@ -92,6 +94,7 @@ VSimdGroupPlan MakeRejectedGroupPlan(int64_t group_id, std::string reason,
   auto node = ffi::make_object<VSimdGroupPlanNode>();
   node->group_id = group_id;
   node->status = ffi::String("REJECTED");
+  node->status_id = VSimdPlanStatus::kRejected;
   node->reason = ffi::String(std::move(reason));
   std::vector<ffi::String> notes;
   notes.reserve(diagnostics.size());
