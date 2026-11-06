@@ -17,6 +17,7 @@
 #include <tvm/ffi/string.h>
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "access.h"
@@ -90,6 +91,26 @@ class FragmentRegisterMap : public ffi::ObjectRef {
 };
 
 /*!
+ * \brief Non-default handling of one store relative to the loop skeleton.
+ *
+ * The array a store lives in already says whether it is a ``pre`` / ``main`` /
+ * ``post`` store, so the role only records the deviations the emitter must
+ * apply. Deciding them in the plan keeps P3 free of policy: it used to re-derive
+ * both rules (folded identity init, write-back superseded by a post), one of
+ * them twice.
+ */
+enum class StoreRole {
+  kMain = 0,        // emitted in its array's normal position
+  kPreFolded,       // pre store folded into the accumulator initial value
+  kPostSuperseded,  // main store whose write-back is taken over by a post store
+};
+
+/*! \brief ``StoreRole`` text used by reflection / diagnostics. */
+const std::string& StoreRoleName(StoreRole role);
+/*! \brief Inverse of :func:`StoreRoleName`. */
+StoreRole StoreRoleFromName(const std::string& name);
+
+/*!
  * \brief Full plan of one write: what, where, predicate / index vector, reduce.
  *
  * ``promote`` is decided once in the plan phase (same principle as the reduce
@@ -126,6 +147,8 @@ class StorePlanNode : public ffi::Object {
   // ``shared`` (normal UB store) or ``register`` (fragment register write, no
   // memory instruction at all).
   ffi::String storage{"shared"};
+  // Plan-decided handling (see ``StoreRole``); ``main`` is the default.
+  ffi::String role{"main"};
 
   static constexpr const bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StorePlan", StorePlanNode,
@@ -150,7 +173,8 @@ class StorePlanNode : public ffi::Object {
         .def_ro("layout_kind", &StorePlanNode::layout_kind)
         .def_ro("nz_block_stride", &StorePlanNode::nz_block_stride)
         .def_ro("nz_elem_stride", &StorePlanNode::nz_elem_stride)
-        .def_ro("storage", &StorePlanNode::storage);
+        .def_ro("storage", &StorePlanNode::storage)
+        .def_ro("role", &StorePlanNode::role);
   }
 };
 
@@ -206,6 +230,11 @@ class VectorPlanNode : public ffi::Object {
   int64_t lanes{0};
   ffi::Optional<int64_t> chunks;
   ffi::Optional<int64_t> tail;
+  // Live chunk window ``[chunk_lo, chunk_hi)``: chunks outside it are provably
+  // dead (every store's predicate is false for the whole chunk), so the emitter
+  // may skip them entirely. ``chunk_hi < 0`` means "no upper clamp".
+  int64_t chunk_lo{0};
+  int64_t chunk_hi{-1};
   ffi::Array<StorePlan> stores;
   ffi::Array<StorePlan> pre_stores;
   ffi::Array<StorePlan> post_stores;
@@ -227,6 +256,8 @@ class VectorPlanNode : public ffi::Object {
         .def_ro("lanes", &VectorPlanNode::lanes)
         .def_ro("chunks", &VectorPlanNode::chunks)
         .def_ro("tail", &VectorPlanNode::tail)
+        .def_ro("chunk_lo", &VectorPlanNode::chunk_lo)
+        .def_ro("chunk_hi", &VectorPlanNode::chunk_hi)
         .def_ro("stores", &VectorPlanNode::stores)
         .def_ro("pre_stores", &VectorPlanNode::pre_stores)
         .def_ro("post_stores", &VectorPlanNode::post_stores)

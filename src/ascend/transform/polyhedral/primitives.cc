@@ -11,10 +11,7 @@
 #include <tvm/tirx/op.h>
 
 #include <algorithm>
-#include <mutex>
-#include <tuple>
 #include <limits>
-#include <map>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -329,56 +326,44 @@ std::string ElemDtype(const std::string& dtype_like) {
   return pos == std::string::npos ? dtype_like : dtype_like.substr(0, pos);
 }
 
+/*
+ * The dtype spellings are a small closed set and these helpers sit on the
+ * emitter's hottest path (every ``T.simd.*`` call materializes its dtype), so
+ * the caches are thread-local: TVM compiles multiple PrimFuncs in parallel and
+ * a process-wide mutex here serializes every compilation thread.
+ */
 DataType DataTypeOf(const std::string& dtype_string) {
-  static std::mutex mutex;
-  static std::map<std::string, DataType> cache;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(dtype_string);
-    if (it != cache.end()) return it->second;
-  }
+  thread_local std::unordered_map<std::string, DataType> cache;
+  auto it = cache.find(dtype_string);
+  if (it != cache.end()) return it->second;
   DataType parsed(ffi::StringToDLDataType(dtype_string));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    cache.emplace(dtype_string, parsed);
-  }
+  cache.emplace(dtype_string, parsed);
   return parsed;
 }
 
 DataType VecDataType(const std::string& elem) { return DataTypeOf(VecDtype(elem)); }
 
 DataType ElemDataType(const DataType& dtype) {
-  static std::mutex mutex;
-  static std::map<std::tuple<int, int, int>, DataType> cache;
-  std::tuple<int, int, int> key(dtype.code(), dtype.bits(), 1);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-  }
+  thread_local std::unordered_map<uint64_t, DataType> cache;
+  const uint64_t key = static_cast<uint64_t>(dtype.code()) << 40 |
+                       static_cast<uint64_t>(dtype.bits()) << 8;
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
   DataType parsed = dtype.element_of();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    cache.emplace(key, parsed);
-  }
+  cache.emplace(key, parsed);
   return parsed;
 }
 
 std::string ElemDtype(const DataType& dtype) {
-  static std::mutex mutex;
-  static std::map<std::tuple<int, int, int>, std::string> cache;
+  thread_local std::unordered_map<uint64_t, std::string> cache;
   DataType elem = dtype.element_of();
-  std::tuple<int, int, int> key(elem.code(), elem.bits(), elem.lanes());
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-  }
+  const uint64_t key = static_cast<uint64_t>(elem.code()) << 40 |
+                       static_cast<uint64_t>(elem.bits()) << 8 |
+                       static_cast<uint64_t>(elem.lanes());
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
   std::string text = ffi::DLDataTypeToString(elem).operator std::string();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    cache.emplace(key, text);
-  }
+  cache.emplace(key, text);
   return text;
 }
 

@@ -1045,6 +1045,112 @@ void DropDeadPreStores(VectorPlan& plan, arith::Analyzer* analyzer) {
   plan.CopyOnWrite()->pre_stores = ffi::Array<StorePlan>(kept);
 }
 
+/*!
+ * \brief Whether ``pre`` can be folded into ``store``'s accumulator initial value.
+ *
+ * Folding drops the pre store's memory write, so the value must be exactly the
+ * accumulator's initial value (uniform, unpredicated, same address) and no
+ * sibling pre store may read the buffer afterwards (it would see a stale value).
+ */
+bool PreFoldableInto(const StorePlan& pre, const StorePlan& store,
+                     const std::vector<StorePlan>& pre_stores) {
+  if (pre->mask.has_value() || !pre->value->is_uniform) return false;
+  if (!SameBuffer(pre->spec->buffer, store->spec->buffer)) return false;
+  if (!SameIndices(pre->spec->indices, store->spec->indices)) return false;
+  for (const StorePlan& other : pre_stores) {
+    if (other.same_as(pre)) continue;
+    if (ReadsBuffer(other->value, pre->spec->buffer)) return false;
+  }
+  return true;
+}
+
+/*!
+ * \brief Record the two non-default store handlings in the plan.
+ *
+ * Both rules used to be re-derived by the emitter, and the identity-init rule
+ * was derived twice with different strength (the hoisting pass used the weak
+ * form, the emission block the strong one). Marking them here makes the plan
+ * authoritative and keeps both emitter paths consistent.
+ */
+void MarkStoreRoles(VectorPlan& plan) {
+  // PRE_FOLDED: the pre store writes the accumulator's initial value.
+  std::set<const StorePlanNode*> consumed;
+  for (int64_t index = 0; index < static_cast<int64_t>(plan->stores.size()); ++index) {
+    const StorePlan& store = plan->stores[index];
+    if (!store->promote.has_value()) continue;
+    for (int64_t pre_index = 0;
+         pre_index < static_cast<int64_t>(plan->pre_stores.size()); ++pre_index) {
+      const StorePlan& pre = plan->pre_stores[pre_index];
+      if (consumed.count(pre.get()) != 0) continue;
+      if (!PreFoldableInto(pre, store, std::vector<StorePlan>(
+                                          plan->pre_stores.begin(), plan->pre_stores.end()))) {
+        continue;
+      }
+      consumed.insert(pre.get());
+      StorePlan updated = pre;
+      updated.CopyOnWrite()->role = ffi::String(StoreRoleName(StoreRole::kPreFolded));
+      plan.CopyOnWrite()->pre_stores.Set(pre_index, updated);
+      break;
+    }
+  }
+
+  // POST_SUPERSEDED: a post store rewrites the same address and consumes the
+  // accumulator value, so the write-back belongs to the post (register
+  // forwarding, one ``vsts`` instead of two).
+  for (int64_t index = 0; index < static_cast<int64_t>(plan->stores.size()); ++index) {
+    const StorePlan& store = plan->stores[index];
+    if (!store->promote.has_value()) continue;
+    bool superseded = false;
+    for (const StorePlan& post : plan->post_stores) {
+      if (post->mask.has_value()) continue;
+      if (!SameBuffer(post->spec->buffer, store->spec->buffer)) continue;
+      if (!SameIndices(post->spec->indices, store->spec->indices)) continue;
+      if (!SameAddressLoad(post->value, post->spec->buffer, post->spec->indices)
+               .defined()) {
+        continue;
+      }
+      superseded = true;
+      break;
+    }
+    if (!superseded) continue;
+    StorePlan updated = store;
+    updated.CopyOnWrite()->role = ffi::String(StoreRoleName(StoreRole::kPostSuperseded));
+    plan.CopyOnWrite()->stores.Set(index, updated);
+  }
+}
+
+/*!
+ * \brief Shrink the segment to the chunks whose stores can actually fire.
+ *
+ * ``GuardFreeBounds`` already proves "this predicate holds over a chunk range"
+ * for the mask-free fast path. Asking it about ``not(mask)`` yields the
+ * complementary fact: the leading / trailing chunks where every store's
+ * predicate is *false*, i.e. the whole chunk performs no write. Those chunks
+ * used to be emitted (a compare, a load and a masked store that writes nothing).
+ *
+ * Only whole-chunk elision is considered, and only when every store is masked
+ * and no pre/post statement shares the chunk body: a single unmasked store, or a
+ * sibling statement, keeps the chunk live.
+ */
+void MarkLiveChunkRange(VectorPlan& plan, const ValueContext& ctx) {
+  if (!plan->chunks.has_value() || *plan->chunks <= 1) return;
+  if (plan->stores.empty() || !plan->pre_stores.empty() || !plan->post_stores.empty()) return;
+  if (ReduceOf(plan).defined()) return;
+  const int64_t chunks = *plan->chunks;
+  int64_t live_lo = 0;
+  int64_t live_hi = chunks;
+  for (const StorePlan& store : plan->stores) {
+    if (!store->mask.has_value()) return;  // an unconditional write keeps every chunk
+    const auto dead = GuardFreeBounds(logical_not(*store->spec->mask), ctx);
+    live_lo = std::max(live_lo, dead.first);
+    live_hi = std::min(live_hi, dead.second.value_or(chunks));
+  }
+  if (live_lo <= 0 && live_hi >= chunks) return;      // nothing to elide
+  if (live_lo >= live_hi) return;                     // degenerate: the whole nest is dead
+  plan.CopyOnWrite()->chunk_lo = live_lo;
+  plan.CopyOnWrite()->chunk_hi = live_hi;
+}
+
 std::pair<ValueNode, int64_t> StripReduce(const ValueNode& value, const std::string& op,
                                           const StoreSpec& site) {
   std::string scalar_recipe;
@@ -1829,6 +1935,9 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
 
   VectorPlan plan = MakeVectorPlan(ToArray(axes), vector_axis, lanes,
                                    chunks, tail);
+  // The plan is uniquely owned here, so take the writable node once instead of
+  // re-checking the refcount at every field write (P6).
+  VectorPlanNode* writer = plan.CopyOnWrite();
 
   auto plan_store = [&](const StoreSpec& spec, const AccessInfo& info) -> StorePlan {
     AxisClass classified = AxisClassOf(info, vector_axis);
@@ -1921,13 +2030,13 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   for (size_t i = 0; i < post_specs.size(); ++i) {
     post_stores.push_back(plan_store(post_specs[i], post_infos[i]));
   }
-  plan.CopyOnWrite()->stores = stores;
-  plan.CopyOnWrite()->pre_stores = pre_stores;
-  plan.CopyOnWrite()->post_stores = post_stores;
+  writer->stores = stores;
+  writer->pre_stores = pre_stores;
+  writer->post_stores = post_stores;
   if (fragment.enabled) {
     ffi::Array<FragmentReg> regs;
     for (const FragmentReg& reg : fragment.regs) regs.push_back(reg);
-    plan.CopyOnWrite()->fragment_regs = regs;
+    writer->fragment_regs = regs;
   }
 
   // Mixed element widths (Stage 1): a chunk narrower than some store register
@@ -1983,7 +2092,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
       ValueNode promote = AccumulatorCandidate(store, plan, analyzer);
       if (promote.defined()) {
         store.CopyOnWrite()->promote = ffi::Optional<ValueNode>(promote);
-        plan.CopyOnWrite()->stores.Set(i, store);
+        writer->stores.Set(i, store);
       }
     }
     for (const StorePlan& store : plan->stores) {
@@ -2015,7 +2124,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     throw Unsupported(
         "a reduction store cannot be scattered into an NZ destination yet; split the nest");
   }
-  if (reduce.defined()) plan.CopyOnWrite()->reduce = ffi::Optional<ffi::ObjectRef>(reduce);
+  if (reduce.defined()) writer->reduce = ffi::Optional<ffi::ObjectRef>(reduce);
   if (reduce.defined()) {
     // The reduction path hands pre/post to the outer-store emitter, which needs
     // lane-uniform statements (R7: close the build-ok/emit-Unsupported gap).
@@ -2035,6 +2144,8 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
     FoldIdentityInit(plan);
   }
   DropDeadPreStores(plan, analyzer);
+  MarkStoreRoles(plan);
+  MarkLiveChunkRange(plan, ctx);
 
   // Defect A0: a partial reduction on an absorbed serial axis has no vector form.
   if (!reduce.defined()) {
@@ -2064,7 +2175,7 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis>& axes,
   std::vector<int64_t> cuts = GuardCuts(plan);
   ffi::Array<int64_t> guard_boundaries;
   for (int64_t cut : cuts) guard_boundaries.push_back(cut);
-  plan.CopyOnWrite()->guard_boundaries = guard_boundaries;
+  writer->guard_boundaries = guard_boundaries;
   return plan;
 }
 
@@ -2326,24 +2437,26 @@ std::optional<VectorProgram> TryBuildSplitAllProgram(
     // buffers become one nest: their chunk loops then interleave (one loop with
     // both bodies) instead of running back to back, which gives the scheduler
     // independent load/store pairs to overlap.
-    auto touched_buffers = [](const Stmt& stmt) {
+    // One traversal per child collects everything the merge decision needs:
+    // the buffers it touches and whether it carries a serial loop. Walking the
+    // same chain three times (buffers, serial flag, then again for the merge)
+    // was the dominant cost of this loop.
+    struct ChildFacts {
       std::set<const tirx::VarNode*> buffers;
+      bool has_serial{false};
+    };
+    auto collect_facts = [](const Stmt& stmt) {
+      ChildFacts facts;
       tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef& node) {
         if (const auto* load = node.as<tirx::BufferLoadNode>()) {
-          buffers.insert(load->buffer->data.get());
+          facts.buffers.insert(load->buffer->data.get());
         } else if (const auto* store = node.as<tirx::BufferStoreNode>()) {
-          buffers.insert(store->buffer->data.get());
+          facts.buffers.insert(store->buffer->data.get());
+        } else if (const auto* loop = node.as<tirx::ForNode>()) {
+          if (loop->kind == ForKind::kSerial) facts.has_serial = true;
         }
       });
-      return buffers;
-    };
-    auto has_serial_loop = [](const Stmt& stmt) {
-      bool found = false;
-      tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef& node) {
-        const auto* loop = node.as<tirx::ForNode>();
-        if (loop != nullptr && loop->kind == ForKind::kSerial) found = true;
-      });
-      return found;
+      return facts;
     };
     std::function<bool(const Stmt&, const Stmt&)> same_loop_shape =
         [&](const Stmt& lhs, const Stmt& rhs) -> bool {
@@ -2379,19 +2492,19 @@ std::optional<VectorProgram> TryBuildSplitAllProgram(
     };
 
     std::optional<Stmt> previous_chain;
-    std::set<const tirx::VarNode*> previous_buffers;
+    ChildFacts previous_facts;
     for (const Stmt& child : seq->seq) {
       if (child.as<tirx::ForNode>() == nullptr) {
         pending.push_back(child);
         previous_chain.reset();
         continue;
       }
-      if (previous_chain.has_value() && !has_serial_loop(child) &&
-          !has_serial_loop(*previous_chain) && same_loop_shape(*previous_chain, child)) {
-        std::set<const tirx::VarNode*> current = touched_buffers(child);
+      ChildFacts facts = collect_facts(child);
+      if (previous_chain.has_value() && !facts.has_serial &&
+          !previous_facts.has_serial && same_loop_shape(*previous_chain, child)) {
         bool disjoint = true;
-        for (const tirx::VarNode* buffer : current) {
-          if (previous_buffers.count(buffer) != 0) {
+        for (const tirx::VarNode* buffer : facts.buffers) {
+          if (previous_facts.buffers.count(buffer) != 0) {
             disjoint = false;
             break;
           }
@@ -2401,14 +2514,14 @@ std::optional<VectorProgram> TryBuildSplitAllProgram(
               *previous_chain, SubstituteVarsStmt(child, zip_loop_vars(*previous_chain, child)));
           sources.back() = build_loop_source(merged);
           previous_chain = merged;
-          previous_buffers.insert(current.begin(), current.end());
+          previous_facts.buffers.insert(facts.buffers.begin(), facts.buffers.end());
           continue;
         }
       }
       flush_pending();
       sources.push_back(build_loop_source(child));
       previous_chain = child;
-      previous_buffers = touched_buffers(child);
+      previous_facts = std::move(facts);
     }
     flush_pending();
   }

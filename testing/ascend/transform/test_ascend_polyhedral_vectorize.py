@@ -2148,6 +2148,10 @@ def test_serial_sandwiched_statements_absorbed():
     assert plan.reduce is None
     assert [s.spec.buffer.name for s in plan.pre_stores] == ["s"]
     assert [s.spec.buffer.name for s in plan.post_stores] == ["s"]
+    # StoreRole: the plan (not the emitter) decides that the pre store feeds the
+    # accumulator initial value and that the post owns the write-back.
+    assert plan.pre_stores[0].role == "pre_folded"
+    assert plan.stores[0].role == "post_superseded"
     ops = _emitted_ops(emit_plan(plan))
     assert "tl.simd.vadd" in ops and "tl.simd.vmuls" in ops
     # 累加器寄存器化：同址 pre 折成 ``vdup`` 寄存器初值，主体每轮只更新寄存器
@@ -3274,6 +3278,96 @@ def test_tail_chunk_loop_runs_exactly_one_iteration():
         # 尾块展开后，剩下的整块循环必须**恰好**覆盖 [0, chunks-1)：不多跑（越界）也不少跑。
         expected = list(range(chunks - 1)) if M % lanes else list(range(chunks))
         assert sorted(covered) == expected, f"M={M}: chunk coverage {sorted(covered)} != {expected}"
+
+
+def test_tail_chunk_guard_is_proved_free():
+    """尾块谓词可证：``if i >= 128: c[i] = a[i]`` on a 130-element axis.
+
+    ``i >= 128`` 对整条轴不可证（``i = 0`` 是反例），但在尾块 ``[128, 130)`` 上恒真，
+    因此 ``mask_free_from`` 应指向最后一个 chunk，尾块不再生成比较。
+
+    注意探测区间在本 fork 是 ``Range(begin, end)``，即 ``Range(128, 130)``；若误按 TVM
+    传统的 ``Range(min, extent)`` 理解写成 ``Range(128, 2)``，会得到空区间，本用例会
+    立刻失败（``mask_free_from is None``）。
+    """
+    N, lanes = 130, 64  # 130 = 2 full chunks + a 2-lane tail chunk
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i >= 128:
+                    c[i] = a[i]
+
+    plan = _single_segment(k)
+    assert plan.vector_axis.name == "i"
+    assert (plan.chunks, plan.tail) == (3, 2)
+    store = plan.stores[0]
+    # 整轴不可证时 until 保持 0；尾块可证时 from 指向 chunk 2。
+    assert store.mask_free_until == 0
+    assert store.mask_free_from == 2
+    # 前缀两个 chunk 的谓词恒假，会被整块删除（见 dead_guard 用例）；
+    # 剩下的尾块直接用尾掩码，不再生成比较。
+    print(f"func:\n\n{k}\n\nemited:\n\n{emit_plan(plan)}")
+    ops = _emitted_ops(emit_plan(plan))
+    assert ops.count("tl.simd.vcmps") == 0
+    assert ops.count("tl.simd.vsts") == 1
+
+
+def test_dead_guard_chunks_are_elided():
+    """谓词恒假的 chunk 整块删除：``if i >= 128: c[i] = a[i]`` on 130 elements.
+
+    ``i >= 128`` 在 chunk 0/1（lane 0-127）上恒假，这两块原本照样发
+    ``vci + vcmps + vld + vsts``（写不进任何数据）。plan 侧用
+    ``GuardFreeBounds(not(mask))`` 求出死前缀，``chunk_lo/chunk_hi`` 把发射窗口
+    收窄到 ``[2, 3)``，于是只剩下尾块那一条 ``vgather2`` + ``vsts``。
+    """
+    N = 130  # 2 full chunks (dead) + a 2-lane tail chunk (the only live one)
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if i >= 128:
+                    c[i] = a[i]
+
+    plan = _single_segment(k)
+    assert (plan.chunk_lo, plan.chunk_hi) == (2, 3)
+
+    stmt = emit_plan(plan)
+    ops = _emitted_ops(stmt)
+    # 死 chunk 循环完全消失：没有 chunk 循环、没有整块 vld/vcmps/vsts。
+    assert _chunk_iterations(stmt) == []
+    assert ops.count("tl.simd.vld") == 0
+    assert ops.count("tl.simd.vcmps") == 0
+    assert ops.count("tl.simd.vgather2") == 1
+    assert ops.count("tl.simd.vsts") == 1
+
+
+def test_unmasked_store_keeps_every_chunk_live():
+    """无谓词 store 不会被误删：``chunk_lo/chunk_hi`` 保持默认整窗。"""
+    N = 130
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[i]
+
+    plan = _single_segment(k)
+    assert (plan.chunk_lo, plan.chunk_hi) == (0, 3)
+    stmt = emit_plan(plan)
+    # 整块循环仍然覆盖 chunk 0/1；尾块照旧走带掩码的 gather。
+    assert [(name, lo, extent) for name, lo, extent in _chunk_iterations(stmt)] == [
+        ("chunk", 0, 2)
+    ]
+    assert _emitted_ops(stmt).count("tl.simd.vld") == 1
 
 
 def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():

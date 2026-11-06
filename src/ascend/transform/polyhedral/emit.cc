@@ -325,8 +325,12 @@ void ExprKeyInto(const PrimExpr& expr, std::string* out) {
     return;
   }
   if (const auto* var = expr.as<tirx::VarNode>()) {
+    // Object identity, not the name: two distinct Vars may share a name_hint
+    // (per-nest loop vars, rebuilt SSA names), and keying them together made the
+    // forwarding / memo maps alias unrelated values. Every key lives only while
+    // the plan owning the Var is alive.
     *out += "v:";
-    *out += var->name_hint.operator std::string();
+    *out += std::to_string(reinterpret_cast<uintptr_t>(var));
     return;
   }
   if (const auto* imm = expr.as<IntImmNode>()) {
@@ -393,8 +397,6 @@ void ExprKeyInto(const PrimExpr& expr, std::string* out) {
   if (binary != nullptr) {
     *out += binary;
     *out += "(";
-    const auto* base = static_cast<const tirx::CmpOpNode<tirx::EQNode>*>(nullptr);
-    (void)base;
     PrimExpr a;
     PrimExpr b;
     if (const auto* op = expr.as<tirx::AddNode>()) {
@@ -464,7 +466,13 @@ void ExprKeyInto(const PrimExpr& expr, std::string* out) {
   }
   if (const auto* op = expr.as<tirx::CallNode>()) {
     *out += "C:";
-    if (const auto* opn = op->op.as<OpNode>()) *out += opn->name;
+    if (const auto* opn = op->op.as<OpNode>()) {
+      *out += opn->name;
+    } else if (const auto* gvar = op->op.as<GlobalVarNode>()) {
+      // A callee is part of the value identity: two calls with the same args
+      // but different functions must never share a key.
+      *out += "g:" + std::to_string(reinterpret_cast<uintptr_t>(gvar));
+    }
     *out += "(";
     for (const PrimExpr& arg : op->args) {
       ExprKeyInto(arg, out);
@@ -483,6 +491,12 @@ std::string ExprKey(const PrimExpr& expr) {
   return out;
 }
 
+/*! \brief Per-thread buffer-key memo shared by ``BufferKey`` and its reset. */
+std::unordered_map<const tirx::BufferNode*, std::string>& BufferKeyCache() {
+  thread_local std::unordered_map<const tirx::BufferNode*, std::string> cache;
+  return cache;
+}
+
 /*!
  * \brief Identity of a buffer: its data Var plus the structural view fields.
  *
@@ -493,6 +507,13 @@ std::string ExprKey(const PrimExpr& expr) {
  * (analysis §2.3 / M6).
  */
 std::string BufferKey(const tirx::Buffer& buffer) {
+  // Memoized per Buffer node for the duration of one ``EmitPlan`` call: the key
+  // walks shape / strides / elem_offset and is rebuilt for every load of every
+  // hoisting decision (``SplitLoopInvariant`` runs once per chunk). The cache is
+  // cleared at each entry point, while the plan's buffers are still alive.
+  auto& cache = BufferKeyCache();
+  auto cached = cache.find(buffer.get());
+  if (cached != cache.end()) return cached->second;
   // PrintExpr costs microseconds per call and this runs for every buffer of
   // every segment; the fast serializer gives the same equivalence relation.
   std::string out = "@" +
@@ -508,8 +529,18 @@ std::string BufferKey(const tirx::Buffer& buffer) {
     out += (i == 0 ? "" : ",") + ExprKey(buffer->strides[i]);
   }
   out += ")|" + ExprKey(buffer->elem_offset);
+  cache.emplace(buffer.get(), out);
   return out;
 }
+
+/*!
+ * \brief Drop the memoized buffer keys.
+ *
+ * Must run at the start of every emission entry point: the keys are keyed by
+ * ``BufferNode`` address, which is only stable while the plan owning the buffer
+ * is alive.
+ */
+void ResetBufferKeyCache() { BufferKeyCache().clear(); }
 
 std::string IndexKey(const ffi::Array<PrimExpr>& indices) {
   std::string out;
@@ -707,13 +738,15 @@ struct PairDomain {
 
 class Emitter {
  public:
-  Emitter(const VectorPlan& plan, PrimExpr chunk, std::string prefix, bool masked_tail = false,
-          int64_t chunk_min = 0, std::optional<int64_t> chunk_max = std::nullopt,
+  Emitter(const VectorPlan& plan, arith::Analyzer* analyzer, PrimExpr chunk,
+          std::string prefix, bool masked_tail = false, int64_t chunk_min = 0,
+          std::optional<int64_t> chunk_max = std::nullopt,
           ProgramPrologue* shared = nullptr,
           std::map<std::string, CarryEntry>* carry = nullptr, bool allow_carry = false,
           PairDomain* pair = nullptr, int pair_stream = 0,
           FragmentRegisterFile* registers = nullptr)
       : plan_(plan),
+        analyzer_(analyzer),
         chunk_(std::move(chunk)),
         prefix_(std::move(prefix)),
         masked_tail_(masked_tail),
@@ -938,7 +971,7 @@ class Emitter {
   ffi::Array<PrimExpr> AddrIndicesAt(const AccessInfo& access, const PrimExpr& base) {
     ffi::Array<PrimExpr> out;
     for (const PrimExpr& index : access->indices) {
-      out.push_back(analyzer_.Simplify(tirx::Substitute(
+      out.push_back(analyzer_->Simplify(tirx::Substitute(
           index, [&](const tirx::Var& var) -> ffi::Optional<PrimExpr> {
             if (var.same_as(plan_->vector_axis->var)) return ffi::Optional<PrimExpr>(base);
             return ffi::Optional<PrimExpr>();
@@ -1037,7 +1070,7 @@ class Emitter {
 
   /* -- fragment registers ------------------------------------------------ */
   FragmentRegisterFile* registers() const { return registers_; }
-  arith::Analyzer* analyzer() { return &analyzer_; }
+  arith::Analyzer* analyzer() { return analyzer_; }
 
   /*!
    * \brief Read one register slot of a fragment access.
@@ -1055,7 +1088,7 @@ class Emitter {
     std::string error;
     std::optional<int64_t> slot =
         RegisterSlotOf(access, plan_->vector_axis, lane_base_, plan_->lanes,
-                       &analyzer_, &error);
+                       analyzer_, &error);
     if (!slot.has_value()) {
       throw Unsupported("fragment register: " + error);
     }
@@ -1246,7 +1279,10 @@ class Emitter {
   PairDomain* pair_;
   int pair_stream_{0};
   FragmentRegisterFile* registers_{nullptr};
-  arith::Analyzer analyzer_;
+  // Owned by the emission entry point and shared by every chunk / segment
+  // emitter: constructing one Analyzer costs ~6 us (five sub-analyzers plus the
+  // Z3 client), which dominated the per-chunk emit cost.
+  arith::Analyzer* analyzer_{nullptr};
 };
 
 PrimExpr Emitter::Build(const ValueNode& node) {
@@ -1804,42 +1840,61 @@ std::pair<std::vector<Stmt>, std::vector<Stmt>> StripMine(const VectorPlan& plan
     return blocks;
   };
 
+  // The plan may have proven a prefix / suffix of chunks dead (every store's
+  // predicate is false there), in which case only the live window is emitted.
+  const int64_t chunks = *plan->chunks;
+  const int64_t live_lo = std::max<int64_t>(0, std::min<int64_t>(plan->chunk_lo, chunks));
+  const int64_t live_hi =
+      plan->chunk_hi < 0
+          ? chunks
+          : std::max<int64_t>(live_lo, std::min<int64_t>(plan->chunk_hi, chunks));
+
   bool has_tail = plan->tail.has_value() && *plan->tail != 0;
   if (!has_tail) {
-    if (*plan->chunks == 1) {
-      // A single chunk is straight-line code: ``for chunk in range(1)`` only
+    if (live_hi - live_lo == 1) {
+      // A single live chunk is straight-line code: ``for chunk in range(1)`` only
       // confuses the backend.
-      return {prologue, block(IntImm32(0), false, "", 0, 1)};
+      return {prologue, block(IntImm32(live_lo), false, "", live_lo, live_hi)};
     }
-    return {prologue, split_range(0, *plan->chunks)};
+    return {prologue, split_range(live_lo, live_hi)};
   }
 
-  int64_t full = *plan->chunks - 1;
-  std::vector<Stmt> blocks = split_range(0, full);
-  for (Stmt& stmt : SeqOfVec(block(IntImm32(full), true, "tail_", full, full + 1))) {
-    blocks.push_back(std::move(stmt));
+  const int64_t full = chunks - 1;
+  std::vector<Stmt> blocks = split_range(live_lo, std::min(live_hi, full));
+  // The tail block covers the last chunk, which is live only if the window
+  // still reaches it.
+  if (live_hi > full) {
+    for (Stmt& stmt : SeqOfVec(block(IntImm32(full), true, "tail_", full, full + 1))) {
+      blocks.push_back(std::move(stmt));
+    }
   }
   return {prologue, blocks};
 }
 
 std::pair<std::vector<Stmt>, std::vector<Stmt>> EmitElementwiseChunks(
-    const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
-    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry, bool allow_carry,
+    const VectorPlan& plan, arith::Analyzer* analyzer, const tirx::Var& chunk,
+    const std::string& prefix, ProgramPrologue* shared,
+    std::map<std::string, CarryEntry>* carry, bool allow_carry,
     FragmentRegisterFile* registers) {
   if (RegisterMode(plan)) {
     // Fragment registers have no dynamic index: every chunk maps to one fixed
     // slot, so the chunk loop is fully expanded (plan G4 / design §2.3).
     TVM_FFI_ICHECK(plan->chunks.has_value())
         << "a register-mode segment needs static chunks (plan contract)";
-    int64_t chunks = *plan->chunks;
+    const int64_t chunks = *plan->chunks;
+    const int64_t live_lo = std::max<int64_t>(0, std::min<int64_t>(plan->chunk_lo, chunks));
+    const int64_t live_hi =
+        plan->chunk_hi < 0
+            ? chunks
+            : std::max<int64_t>(live_lo, std::min<int64_t>(plan->chunk_hi, chunks));
     std::vector<Stmt> prologue;
     std::vector<Stmt> blocks;
-    for (int64_t index = 0; index < chunks; ++index) {
+    for (int64_t index = live_lo; index < live_hi; ++index) {
       bool masked_tail =
           index + 1 == chunks && plan->tail.has_value() && *plan->tail != 0;
       // Fully unrolled chunks share one C scope, so every chunk gets its own
       // SSA prefix (the loop form relies on the loop body being a scope).
-      Emitter body(plan, IntImm32(index),
+      Emitter body(plan, analyzer, IntImm32(index),
                    prefix + "u" + std::to_string(index) + "_", masked_tail,
                    index, index + 1, shared, carry, allow_carry, nullptr, 0,
                    registers);
@@ -1854,7 +1909,8 @@ std::pair<std::vector<Stmt>, std::vector<Stmt>> EmitElementwiseChunks(
     MakeBlock make_block = [&](const PrimExpr& chunk_index, bool masked_tail,
                                const std::string& label, int64_t chunk_min,
                                std::optional<int64_t> chunk_max) -> Block {
-      Emitter body(plan, chunk_index, prefix + label, masked_tail, chunk_min, chunk_max, shared,
+      Emitter body(plan, analyzer, chunk_index, prefix + label, masked_tail, chunk_min,
+                   chunk_max, shared,
                    carry, allow_carry, nullptr, 0, registers);
       for (const StorePlan& store : plan->stores) EmitStore(plan, store, &body);
       return Block{body.prologue_, body.lets_};
@@ -1879,9 +1935,9 @@ std::pair<std::vector<Stmt>, std::vector<Stmt>> EmitElementwiseChunks(
     std::vector<Stmt> shared_lets;
     PairDomain domain;
     domain.lets = &shared_lets;
-    Emitter even(plan, even_chunk, prefix + "e", false, 0, std::nullopt, shared, carry,
+    Emitter even(plan, analyzer, even_chunk, prefix + "e", false, 0, std::nullopt, shared, carry,
                  allow_carry, deinterleave ? &domain : nullptr, /*pair_stream=*/0);
-    Emitter odd(plan, odd_chunk, prefix + "o", false, 0, std::nullopt, shared, carry,
+    Emitter odd(plan, analyzer, odd_chunk, prefix + "o", false, 0, std::nullopt, shared, carry,
                 allow_carry, deinterleave ? &domain : nullptr, /*pair_stream=*/1);
     // Value binds and the write they feed stay in source order (a later store may
     // read what an earlier one wrote through the forward map).
@@ -2015,6 +2071,79 @@ PrimExpr EmitReduceChunk(const VectorPlan& plan, const StorePlan& store, Emitter
                          const PrimExpr& fill);
 
 /* ------------------------------------------------------------------------- */
+/* shared pre-store handling                                                 */
+/* ------------------------------------------------------------------------- */
+
+/*! \brief Plan-decided handling of one store. */
+StoreRole RoleOf(const StorePlan& store) {
+  return StoreRoleFromName(store->role.operator std::string());
+}
+
+/*!
+ * \brief Every buffer this segment writes, as structural keys.
+ *
+ * Both the pre-store hoisting and ``SplitLoopInvariant`` ask "does this value
+ * read something the loop writes?". Fragment registers count as written even if
+ * this segment only reads them: an earlier nest may have produced them under its
+ * own hoisted loop, so hoisting the register read would capture a stale value.
+ */
+std::set<std::string> WrittenStoreKeys(const VectorPlan& plan,
+                                       FragmentRegisterFile* registers) {
+  std::set<std::string> keys;
+  for (const StorePlan& store : plan->pre_stores) keys.insert(BufferKey(store->spec->buffer));
+  for (const StorePlan& store : plan->stores) keys.insert(BufferKey(store->spec->buffer));
+  for (const StorePlan& store : plan->post_stores) keys.insert(BufferKey(store->spec->buffer));
+  if (RegisterMode(plan) && registers != nullptr) {
+    for (const auto& entry : registers->entries()) {
+      for (const tirx::Buffer& reg : entry.regs) keys.insert(BufferKey(reg));
+    }
+  }
+  return keys;
+}
+
+/*! \brief Pre stores split by where they are emitted. */
+struct PreStores {
+  std::vector<StorePlan> invariant;  // hoisted out of the chunk loop
+  std::vector<StorePlan> loop;       // emitted once per chunk
+};
+
+PreStores SplitPreStores(const VectorPlan& plan, bool single,
+                         const std::set<std::string>& written_keys) {
+  PreStores split;
+  for (const StorePlan& store : plan->pre_stores) {
+    // A folded pre no longer writes memory: hoisting it would also hoist the
+    // accumulator's initial value away from the loop that consumes it.
+    const bool foldable = RoleOf(store) == StoreRole::kPreFolded;
+    if (single && !foldable && StoreIsLoopInvariant(store, plan, written_keys)) {
+      split.invariant.push_back(store);
+    } else {
+      split.loop.push_back(store);
+    }
+  }
+  return split;
+}
+
+/*! \brief Prologue / lets produced by the hoisted pre stores. */
+struct HoistedPre {
+  std::vector<Stmt> prologue;
+  std::vector<Stmt> lets;
+};
+
+HoistedPre EmitHoistedPreStores(const VectorPlan& plan, arith::Analyzer* analyzer,
+                                const std::vector<StorePlan>& invariant,
+                                const std::string& prefix, ProgramPrologue* shared,
+                                std::map<std::string, CarryEntry>* carry) {
+  HoistedPre out;
+  if (invariant.empty()) return out;
+  Emitter emitter(plan, analyzer, IntImm32(0), prefix + "hopre_", false, 0, std::nullopt, shared,
+                  carry, false);
+  for (const StorePlan& store : invariant) EmitOuterStore(store, &emitter);
+  out.prologue = emitter.prologue_;
+  out.lets = emitter.TakeLets();
+  return out;
+}
+
+/* ------------------------------------------------------------------------- */
 /* segment emission                                                          */
 /* ------------------------------------------------------------------------- */
 
@@ -2029,22 +2158,22 @@ std::vector<Axis> InnerAxes(const VectorPlan& plan, const std::vector<Axis>& hoi
 }
 
 std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
-    const VectorPlan& plan, const tirx::Var& chunk, const std::vector<Axis>& hoisted,
-    const std::string& prefix, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry,
-    FragmentRegisterFile* registers);
+    const VectorPlan& plan, arith::Analyzer* analyzer, const tirx::Var& chunk,
+    const std::vector<Axis>& hoisted, const std::string& prefix, bool single,
+    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry,
+    bool allow_carry, FragmentRegisterFile* registers);
 
 std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
-    const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
-    const std::vector<Axis>& hoisted, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry,
-    FragmentRegisterFile* registers);
+    const VectorPlan& plan, arith::Analyzer* analyzer, const tirx::Var& chunk,
+    const std::string& prefix, const std::vector<Axis>& hoisted, bool single,
+    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry,
+    bool allow_carry, FragmentRegisterFile* registers);
 
 std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
-    const VectorPlan& plan, const tirx::Var& chunk, const std::vector<Axis>& hoisted,
-    const std::string& prefix, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry,
-    FragmentRegisterFile* registers) {
+    const VectorPlan& plan, arith::Analyzer* analyzer, const tirx::Var& chunk,
+    const std::vector<Axis>& hoisted, const std::string& prefix, bool single,
+    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry,
+    bool allow_carry, FragmentRegisterFile* registers) {
   // A parallel vector axis with inner axes uses the hand-written three-part
   // structure (pre -> for inner: main -> post) so pre/post run once per chunk.
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
@@ -2054,7 +2183,8 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
           "a packed NZ store needs the vector axis to be the innermost axis (split the nest)");
     }
     std::pair<std::vector<Stmt>, Stmt> parts = EmitParallelAxisParts(
-        plan, chunk, prefix, hoisted, single, shared, carry, allow_carry, registers);
+        plan, analyzer, chunk, prefix, hoisted, single, shared, carry, allow_carry,
+        registers);
     // The three-part structure only loops the axes inside the vector axis; an
     // outer axis that the program does not hoist still needs its serial loop,
     // otherwise the emitted body references its variable unbound (a multi-
@@ -2069,34 +2199,12 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     return {parts.first, body};
   }
 
-  Emitter emitter(plan, chunk, prefix, false, 0, std::nullopt, shared, carry,
+  Emitter emitter(plan, analyzer, chunk, prefix, false, 0, std::nullopt, shared, carry,
                   allow_carry, nullptr, 0, registers);
-  std::set<std::string> written_keys;
-  for (const StorePlan& store : plan->pre_stores) written_keys.insert(BufferKey(store->spec->buffer));
-  for (const StorePlan& store : plan->stores) written_keys.insert(BufferKey(store->spec->buffer));
-  for (const StorePlan& store : plan->post_stores) written_keys.insert(BufferKey(store->spec->buffer));
-  if (RegisterMode(plan) && registers != nullptr) {
-    // A fragment register may be written by an earlier nest inside its own
-    // hoisted outer loop; hoisting the register read to the program prologue
-    // would capture a stale value, so it must never be treated as invariant.
-    for (const auto& entry : registers->entries()) {
-      for (const tirx::Buffer& reg : entry.regs) {
-        written_keys.insert(BufferKey(reg));
-      }
-    }
-  }
+  const std::set<std::string> written_keys = WrittenStoreKeys(plan, registers);
+  const PreStores pre = SplitPreStores(plan, single, written_keys);
 
-  std::vector<StorePlan> invariant_pre;
-  std::vector<StorePlan> loop_pre;
-  for (const StorePlan& store : plan->pre_stores) {
-    if (single && StoreIsLoopInvariant(store, plan, written_keys)) {
-      invariant_pre.push_back(store);
-    } else {
-      loop_pre.push_back(store);
-    }
-  }
-
-  for (const StorePlan& store : loop_pre) EmitOuterStore(store, &emitter);
+  for (const StorePlan& store : pre.loop) EmitOuterStore(store, &emitter);
   std::vector<Stmt> pre_lets = emitter.TakeLets();
   emitter.clear_forward();
 
@@ -2107,8 +2215,8 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     EmitReduce(plan, &emitter);
     main_lets = emitter.TakeLets();
   } else {
-    auto chunks = EmitElementwiseChunks(plan, chunk, prefix, shared, carry, allow_carry,
-                                        registers);
+    auto chunks = EmitElementwiseChunks(plan, analyzer, chunk, prefix, shared, carry,
+                                        allow_carry, registers);
     main_prologue = chunks.first;
     main_lets = chunks.second;
   }
@@ -2158,19 +2266,13 @@ std::pair<std::vector<Stmt>, Stmt> EmitSegmentStmts(
     body = tirx::For(axis->var, IntImm32(0), axis->extent, ForKind::kSerial, body);
   }
 
-  std::vector<Stmt> hoisted_lets;
-  if (!invariant_pre.empty()) {
-    Emitter pre_emitter(plan, IntImm32(0), prefix + "hopre_", false, 0, std::nullopt, shared,
-                        carry, false);
-    for (const StorePlan& store : invariant_pre) EmitOuterStore(store, &pre_emitter);
-    for (Stmt& stmt : pre_emitter.prologue_) emitter.prologue_.push_back(std::move(stmt));
-    hoisted_lets = pre_emitter.TakeLets();
-  }
+  HoistedPre hoisted_pre = EmitHoistedPreStores(plan, analyzer, pre.invariant, prefix, shared, carry);
 
   std::vector<Stmt> prologue = emitter.prologue_;
+  prologue.insert(prologue.end(), hoisted_pre.prologue.begin(), hoisted_pre.prologue.end());
   prologue.insert(prologue.end(), main_prologue.begin(), main_prologue.end());
   prologue.insert(prologue.end(), hoisted_body.begin(), hoisted_body.end());
-  prologue.insert(prologue.end(), hoisted_lets.begin(), hoisted_lets.end());
+  prologue.insert(prologue.end(), hoisted_pre.lets.begin(), hoisted_pre.lets.end());
   return {prologue, body};
 }
 
@@ -2300,8 +2402,8 @@ void EmitReduceLoop(const VectorPlan& plan, const StorePlan& store, Emitter* emi
   MakeBlock build_chunk = [&](const PrimExpr& chunk_index, bool masked_tail,
                               const std::string& label, int64_t chunk_min,
                               std::optional<int64_t> chunk_max) -> Block {
-    Emitter body(plan, chunk_index, emitter->prefix() + label, masked_tail, chunk_min,
-                 chunk_max, emitter->shared(), emitter->carry(), false);
+    Emitter body(plan, emitter->analyzer(), chunk_index, emitter->prefix() + label, masked_tail,
+                 chunk_min, chunk_max, emitter->shared(), emitter->carry(), false);
     PrimExpr reduced = EmitReduceChunk(plan, store, &body, reduce, bits, mask, fill);
     PrimExpr lane0 = emitter->Lane0Mask(bits);
     PrimExpr total = body.Bind(
@@ -2358,62 +2460,28 @@ void EmitReduce(const VectorPlan& plan, Emitter* emitter) {
 /* ------------------------------------------------------------------------- */
 
 std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
-    const VectorPlan& plan, const tirx::Var& chunk, const std::string& prefix,
-    const std::vector<Axis>& hoisted, bool single, ProgramPrologue* shared,
-    std::map<std::string, CarryEntry>* carry, bool allow_carry,
-    FragmentRegisterFile* registers) {
+    const VectorPlan& plan, arith::Analyzer* analyzer, const tirx::Var& chunk,
+    const std::string& prefix, const std::vector<Axis>& hoisted, bool single,
+    ProgramPrologue* shared, std::map<std::string, CarryEntry>* carry,
+    bool allow_carry, FragmentRegisterFile* registers) {
   TVM_FFI_ICHECK(!ReduceOf(plan).defined())
       << "a parallel vector axis with pre/post must go through the elementwise path";
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
   std::vector<Stmt> prologue;
-  std::set<std::string> written_keys;
-  for (const StorePlan& store : plan->pre_stores) written_keys.insert(BufferKey(store->spec->buffer));
-  for (const StorePlan& store : plan->stores) written_keys.insert(BufferKey(store->spec->buffer));
-  for (const StorePlan& store : plan->post_stores) written_keys.insert(BufferKey(store->spec->buffer));
+  const std::set<std::string> written_keys = WrittenStoreKeys(plan, registers);
+  const PreStores pre = SplitPreStores(plan, single, written_keys);
 
   std::vector<StorePlan> candidates;
   for (const StorePlan& store : plan->stores) {
     if (store->promote.has_value()) candidates.push_back(store);
   }
-  // A pre write folded into an accumulator initial value must NOT be hoisted:
-  // folding means it no longer writes memory, and the hoisted init depends on it.
-  std::set<const StorePlanNode*> foldable;
-  for (const StorePlan& store : candidates) {
-    for (const StorePlan& pre : plan->pre_stores) {
-      if (!pre->mask.has_value() && pre->value->is_uniform &&
-          SameBuffer(pre->spec->buffer, store->spec->buffer) &&
-          SameIndices(pre->spec->indices, store->spec->indices)) {
-        foldable.insert(pre.get());
-      }
-    }
-  }
-  std::vector<StorePlan> invariant_pre;
-  std::vector<StorePlan> loop_pre;
-  for (const StorePlan& store : plan->pre_stores) {
-    if (single && foldable.count(store.get()) == 0 &&
-        StoreIsLoopInvariant(store, plan, written_keys)) {
-      invariant_pre.push_back(store);
-    } else {
-      loop_pre.push_back(store);
-    }
-  }
-  std::set<const StorePlanNode*> invariant_ids;
-  for (const StorePlan& store : invariant_pre) invariant_ids.insert(store.get());
-  std::vector<StorePlan> remaining_pre;
-  for (const StorePlan& store : plan->pre_stores) {
-    if (invariant_ids.count(store.get()) == 0) remaining_pre.push_back(store);
-  }
-  loop_pre = remaining_pre;
 
   auto finish = [&](const Stmt& body) -> std::pair<std::vector<Stmt>, Stmt> {
-    if (!invariant_pre.empty()) {
-      Emitter pre_emitter(plan, IntImm32(0), prefix + "hopre_", false, 0, std::nullopt, shared,
-                          carry, false);
-      for (const StorePlan& store : invariant_pre) EmitOuterStore(store, &pre_emitter);
-      for (Stmt& stmt : pre_emitter.prologue_) prologue.push_back(std::move(stmt));
-      std::vector<Stmt> lets = pre_emitter.TakeLets();
+    HoistedPre hoisted = EmitHoistedPreStores(plan, analyzer, pre.invariant, prefix, shared, carry);
+    for (Stmt& stmt : hoisted.prologue) prologue.push_back(std::move(stmt));
+    if (!hoisted.lets.empty()) {
       std::vector<Stmt> out = prologue;
-      out.insert(out.end(), lets.begin(), lets.end());
+      out.insert(out.end(), hoisted.lets.begin(), hoisted.lets.end());
       return {out, body};
     }
     return {prologue, body};
@@ -2425,36 +2493,30 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     // SSA names of a program segment are prefixed with ``s{i}_`` so sibling
     // segments never collide.
     const std::string body_prefix = prefix + label;
-    Emitter body_emitter(plan, chunk_var, body_prefix, masked_tail, chunk_min, chunk_max,
+    Emitter body_emitter(plan, analyzer, chunk_var, body_prefix, masked_tail, chunk_min,
+                         chunk_max,
                          shared, carry, allow_carry, nullptr, 0, registers);
-    // A same-address pre write with a uniform value folds into the register
-    // initial value instead of a memory write.
+    // Plan-decided fold: a pre store marked ``pre_folded`` supplies the
+    // accumulator's initial value instead of writing memory. The plan already
+    // proved it is unmasked, uniform, at the accumulator's address and not read
+    // by a sibling.
     std::map<const StorePlanNode*, StorePlan> folded;
     std::set<const StorePlanNode*> consumed_pre;
     for (const StorePlan& store : candidates) {
-      for (const StorePlan& pre : loop_pre) {
-        if (consumed_pre.count(pre.get()) != 0 || pre->mask.has_value() ||
-            !pre->value->is_uniform) {
+      for (const StorePlan& folded_pre : pre.loop) {
+        if (consumed_pre.count(folded_pre.get()) != 0 ||
+            RoleOf(folded_pre) != StoreRole::kPreFolded) {
           continue;
         }
-        if (SameBuffer(pre->spec->buffer, store->spec->buffer) &&
-            SameIndices(pre->spec->indices, store->spec->indices)) {
-          // Folding drops the memory write; a sibling pre reading the buffer
-          // would see a stale value, so keep the write in that case.
-          bool sibling_reads = false;
-          for (const StorePlan& other : loop_pre) {
-            if (other.get() != pre.get() && ReadsBuffer(other->value, pre->spec->buffer)) {
-              sibling_reads = true;
-            }
-          }
-          if (sibling_reads) continue;
-          folded[store.get()] = pre;
-          consumed_pre.insert(pre.get());
+        if (SameBuffer(folded_pre->spec->buffer, store->spec->buffer) &&
+            SameIndices(folded_pre->spec->indices, store->spec->indices)) {
+          folded[store.get()] = folded_pre;
+          consumed_pre.insert(folded_pre.get());
           break;
         }
       }
     }
-    for (const StorePlan& store : loop_pre) {
+    for (const StorePlan& store : pre.loop) {
       if (consumed_pre.count(store.get()) == 0) EmitStore(plan, store, &body_emitter);
     }
     std::vector<Stmt> pre_lets = body_emitter.TakeLets();
@@ -2508,18 +2570,11 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     std::vector<Stmt> main_lets = body_emitter.TakeLets();
     body_emitter.clear_forward();
 
-    // Write-back: when a post overwrites the same address and reads the old
-    // value, hand the write-back to the post (register forwarding, saves a vsts).
+    // Write-back: the plan marks a store whose post overwrites the same address
+    // and consumes the old value, so the post owns the single ``vsts``.
     std::set<const StorePlanNode*> superseded;
     for (const StorePlan& store : candidates) {
-      for (const StorePlan& post : plan->post_stores) {
-        if (!post->mask.has_value() &&
-            SameBuffer(post->spec->buffer, store->spec->buffer) &&
-            SameIndices(post->spec->indices, store->spec->indices) &&
-            SameAddressLoad(post->value, post->spec->buffer, post->spec->indices).defined()) {
-          superseded.insert(store.get());
-        }
-      }
+      if (RoleOf(store) == StoreRole::kPostSuperseded) superseded.insert(store.get());
     }
     for (const auto& entry : acc_order) {
       const StorePlan& store = std::get<0>(entry);
@@ -2647,13 +2702,16 @@ Stmt EmitProgram(const VectorProgram& program, FragmentRegisterFile* registers) 
   }
   ProgramPrologue shared;
   std::map<std::string, CarryEntry> carry;
+  // One Analyzer for the whole program: every chunk / segment emitter shares it,
+  // so a 16-chunk register segment no longer builds 16 analyzers (~6 us each).
+  arith::Analyzer analyzer;
   std::vector<Stmt> prologue;
   if (owns_registers) DeclareRegisters(local, &prologue);
   std::vector<Stmt> bodies;
   for (size_t index = 0; index < program->segments.size(); ++index) {
     tirx::Var seg_chunk("chunk_s" + std::to_string(index), DataType::Int(32));
     std::vector<Axis> hoisted(program->axes.begin(), program->axes.end());
-    auto emitted = EmitSegmentStmts(program->segments[index], seg_chunk, hoisted,
+    auto emitted = EmitSegmentStmts(program->segments[index], &analyzer, seg_chunk, hoisted,
                                     "s" + std::to_string(index) + "_",
                                     program->segments.size() == 1, &shared, &carry,
                                     SegmentConsumesCarry(program->segments[index], hoisted),
@@ -2675,6 +2733,7 @@ Stmt EmitProgram(const VectorProgram& program, FragmentRegisterFile* registers) 
 }  // namespace
 
 tirx::Stmt EmitPlan(const ffi::ObjectRef& plan, FragmentRegisterFile* registers) {
+  ResetBufferKeyCache();
   if (const auto* program = plan.as<VectorProgramNode>()) {
     return EmitProgram(ffi::GetRef<VectorProgram>(program), registers);
   }
@@ -2688,8 +2747,9 @@ tirx::Stmt EmitPlan(const ffi::ObjectRef& plan, FragmentRegisterFile* registers)
     registers = &local;
   }
   tirx::Var chunk("chunk", DataType::Int(32));
-  auto emitted = EmitSegmentStmts(node, chunk, {}, "", /*single=*/true, nullptr, nullptr,
-                                  false, registers);
+  arith::Analyzer analyzer;
+  auto emitted = EmitSegmentStmts(node, &analyzer, chunk, {}, "", /*single=*/true, nullptr,
+                                  nullptr, false, registers);
   std::vector<Stmt> all;
   if (owns_registers) DeclareRegisters(local, &all);
   for (Stmt& stmt : emitted.first) all.push_back(std::move(stmt));

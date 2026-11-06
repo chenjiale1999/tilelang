@@ -57,10 +57,21 @@ const Axis* AxisOfVar(const std::vector<Axis>& axes, const tirx::Var& var) {
   return nullptr;
 }
 
-bool ProveGuard(const PrimExpr& expr, const ValueContext& ctx, int64_t lo, int64_t hi) {
-  arith::Analyzer probe;
-  probe.Bind(ctx.vector_axis->var, Range(IntImm32(lo), IntImm32(hi)));
-  return probe.CanProve(expr);
+bool ProveGuard(const PrimExpr& expr, const ValueContext& ctx, arith::Analyzer* probe,
+                int64_t begin, int64_t end) {
+  // A predicate that depends on memory cannot be decided from the iteration
+  // range alone: the probe analyzer only constrains the vector axis, so the
+  // final Z3 fallback (one solver query per probe, ~0.7ms) is pure overhead and
+  // always fails. Keeping the guard is conservative; skipping the query is not.
+  if (ContainsBufferLoad(expr)) return false;
+  // One analyzer per probe batch: ``GuardFreeBounds`` asks the same predicate
+  // once per chunk, and rebuilding the sub-analyzers (plus the Z3 client) for
+  // every chunk dominated the proof. Re-binding is safe because every
+  // sub-analyzer accepts an override and only the axis range changes.
+  // ``Range`` in this fork is ``Range(begin, end)`` (not ``(min, extent)``).
+  probe->Bind(ctx.vector_axis->var, Range(IntImm32(begin), IntImm32(end)),
+              /*allow_override=*/true);
+  return probe->CanProve(expr);
 }
 
 /*! \brief Lane-uniform sub-expression -> scalar; validates masked loads (P0-3). */
@@ -467,13 +478,21 @@ std::pair<int64_t, std::optional<int64_t>> GuardFreeBounds(const PrimExpr& expr,
     return {0, std::nullopt};
   }
   int64_t chunks = (*extent + lanes - 1) / lanes;
+  arith::Analyzer probe;
+  // Fast path: a guard that holds over the whole axis holds in every chunk, so
+  // one full-range proof replaces the per-chunk scan. This is the common case
+  // (``i < extent``-style predicates) and the scan costs one Z3 query per chunk.
+  if (ProveGuard(expr, ctx, &probe, 0, *extent)) {
+    return {chunks - 1, 1};
+  }
   int64_t until = 0;
-  while (until + 1 < chunks && ProveGuard(expr, ctx, 0, (until + 1) * lanes)) {
+  while (until + 1 < chunks && ProveGuard(expr, ctx, &probe, 0, (until + 1) * lanes)) {
     ++until;
   }
   std::optional<int64_t> from;
   for (int64_t chunk = chunks - 1; chunk > 0; --chunk) {
-    if (!ProveGuard(expr, ctx, chunk * lanes, *extent)) break;
+    // The tail chunk covers ``[chunk * lanes, extent)``.
+    if (!ProveGuard(expr, ctx, &probe, chunk * lanes, *extent)) break;
     from = chunk;
   }
   return {until, from};

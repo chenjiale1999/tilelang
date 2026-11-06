@@ -15,6 +15,27 @@ namespace tvm {
 namespace tl {
 namespace polyhedral {
 
+const std::string& StoreRoleName(StoreRole role) {
+  static const std::string kMain = "main";
+  static const std::string kPreFolded = "pre_folded";
+  static const std::string kPostSuperseded = "post_superseded";
+  switch (role) {
+    case StoreRole::kPreFolded:
+      return kPreFolded;
+    case StoreRole::kPostSuperseded:
+      return kPostSuperseded;
+    case StoreRole::kMain:
+      break;
+  }
+  return kMain;
+}
+
+StoreRole StoreRoleFromName(const std::string& name) {
+  if (name == "pre_folded") return StoreRole::kPreFolded;
+  if (name == "post_superseded") return StoreRole::kPostSuperseded;
+  return StoreRole::kMain;
+}
+
 StorePlan MakeStorePlan(StoreSpec spec, AccessInfo access, ValueNode value,
                         ffi::Optional<ValueNode> mask, AccessClass kind,
                         ffi::Optional<ValueNode> index) {
@@ -66,6 +87,9 @@ VectorPlan MakeVectorPlan(ffi::Array<Axis> axes, Axis vector_axis, int64_t lanes
   node->lanes = lanes;
   node->chunks = std::move(chunks);
   node->tail = std::move(tail);
+  // A static segment starts with every chunk live; ``-1`` is reserved for the
+  // dynamic chunk count (unknown at plan time).
+  node->chunk_hi = node->chunks.has_value() ? *node->chunks : -1;
   return VectorPlan(std::move(node));
 }
 

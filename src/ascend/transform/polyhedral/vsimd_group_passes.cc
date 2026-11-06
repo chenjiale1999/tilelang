@@ -178,8 +178,8 @@ bool PlanRegionItem(const VSimdProgram &program, const VSimdProgramItem &item,
  *
  * The copy is element-wise; a source extent of 1 along a dimension broadcasts.
  */
-bool BuildCopyNest(const VSimdCopyReducePayload &payload, Stmt *out,
-                   PlanFailure *failure) {
+bool BuildCopyNest(const VSimdCopyReducePayload &payload, arith::Analyzer *analyzer,
+                   Stmt *out, PlanFailure *failure) {
   const int rank = static_cast<int>(payload.dst_extents.size());
   if (rank == 0) {
     failure->reason = "a rank-0 copy has no parallel domain";
@@ -191,13 +191,12 @@ bool BuildCopyNest(const VSimdCopyReducePayload &payload, Stmt *out,
                       std::to_string(rank) + ")";
     return false;
   }
-  arith::Analyzer analyzer;
   std::vector<Var> vars;
   std::vector<PrimExpr> dst_indices;
   std::vector<PrimExpr> src_indices;
   for (int d = 0; d < rank; ++d) {
     vars.push_back(MakeLoopVar("cp_i", d));
-    if (!analyzer.CanProveEqual(payload.src_extents[d], payload.dst_extents[d]) &&
+    if (!analyzer->CanProveEqual(payload.src_extents[d], payload.dst_extents[d]) &&
         !tirx::is_one(payload.src_extents[d])) {
       failure->reason =
           "copy dimension " + std::to_string(d) + " has unequal extents " +
@@ -224,7 +223,8 @@ bool BuildCopyNest(const VSimdCopyReducePayload &payload, Stmt *out,
 bool PlanCopyItem(const VSimdProgram &program, const VSimdProgramItem &item,
                   const SBlock &vf,
                   const std::vector<std::pair<Buffer, Layout>> &program_layouts,
-                  VSimdItemPlan *out, PlanFailure *failure) {
+                  arith::Analyzer *analyzer, VSimdItemPlan *out,
+                  PlanFailure *failure) {
   VSimdCopyReducePayload payload;
   std::string error;
   if (!ReadVSimdCopy(item, &payload, &error)) {
@@ -245,7 +245,7 @@ bool PlanCopyItem(const VSimdProgram &program, const VSimdProgramItem &item,
     return false;
   }
   Stmt nest;
-  if (!BuildCopyNest(payload, &nest, failure)) return false;
+  if (!BuildCopyNest(payload, analyzer, &nest, failure)) return false;
   try {
     VectorProgram plan =
         BuildPlan(nest, std::nullopt, MakeOptions(vf, program_layouts));
@@ -296,8 +296,8 @@ bool ReduceRecipeOf(const std::string &kind, std::string *recipe) {
  * Supported shapes: the destination drops the reduced dimension (the usual
  * ``reduce(src(m, k), dst(m), dim=1)``), or keeps it with extent 1.
  */
-bool MapReduceDims(const VSimdReducePayload &payload, bool *kept_dim,
-                   std::vector<int> *src_to_dst, PlanFailure *failure) {
+bool MapReduceDims(const VSimdReducePayload &payload, arith::Analyzer *analyzer,
+                   bool *kept_dim, std::vector<int> *src_to_dst, PlanFailure *failure) {
   const int src_rank = static_cast<int>(payload.src_extents.size());
   const int dst_rank = static_cast<int>(payload.dst_extents.size());
   if (payload.dim < 0 || payload.dim >= src_rank) {
@@ -328,11 +328,10 @@ bool MapReduceDims(const VSimdReducePayload &payload, bool *kept_dim,
     return false;
   }
 
-  arith::Analyzer analyzer;
   for (int t = 0; t < src_rank; ++t) {
     if (t == payload.dim) continue;
     const int d = (*src_to_dst)[t];
-    if (!analyzer.CanProveEqual(payload.src_extents[t], payload.dst_extents[d]) &&
+    if (!analyzer->CanProveEqual(payload.src_extents[t], payload.dst_extents[d]) &&
         !tirx::is_one(payload.src_extents[t])) {
       failure->reason = "reduce dimension " + std::to_string(t) +
                         " does not match its destination extent";
@@ -430,7 +429,8 @@ bool BuildReduceInitNest(const VSimdReducePayload &payload,
 bool PlanReduceItem(const VSimdProgram &program, const VSimdProgramItem &item,
                     const SBlock &vf,
                     const std::vector<std::pair<Buffer, Layout>> &program_layouts,
-                    VSimdItemPlan *out, PlanFailure *failure) {
+                    arith::Analyzer *analyzer, VSimdItemPlan *out,
+                    PlanFailure *failure) {
   VSimdReducePayload payload;
   std::string error;
   if (!ReadVSimdReduce(item, &payload, &error)) {
@@ -457,7 +457,7 @@ bool PlanReduceItem(const VSimdProgram &program, const VSimdProgramItem &item,
 
   bool kept_dim = false;
   std::vector<int> src_to_dst;
-  if (!MapReduceDims(payload, &kept_dim, &src_to_dst, failure)) return false;
+  if (!MapReduceDims(payload, analyzer, &kept_dim, &src_to_dst, failure)) return false;
 
   Stmt nest;
   if (!BuildReduceNest(payload, kept_dim, src_to_dst, &nest, failure))
@@ -545,6 +545,9 @@ VSimdGroupPlan PlanOneGroup(
   }
 
   PlanFailure failure;
+  // One analyzer for the whole group: the payload validation only needs
+  // ``CanProveEqual`` on extents, and building one per item was pure overhead.
+  arith::Analyzer analyzer;
   std::vector<VSimdItemPlan> items;
   for (int index : group.items) {
     if (index < 0 || index >= static_cast<int>(program.items.size())) {
@@ -557,9 +560,11 @@ VSimdGroupPlan PlanOneGroup(
     if (item.kind == "REGION") {
       ok = PlanRegionItem(program, item, body, vf, &plan, &failure);
     } else if (item.kind == "COPY") {
-      ok = PlanCopyItem(program, item, vf, program_layouts, &plan, &failure);
+      ok = PlanCopyItem(program, item, vf, program_layouts, &analyzer, &plan,
+                        &failure);
     } else if (item.kind == "REDUCE") {
-      ok = PlanReduceItem(program, item, vf, program_layouts, &plan, &failure);
+      ok = PlanReduceItem(program, item, vf, program_layouts, &analyzer, &plan,
+                          &failure);
     } else {
       failure.reason = "unexpected " + item.kind + " item in a P1_LIFTABLE group";
     }
