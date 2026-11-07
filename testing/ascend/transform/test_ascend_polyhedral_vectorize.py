@@ -203,6 +203,14 @@ def _plan(func, layouts=None):
     return build_plan(_first_parallel(func), layouts=layouts)
 
 
+@contextlib.contextmanager
+def _rejects(code: str):
+    """Assert the stable rejection code (the diagnostic text is free to change)."""
+    with pytest.raises(Unsupported) as excinfo:
+        yield excinfo
+    assert excinfo.value.code == code
+
+
 def _emitted_text(func, layouts=None) -> str:
     """向量化后的 IR 文本（阶段一/阶段二的 store 形态断言用）。"""
     return str(emit_plan(_plan(func, layouts)))
@@ -735,7 +743,7 @@ def test_fragment_register_non_identity_layout_rejected():
     nest = _outer_parallel_nests(k)[0]
     frag = _fragment_buffer(nest)
     padded = Layout((N,), lambda i: [i // 2])
-    with pytest.raises(Unsupported, match="non-identity layout"):
+    with _rejects("fragment.non_identity_layout"):
         build_plan(nest, layouts={frag: padded}, vf_alloc_scope=[frag])
 
 
@@ -758,7 +766,7 @@ def test_fragment_register_strided_access_rejected():
             T.copy(c_ub, C)
 
     nest = _outer_parallel_nests(k)[0]
-    with pytest.raises(Unsupported, match="not contiguous along vector axis"):
+    with _rejects("fragment.not_contiguous"):
         build_plan(nest, vf_alloc_scope=_fragment_scope(nest))
 
 
@@ -1794,7 +1802,7 @@ def test_true_random_access_is_rejected():
             for i in T.Parallel(N):
                 c[i] = a[i // 3]
 
-    with pytest.raises(Unsupported, match="not a power of two"):
+    with _rejects("plan.no_vector_axis"):
         _plan(k)
 
 
@@ -1879,7 +1887,7 @@ def test_nested_loop_rejected():
                         cnt[0] += 1
                         c[tm, g_i] = a[tm, g_i]
 
-    with pytest.raises(Unsupported, match="nested serial loop"):
+    with _rejects("body.nested_loop"):
         _plan(k)
 
 
@@ -2045,7 +2053,7 @@ def test_serial_shared_scalar_rejected():
                         cnt[0] += 1
                         c[i, j] = a[i, j]
 
-    with pytest.raises(Unsupported, match="nested serial loop"):
+    with _rejects("body.nested_loop"):
         _plan(k)
 
 
@@ -2062,7 +2070,7 @@ def test_serial_stencil_rejected():
                 for j in T.serial(KS):
                     c[i, j] = c[i, j - 1] + a[i, j]
 
-    with pytest.raises(Unsupported, match="nested serial loop"):
+    with _rejects("body.nested_loop"):
         _plan(k)
 
 
@@ -2324,7 +2332,7 @@ def test_multi_serial_one_unclean_is_rejected():
                 for l in T.serial(KS):
                     c[i, l] = c[i, l - 1] + a[i, l]
 
-    with pytest.raises(Unsupported, match="nested serial loop"):
+    with _rejects("body.nested_loop"):
         _plan(k)
 
 
@@ -2475,7 +2483,7 @@ def test_multi_segment_failure_reason_is_preserved():
                 for l in T.serial(KS):
                     flags[i, l] = a[i, l] > 0.0
 
-    with pytest.raises(Unsupported, match="nested serial loop") as excinfo:
+    with _rejects("body.nested_loop") as excinfo:
         _plan(k)
     notes = excinfo.value.diagnostics
     assert any(note.startswith("segment 1") for note in notes)
@@ -3546,7 +3554,7 @@ def test_conditional_reduction_is_rejected():
                 if i < 64:
                     s[0] = s[0] + a[i]
 
-    with pytest.raises(Unsupported, match="conditional reduction"):
+    with _rejects("reduce.conditional"):
         _single_segment(k)
 
 
@@ -3609,7 +3617,7 @@ def test_multiple_writes_to_one_buffer_at_different_addresses_are_rejected():
                     c[i, 2 * j] = a[i, j]
                     c[i, j] = 2.0
 
-    with pytest.raises(Unsupported, match="nested serial loop") as excinfo:
+    with _rejects("body.nested_loop") as excinfo:
         _single_segment(k)
     assert any("may alias" in note for note in excinfo.value.diagnostics)
 
@@ -3927,7 +3935,7 @@ def test_mixed_width_with_predicate_is_rejected():
             T.copy(b_ub, B)
             T.copy(c_ub, C)
 
-    with pytest.raises(Unsupported, match="statement predicate"):
+    with _rejects("body.statement_predicate"):
         _plan(k)
 
 
@@ -3952,7 +3960,7 @@ def test_mixed_width_with_reduction_is_rejected():
             T.copy(s_ub, S)
             T.copy(c_ub, C)
 
-    with pytest.raises(Unsupported, match="no vectorizable axis"):
+    with _rejects("plan.no_vector_axis"):
         _plan(k)
 
 
@@ -4244,7 +4252,7 @@ def test_nz_store_with_predicate_is_rejected():
                     c_ub[i, j] = T.exp(a_ub[i, j])
             T.copy(c_ub, C)
 
-    with pytest.raises(Unsupported, match="statement predicate"):
+    with _rejects("body.statement_predicate"):
         _plan(k, _nz(k))
 
 
@@ -4263,7 +4271,7 @@ def test_nz_store_with_partial_column_chunk_is_rejected():
                 c_ub[i, j] = T.exp(a_ub[i, j])
             T.copy(c_ub, C)
 
-    with pytest.raises(Unsupported, match="whole number of chunks"):
+    with _rejects("plan.partial_chunks"):
         _plan(k, _nz(k))
 
 

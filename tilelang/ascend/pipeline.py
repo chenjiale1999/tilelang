@@ -123,9 +123,14 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # Groups P2/P3 reject stay as ``T.Parallel`` / tile ops and are handled by
     # the legacy lowering below.
     if pass_ctx.config.get(tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT, True):
+        # Lower VF-local register tiles into one fragment per 2048-bit vector
+        # register (and elementwise uses into chunk-wise T.Parallel nests)
+        # before P1, so P2/P3 can vectorize every register without any UB
+        # round-trip. Fragments with unsupported uses stay untouched.
+        # mod = ascend_transform.AscendSimdVFallocFragment()(mod)
         mod = ascend_transform.AscendLiftVSimd()(mod)
         mod = ascend_transform.AscendVectorizeVSimd()(mod)
-    mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+    # mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
     mod = ascend_transform.AscendLowerTileOp()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 

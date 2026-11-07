@@ -57,6 +57,18 @@ def AscendAnalyzeVSimdRegion():
     return _ffi_api.AscendAnalyzeVSimdRegion()  # type: ignore
 
 
+def AscendSimdVFallocFragment():
+    """Pre-P1: lower SimdVF-local ``T.alloc_fragment`` tiles into register arrays.
+
+    A fragment larger than one 2048-bit vector register is split into
+    register-sized fragments, and its elementwise uses (``T.Parallel`` /
+    elementwise ``T.serial`` / full-tile ``T.copy``) are rewritten into
+    chunk-wise ``T.Parallel`` nests, so P2/P3 can vectorize each register.
+    Fragments with any other use are left untouched.
+    """
+    return _ffi_api.AscendSimdVFallocFragment()  # type: ignore
+
+
 def AscendLiftVSimd():
     """P1 metadata pass: attach per-VF ``tl.vsimd.program`` annotations."""
     return _ffi_api.AscendLiftVSimd()  # type: ignore
@@ -311,6 +323,7 @@ __all__ = [
     "AscendAnalyzeSimdVFCaptureInfo",
     "AscendAnalyzeVSimdRegion",
     "AscendAnalyzeVSimdRegionReport",
+    "AscendSimdVFallocFragment",
     "AscendLiftVSimd",
     "AscendPlanVSimd",
     "AscendEmitVSimd",
