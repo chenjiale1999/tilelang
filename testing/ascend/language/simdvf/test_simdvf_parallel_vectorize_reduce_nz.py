@@ -11,21 +11,26 @@ the 8-bit tail and the full ``vcvt`` pair matrix), and NZ layout / pack2
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
 import tilelang
 import tilelang.testing
 from tilelang.ascend import language as T
 from tilelang.layout import make_ascend_compact_nz_layout
 
-from testing.ascend.language._simdvf_parallel_helpers import (
+from testing.ascend.language.simdvf._simdvf_parallel_helpers import (
     F32,
     M,
     N,
     _assert_close,
     _compile,
     _nz_physical,
+    _require_npu_runtime,
 )
+
+
+@pytest.fixture(autouse=True)
+def _npu_runtime():
+    _require_npu_runtime()
 
 
 # ---------------------------------------------------------------------------

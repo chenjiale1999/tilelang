@@ -1,9 +1,10 @@
 """Shared constants and helpers for the ``T.Parallel`` device regressions.
 
 Split out of the former single-file suite; the cases live in
-``test_tilelang_ascend_simdvf_parallel*.py``.
+``test_simdvf_parallel_vectorize*.py``.
 """
 
+import pytest
 import torch
 
 import tilelang
@@ -14,6 +15,17 @@ NAN = float("nan")
 INF = float("inf")
 
 M, N = 8, 128
+
+
+def _require_npu_runtime():
+    """Skip the calling test unless torch_npu and a usable NPU are present."""
+    if not hasattr(torch, "npu"):
+        pytest.skip("torch.npu is unavailable in the current environment")
+    try:
+        _ = torch.randn(1, device=torch.device("npu"))
+        torch.npu.synchronize()
+    except Exception as err:
+        pytest.skip(f"NPU runtime is unavailable: {err}")
 
 
 def _compile(func, out_idx=-1):

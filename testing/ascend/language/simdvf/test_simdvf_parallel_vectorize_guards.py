@@ -8,13 +8,12 @@ writing disjoint addresses of the *same* buffer (guard-aware legality).
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
 import tilelang
 import tilelang.testing
 from tilelang.ascend import language as T
 
-from testing.ascend.language._simdvf_parallel_helpers import (
+from testing.ascend.language.simdvf._simdvf_parallel_helpers import (
     F32,
     INF,
     N,
@@ -22,7 +21,13 @@ from testing.ascend.language._simdvf_parallel_helpers import (
     _assert_close,
     _compile,
     _cycle,
+    _require_npu_runtime,
 )
+
+
+@pytest.fixture(autouse=True)
+def _npu_runtime():
+    _require_npu_runtime()
 
 
 # ---------------------------------------------------------------------------

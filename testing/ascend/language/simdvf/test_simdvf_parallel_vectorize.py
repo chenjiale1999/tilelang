@@ -17,13 +17,12 @@ indirect runtime gather, transposed scatter).
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
 import tilelang
 import tilelang.testing
 from tilelang.ascend import language as T
 
-from testing.ascend.language._simdvf_parallel_helpers import (
+from testing.ascend.language.simdvf._simdvf_parallel_helpers import (
     F32,
     INF,
     M,
@@ -31,7 +30,13 @@ from testing.ascend.language._simdvf_parallel_helpers import (
     NAN,
     _assert_close,
     _compile,
+    _require_npu_runtime,
 )
+
+
+@pytest.fixture(autouse=True)
+def _npu_runtime():
+    _require_npu_runtime()
 
 
 # ---------------------------------------------------------------------------
