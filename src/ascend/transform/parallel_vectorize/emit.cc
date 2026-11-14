@@ -29,7 +29,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 tirx::Stmt VstVldBarrier() {
   return tirx::Evaluate(
@@ -2943,6 +2943,6 @@ tirx::Stmt EmitPlan(const ffi::ObjectRef& plan) {
   return SeqOfVec(all)[0];
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

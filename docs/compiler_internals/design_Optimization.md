@@ -1,3 +1,7 @@
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
 读完了报告和全部 23 个源文件（共 11594 行）。结论先给：**分层骨架是正确的，但实现层已经出现了三类系统性的结构问题**——同一语义有 2–3 个事实来源、策略在 emit 层被重复推导、类型靠字符串传递。下面按严重程度列出，每条都给出代码位置。
 
 ---
@@ -6,9 +10,9 @@
 
 ### D1 ⚠️ P1→P2 载体是 untyped Map，P2 解码后丢掉 90% ★最严重
 
-- P1 把 item 事实写成 `rec.meta.Set("kind", ...)` 这种手写键值（[lift_vsimd.cc](file:///home/cjl/workspace/tilelang/src/ascend/transform/lift_vsimd.cc#L520-L535)），P2 再用 405 行手工解码（[vsimd_payload_read.cc](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/vsimd_payload_read.cc#L135-L260)，`GetBuffer/GetVar/ReadOptionalInt/Fail`）。
-- 但 [PlanRegionItem](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/vsimd_group_passes.cc#L141-L157) 只用了 `layouts / assumptions / bindings / shape_syms`；`domain`、`accesses`、`outer_vars`、`local_views` 解出来后全部丢弃（报告 §12 C 也承认了）。
-- 真正的规划输入是 `body.stmts[span_begin]` **重新跑一遍**规范化与分类（[plan.cc:2593-2598](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2593-L2598)）。
+- P1 把 item 事实写成 `rec.meta.Set("kind", ...)` 这种手写键值（[lift_vsimd.cc](file:///home/cjl/workspace/tilelang/src/ascend/transform/lift_vsimd.cc#L520-L535)），P2 再用 405 行手工解码（[vsimd_payload_read.cc](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/vsimd_payload_read.cc#L135-L260)，`GetBuffer/GetVar/ReadOptionalInt/Fail`）。
+- 但 [PlanRegionItem](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/vsimd_group_passes.cc#L141-L157) 只用了 `layouts / assumptions / bindings / shape_syms`；`domain`、`accesses`、`outer_vars`、`local_views` 解出来后全部丢弃（报告 §12 C 也承认了）。
+- 真正的规划输入是 `body.stmts[span_begin]` **重新跑一遍**规范化与分类（[plan.cc:2593-2598](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2593-L2598)）。
 
 **后果**：同一个"访问事实"存在两套推导（P1 PR-A/PR-C 一套，`ClassifyAccess` 一套），两套已经出现差异——报告 §12.1 的 A 类表（P1 拒绝、P2 不拒绝）就是这个差异的证据；另外还有 ~600 行编码 + 405 行解码，只为了传 4 个字段，而且两边都没有 schema 校验。
 
@@ -18,15 +22,15 @@
 
 ### D2 ⚠️ Plan 已决定的事，emit 又推导一遍，而且写了两遍
 
-Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L1981-L1988)），emit 阶段却重新计算了 5 类策略：
+Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L1981-L1988)），emit 阶段却重新计算了 5 类策略：
 
 | 策略 | 位置 |
 |---|---|
-| folded pre（单位元折进累加器） | [emit.cc:2380-2389](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2380-L2389) **和** [2432-2456](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2432-L2456)（两遍） |
-| invariant pre 是否可外提 | [2092](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2092) **和** [2393](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2393) |
-| superseded post（寄存器转发） | [2513-2523](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2513-L2523) |
-| carry 资格 | [2548-2557](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2548-L2557) |
-| 外层轴补齐 | [2063-2068](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2063-L2068) |
+| folded pre（单位元折进累加器） | [emit.cc:2380-2389](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2380-L2389) **和** [2432-2456](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2432-L2456)（两遍） |
+| invariant pre 是否可外提 | [2092](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2092) **和** [2393](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2393) |
+| superseded post（寄存器转发） | [2513-2523](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2513-L2523) |
+| carry 资格 | [2548-2557](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2548-L2557) |
+| 外层轴补齐 | [2063-2068](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2063-L2068) |
 
 而 `EmitSegmentStmts`（2089-2174）与 `EmitParallelAxisParts`（2390-2420）是**同一段 pre/post/prologue 逻辑的两份拷贝**。任何一条规则变化（例如"folded pre 不能被 hoist"）必须同步改 3 处——你记忆里记录的"COW 静默丢写"就是这类多写点造成的。
 
@@ -38,11 +42,11 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 | 路径 | 入口 | 拆段方式 | flatten | hoist 计算 |
 |---|---|---|---|---|
-| 单段 | [SplitNest](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L313-L375) | 单 serial + pre/post | 允许 | [2630-2635](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2630-L2635) |
-| 多 serial 段 | [TryBuildProgram](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2462-L2570) | `AbsorbSerialChain` | 允许 | [2547-2560](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2547-L2560) |
-| tile-op 段 | [TryBuildSplitAllProgram](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2194-L2459) | `build_loop_source` + `split_trailing_serial` | **禁止**带 serial 轴段 | [2440-2452](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2440-L2452) |
+| 单段 | [SplitNest](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L313-L375) | 单 serial + pre/post | 允许 | [2630-2635](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2630-L2635) |
+| 多 serial 段 | [TryBuildProgram](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2462-L2570) | `AbsorbSerialChain` | 允许 | [2547-2560](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2547-L2560) |
+| tile-op 段 | [TryBuildSplitAllProgram](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2194-L2459) | `build_loop_source` + `split_trailing_serial` | **禁止**带 serial 轴段 | [2440-2452](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2440-L2452) |
 
-三处还各自实现了一遍「相邻链合并」（`merge_chain_bodies/zip_loop_vars/same_loop_shape`，2359-2379），而 `AbsorbSerialChain` 完全不复用。`BuildPlan` 末尾的 [诊断合并 hack](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L2614-L2628)（用 `std::equal` 判断 notes 是否已经合并）是控制流过于复杂、难以梳理的直接证据。
+三处还各自实现了一遍「相邻链合并」（`merge_chain_bodies/zip_loop_vars/same_loop_shape`，2359-2379），而 `AbsorbSerialChain` 完全不复用。`BuildPlan` 末尾的 [诊断合并 hack](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L2614-L2628)（用 `std::equal` 判断 notes 是否已经合并）是控制流过于复杂、难以梳理的直接证据。
 
 **改法**：收敛成一个 `Segmenter(body) -> vector<SegmentIR>`，`SplitNest` 退化为"只有一段"的特例；`TryBuildProgram` 的 `seg_positions < 2 → return nullopt` 这类探测逻辑全部消失。
 
@@ -56,7 +60,7 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D5 128 处 `throw Unsupported`，能力边界不可枚举
 
-`plan.cc` 74 处、`body.cc` 26 处、`emit.cc` 15 处。仅 [BuildPlanForAxis](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L1765-L2069) 一个函数 300 行里就有 15 个 throw，与规划逻辑完全交错。
+`plan.cc` 74 处、`body.cc` 26 处、`emit.cc` 15 处。仅 [BuildPlanForAxis](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L1765-L2069) 一个函数 300 行里就有 15 个 throw，与规划逻辑完全交错。
 
 **后果**："这条 nest 为什么没被向量化"无法结构化回答；报告 §9/§10 的能力表只能人工维护；新增支持必须读懂 300 行才能找到该删哪个 throw。
 
@@ -66,7 +70,7 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D6 类型全部字符串化
 
-- `recipe` 字符串 if-else 链：[Emitter::Build](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L1252-L1406) 150 行、50 处 `recipe == "..."`；
+- `recipe` 字符串 if-else 链：[Emitter::Build](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L1252-L1406) 150 行、50 处 `recipe == "..."`；
 - `kind_value` 存 `AccessClass` 名字再 `AccessClassFromName` 转回：`emit.cc` 7 处、全库 31 处；
 - `status`（`PLANNED/REJECTED/LIFTED/P1_LIFTABLE`）、`storage`（`shared/register`）、`store_lane_mode`（`full/pk_half/pk_quarter`）、`layout_kind`（`nd/nz`）全是裸字符串（30 处）；
 - item kind `"REGION"/"COPY"/"REDUCE"` 散落 6 个文件。
@@ -79,9 +83,9 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D7 `Emitter` 是 550 行 god class
 
-[emit.cc:708-1250](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L708-L1250)：30 个成员、11 参构造、同时负责 SSA 绑定/掩码缓存/谓词/地址/值 memo/pair 域/carry 转发/寄存器文件/prologue。
+[emit.cc:708-1250](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L708-L1250)：30 个成员、11 参构造、同时负责 SSA 绑定/掩码缓存/谓词/地址/值 memo/pair 域/carry 转发/寄存器文件/prologue。
 
-尤其 [InlineFreshBind](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L771-L785)：通过"回滚最后一条 let + 清理 memo"实现 in-place 写，隐含了对发射顺序的强依赖。这类改写正确与否取决于上一行是否恰好是那条 bind，很难测试。
+尤其 [InlineFreshBind](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L771-L785)：通过"回滚最后一条 let + 清理 memo"实现 in-place 写，隐含了对发射顺序的强依赖。这类改写正确与否取决于上一行是否恰好是那条 bind，很难测试。
 
 **改法**：拆 `ValueBuilder`（值 DAG → SSA）、`AddressBuilder`、`MaskCache`、`StoreEmitter`；或者改成"先建完整表达式 DAG，再统一 SSA 化 + 打印"两段式，彻底消除回滚式改写。
 
@@ -89,13 +93,13 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D8 值同一性靠"打印字符串"，且 Var 只用名字
 
-[ValueKey](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L535-L550) 递归打印整个子树；[ExprKeyInto](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L327-L331) 对 `VarNode` **只取 `name_hint`**。Buffer 已经用 data 指针修正（495-512），Var 没有。
+[ValueKey](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L535-L550) 递归打印整个子树；[ExprKeyInto](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L327-L331) 对 `VarNode` **只取 `name_hint`**。Buffer 已经用 data 指针修正（495-512），Var 没有。
 
 **风险**：
 1. 同名不同 Var（两个 nest 的 `i`、或两次 codegen 重名的 `v0`）会命中同一 cache 键 → 串值；
 2. key 无节点级 memo，每个新节点都重打印整个子树，DAG 共享时是重复的平方级工作；
 3. `Call` 分支（465-475）在 `op` 是 `GlobalVar` 时只打 `"C:("`，丢掉函数身份 → 不同调用同参数会碰撞；
-4. `ExprKeyInto` 里 [396-397](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L396-L397) 是明显的残留死代码（`static_cast<...>(nullptr)` 再 `(void)`）。
+4. `ExprKeyInto` 里 [396-397](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L396-L397) 是明显的残留死代码（`static_cast<...>(nullptr)` 再 `(void)`）。
 
 **改法**：构造期 hash-consing 分配节点 id，key 用 id 组合（O(1) 且正确）；或给 `Var` 带上唯一 id。
 
@@ -103,7 +107,7 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D9 全局互斥锁在 dtype 最热路径上
 
-[primitives.cc:332-383](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/primitives.cc#L332-L383)：`DataTypeOf` / `ElemDataType` / `ElemDtype` 每次调用都 `lock_guard` + `std::map` 查找。而 emit 每条指令都要构造 dtype。TVM 并行编译多个 PrimFunc 时，这条全局锁会把所有编译线程串行化。
+[primitives.cc:332-383](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/primitives.cc#L332-L383)：`DataTypeOf` / `ElemDataType` / `ElemDtype` 每次调用都 `lock_guard` + `std::map` 查找。而 emit 每条指令都要构造 dtype。TVM 并行编译多个 PrimFunc 时，这条全局锁会把所有编译线程串行化。
 
 **改法**：`thread_local` 缓存，或固定小表（code/bits/lanes 组合有限）用数组/switch。
 
@@ -111,7 +115,7 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 ### D10 测试约定绑在英文诊断文案上
 
-`pytest.raises(..., match=...)` 匹配 `Unsupported::message`，报告称其 "byte-identical"（D3）。这是 Python port 时代用 reference 实现当 oracle 的约束——而 `polyhedral_reference` 已经删除（`tilelang/ascend/analysis/polyhedral/` 只剩 `__init__.py` + 60 行 `_ffi.py`），C++ 里仍有 30 处 "C++ counterpart of polyhedral/xxx.py / Python 语义" 注释，是纯粹的历史遗留负担。
+`pytest.raises(..., match=...)` 匹配 `Unsupported::message`，报告称其 "byte-identical"（D3）。这是 Python port 时代用 reference 实现当 oracle 的约束——而 `polyhedral_reference` 已经删除（`tilelang/ascend/analysis/parallel_vectorize/` 只剩 `__init__.py` + 60 行 `_ffi.py`），C++ 里仍有 30 处 "C++ counterpart of polyhedral/xxx.py / Python 语义" 注释，是纯粹的历史遗留负担。
 
 **改法**：诊断改成 `reason_code + 参数` 结构化，文案自由；测试断言 code。同时清掉 parity 注释。
 
@@ -121,10 +125,10 @@ Plan 阶段已经算出 `promote`（[plan.cc:1981-1988](file:///home/cjl/workspa
 
 | # | 问题 | 位置 | 建议 |
 |---|---|---|---|
-| P1 | `written_keys` 每段用未缓存的 `BufferKey()` 重建（会打印 shape/strides/elem_offset） | [emit.cc:2075-2077](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2075-L2077), [2370-2372](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L2370-L2372) | 用已有的 `CachedBufferKey` |
-| P2 | `ProveGuard` **每次调用新建 Analyzer** | [value.cc:60-64](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/value.cc#L60-L64) | 传入共享 analyzer（顺带修掉"用不上 T.assume 导致误判"） |
-| P3 | `BuildCopyNest` 自建 analyzer，丢掉 region assumptions | [vsimd_group_passes.cc:194](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/vsimd_group_passes.cc#L194) | 复用 PlanOptions 的 analyzer |
-| P4 | 每个 chunk × 每个 store 做 `Substitute+Simplify` | [emit.cc:938-948](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/emit.cc#L938-L948) | 静态 chunk 展开成常量表；或把 lane_base 符号化后复用同一表达式 |
+| P1 | `written_keys` 每段用未缓存的 `BufferKey()` 重建（会打印 shape/strides/elem_offset） | [emit.cc:2075-2077](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2075-L2077), [2370-2372](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L2370-L2372) | 用已有的 `CachedBufferKey` |
+| P2 | `ProveGuard` **每次调用新建 Analyzer** | [value.cc:60-64](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/value.cc#L60-L64) | 传入共享 analyzer（顺带修掉"用不上 T.assume 导致误判"） |
+| P3 | `BuildCopyNest` 自建 analyzer，丢掉 region assumptions | [vsimd_group_passes.cc:194](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/vsimd_group_passes.cc#L194) | 复用 PlanOptions 的 analyzer |
+| P4 | 每个 chunk × 每个 store 做 `Substitute+Simplify` | [emit.cc:938-948](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/emit.cc#L938-L948) | 静态 chunk 展开成常量表；或把 lane_base 符号化后复用同一表达式 |
 | P5 | 同一段语句被 `PostOrderVisit` 遍历 5 次以上（SerialIsClean / touched_buffers / has_serial_loop / identity_init / ExprReadsBuffers） | plan.cc 多处 | 一次遍历建 reads/writes/loops 索引 |
 | P6 | `plan.CopyOnWrite()` 32 次 + `Array.Set` + StorePlan 逐字段 COW（1866-1907） | plan.cc | 构造时一次填满，用 aggregate/builder |
 | P7 | 每段新建 `Emitter`，`dup_/forward_/memo_` 缓存随对象销毁，跨段只共享了 mask/ramp | emit.cc | 把 value 级缓存提升到 Program 级 |
@@ -273,7 +277,7 @@ chunk_hi = min over stores(dead_from ?: chunks)
 
 ## 五、顺手记下的小问题
 
-1. **打分器的魔法权重与注释矛盾**：[AxisWeight](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L101-L119) 是 100/10/8/4/3/2/1 的拍脑袋权重，[AxisScore](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L445-L450) 末尾 `+ axis->index` 与 [468 行注释](file:///home/cjl/workspace/tilelang/src/ascend/transform/polyhedral/plan.cc#L468) "equal scores keep nest order" 自相矛盾——实际上内层轴总是被优先。要么写明这是"偏好内层轴"，要么去掉 `+index`。
+1. **打分器的魔法权重与注释矛盾**：[AxisWeight](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L101-L119) 是 100/10/8/4/3/2/1 的拍脑袋权重，[AxisScore](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L445-L450) 末尾 `+ axis->index` 与 [468 行注释](file:///home/cjl/workspace/tilelang/src/ascend/transform/parallel_vectorize/plan.cc#L468) "equal scores keep nest order" 自相矛盾——实际上内层轴总是被优先。要么写明这是"偏好内层轴"，要么去掉 `+index`。
 2. **P1 的 copy 识别用子串**（`IsCopyOp` 查 `"copy"`），body.cc 用精确名，P2 用 payload 解码——三种"什么是 copy"的定义。任何名字里带 copy 的非 tile-op 会被 P1 标成 COPY，然后 P2 解码失败导致整组拒绝。
 3. **`VSimdItemPlan` 用 3 个 optional 表达 tagged union**，`kind` 与 `plan_kind` 冗余，不变量（恰好一个非空）无任何强制。
 4. **`VRegLanes`/`kMaxVRegsPerVf`(32)/`kManualVRegPool`(24)** 是硬编码的 ISA 假设，V2 只统计手动 fragment，未把单 nest 的自动临时量计入预算 → 多段 VF 理论上可超 32。

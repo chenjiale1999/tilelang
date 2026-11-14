@@ -1,7 +1,7 @@
-"""C++-only facade for the polyhedral P2/P3 vectorizer.
+"""C++-only facade for the parallel_vectorize P2/P3 vectorizer.
 
 Every symbol here is backed by the compiled C++ implementation
-(``src/ascend/transform/polyhedral``) through the TVM FFI; nothing in this
+(``src/ascend/transform/parallel_vectorize``) through the TVM FFI; nothing in this
 package plans, emits, or renders in Python.
 
 Data flow (all C++):

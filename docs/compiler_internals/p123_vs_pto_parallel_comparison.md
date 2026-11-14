@@ -1,5 +1,10 @@
 # `T.Parallel` 向量化：本分支 P1/P2/P3 与 PTO PR-1+PR-2 的对比
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **对齐对象**
 >
 > | | 本方（本文简称 **P123**） | 对方（本文简称 **PTO**） |
@@ -47,7 +52,7 @@ TIR
  └─ AscendLiftVSimd (P1)      per-Parallel: 语法白名单 + 内存合法性 + capture 闭包
       → For.annotations["tl.vsimd.region"] = tl.vsimd.Region（LIFTED / OPAQUE + reason）
  └─ AscendPlanVSimd (P2)      per-loop: BuildPlan → VectorProgram（segments / 轴 / 掩码 / 布局）
-      → For.annotations["tl.vsimd.plan"]  = tl.polyhedral.VSimdRegionPlan
+      → For.annotations["tl.vsimd.plan"]  = tl.parallel_vectorize.VSimdRegionPlan
  └─ AscendEmitVSimd (P3)      per-loop: EmitPlan → tl.simd.* 语句；失败只回滚该 loop
       → 无条件清理两处注解
 ```
@@ -291,7 +296,7 @@ P123 缺一条“最终 IR legality”闸门：`vsts` 的某些分布（如 `NOR
 | 维度 | P123 | PTO |
 | --- | --- | --- |
 | 阶段数 | 3（lift / plan / emit） | 2 主动阶段（Verify+Legalize / Vectorize）+ 2 legality/元数据阶段 + codegen |
-| 阶段间载体 | **类型化 FFI 对象**：`tl.vsimd.Region` → `tl.polyhedral.VSimdRegionPlan` | **IR annotation**（`pto_parallel_loop_layout`）+ 就地改写 + AttrStmt carrier |
+| 阶段间载体 | **类型化 FFI 对象**：`tl.vsimd.Region` → `tl.parallel_vectorize.VSimdRegionPlan` | **IR annotation**（`pto_parallel_loop_layout`）+ 就地改写 + AttrStmt carrier |
 | 载体是否改 body | 否（P1/P2 只挂注解；P3 才替换） | 是（Legalize/Vectorize 直接改写语句） |
 | 定位方式 | `For` 节点身份（无 span / fingerprint） | 就地改写 + annotation 查表 |
 | 阶段契约 | region 是“忠实描述”；plan 是“发射唯一输入” | Verify 是“输入契约”；Legalize 保证 Vectorize 输入形态 |
@@ -347,7 +352,7 @@ P123 缺一条“最终 IR legality”闸门：`vsts` 的某些分布（如 `NOR
 | | P123 | PTO |
 | --- | --- | --- |
 | 结构测试 | 641（transform）+ 22（analysis）：离线 plan/emit 字段断言、三阶段契约、oracle、报告 | 414 PTO 结构用例（本 PR 新增 96 / 68 个 node 在两个控制流文件） |
-| 设备测试 | 20 例设备数值回归（`test_tilelang_ascend_vsimd_numeric.py`，见 §8；无 NPU 时 skip） | 11 例数值回归（含 UB 污染、NaN/±0、runtime trip count） |
+| 设备测试 | 20 例设备数值回归（原 `test_tilelang_ascend_vsimd_numeric.py`，已并入 `test_tilelang_ascend_simdvf_parallel*.py`，见 §8；无 NPU 时 skip） | 11 例数值回归（含 UB 污染、NaN/±0、runtime trip count） |
 | 覆盖倾向 | “机制是否按设计工作”（plan 字段、指令序列） | “语义是否正确”（NumPy golden 对比） |
 
 设备级数值回归已补齐（20 例，见 §8）：覆盖分支谓词化 × tail、serial shell 展开/归约、strided/间接访存、窄化/加宽/同宽符号 cast。
@@ -461,7 +466,7 @@ else:        z[i] = 2.0
 | --- | --- | --- | --- |
 | 1 | `min == 0` / `step == 1` 从“P2 兜底”前移成 **P1 闸门**；常量 `T.serial` shell 同样要求 `step == 1` | `vsimd_analysis_common.h::NestCollector`（`IsZeroLowerBound` / `IsUnitStep`）；`plan.cc::RequireZeroMin` 保留作纵深防御 | `test_ascend_vsimd_lift.py` 新增 3 例；探针：`min=3` / `step=2` / shell `step=2` 均 `OPAQUE + UNSUPPORTED`，合法形态仍 `LIFTED` |
 | 2 | `vmax/vmin` 的 NaN / ±0 语义**以 CANN 为基准**并配设备用例 | 契约（950PR 实测 `asc_max`/`asc_min`）：NaN 传播（任一操作数为 NaN 则结果 NaN）；`max` 仅双 `-0` 得 `-0`，`min` 仅双 `+0` 得 `+0`；发射是直接 `vmax/vmin` | `test_parallel_max_min_nan_and_signed_zero`（`max` / `min` 两个参数）：NaN 在左/右/双侧、`±0` 四种顺序、`±inf`，并对零结果单独校验 `signbit` |
-| 3 | 设备级数值回归文件 | `testing/ascend/language/test_tilelang_ascend_vsimd_numeric.py`（20 例，第二轮扩到同宽符号/加宽，见 §8.6） | 每例先断言 CCE 源里出现对应 `simd_inst::*`（防静默回落），再与 torch golden 逐位比对；本机无 `torch_npu` → 全部 skip |
+| 3 | 设备级数值回归文件 | 原 `testing/ascend/language/test_tilelang_ascend_vsimd_numeric.py`（20 例，第二轮扩到同宽符号/加宽，见 §8.6）；该文件已去重删除，用例并入 `test_tilelang_ascend_simdvf_parallel*.py` | 每例先断言 CCE 源里出现对应 `simd_inst::*`（防静默回落），再与 torch golden 逐位比对；本机无 `torch_npu` → 全部 skip |
 | 4 | `vcvt` 转换表补齐（新增 12 个转换对） | `emit.cc::Vcvt` | 逐对离线探针：`build_plan`/`emit_plan` 的实参顺序与 `simd.py` 逐字一致，且经全链路产出 `vcvt + PK` 装载 |
 
 设备用例覆盖（20 例）：max/min 的 NaN/±0、tail chunk（`update_mask`）、单臂谓词化 store、异址双臂互补掩码、mask `==`/`!=`（`pxor`/`pnot`）、常量 shell 末写生效（4 条 store）、shell 归约（`vcadd`）、stride-2 装载（`vgather2`）、间接 gather、`f32→bf16`、`i32→u8`、`i16→u8`、`f16→fp8`、`i32→u32` reinterpret、`f16/i16→f32/i32`（`UNPK_B16`）、`i8→i32`/`fp8→f32`（`UNPK4_B8`）。
@@ -522,7 +527,7 @@ else:        z[i] = 2.0
 - 实质缺口：仅剩 `lanes` 可配；运行期 / 不可吸收 serial shell 与 serial 循环下的 Parallel 已在第三轮补齐（§8.7）。转换只剩 `i8/u8→i16/f16`、`i32→i64`、`i64→*` 按 nest 回退。
 - 风险从 **5 条**收敛为 **1 条**（R3 发射前 legality）；R1 / R2 / R4 / R5 已关闭。
 - 唯一尚未闭环的验证是**设备执行**：22 个设备用例与 NaN/±0 契约在无 NPU 主机上只能 skip。建议在 950 环境跑一次
-  `pytest testing/ascend/language/test_tilelang_ascend_vsimd_numeric.py -v`，把实测结果回填本节（尤其 `vmax/vmin` 的 ±0 顺序、
+  `pytest testing/ascend/language/test_tilelang_ascend_simdvf_parallel*.py -v`，把实测结果回填本节（尤其 `vmax/vmin` 的 ±0 顺序、
   `UNPK_*` 加宽取值、同宽符号位型、壳循环的末写覆盖）。
 - 测试规模：`testing/ascend/transform` 647 + `testing/ascend/analysis` 22 = **669 passed**（三轮共新增 22 个 P1/P2/P3 结构用例）；
   设备用例 22 个（无 NPU 时 skip）。§4.7 的旧计数以本节为准。

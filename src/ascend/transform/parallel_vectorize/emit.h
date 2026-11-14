@@ -2,8 +2,8 @@
  * \file emit.h
  * \brief Emission layer: ``VectorPlan`` / ``VectorProgram`` -> ``T.simd.*`` TIR.
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_EMIT_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_EMIT_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_EMIT_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_EMIT_H_
 
 #include <tvm/tirx/stmt.h>
 
@@ -11,7 +11,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*!
  * \brief Emit a plan (or program) as ``T.simd.*`` TIR.
@@ -31,8 +31,8 @@ TVM_DLL tirx::Stmt EmitPlan(const ffi::ObjectRef& plan);
  */
 TVM_DLL tirx::Stmt VstVldBarrier();
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_EMIT_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_EMIT_H_

@@ -1,7 +1,12 @@
 # P1 输出完备性审计与 P2 能力路线选型
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > 依据文档：`/home/cjl/workspace/tilelang-stable/docs/compiler_internals/vsimd_p1_analysis.md`（2026-10-27 更新版，1270 行，新增第 8 章“与多面体向量化 66 场景的对照”）。
-> 对照实现：`/home/cjl/workspace/tilelang` 分支 `Parallel_lowering` 的 `tilelang/ascend/analysis/polyhedral/`。
+> 对照实现：`/home/cjl/workspace/tilelang` 分支 `Parallel_lowering` 的 `tilelang/ascend/analysis/parallel_vectorize/`。
 > 前置约束：**暂不扩展 P1 阶段功能**；P2 输入定义为 **P1 输出 + 前置 Pass 输出的 TIR 中间表示**。
 
 ---

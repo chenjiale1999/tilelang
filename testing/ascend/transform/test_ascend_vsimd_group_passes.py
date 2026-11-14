@@ -5,7 +5,7 @@ The chain vectorizes ``T.Parallel`` loops inside a ``SIMD_VF`` and nothing else:
 * P1 attaches ``tl.vsimd.region`` (``tl.vsimd.Region``) to every top-level
   Parallel;
 * P2 plans each LIFTED region and attaches ``tl.vsimd.plan``
-  (``tl.polyhedral.VSimdRegionPlan``) to the **same loop**; a region the
+  (``tl.parallel_vectorize.VSimdRegionPlan``) to the **same loop**; a region the
   planner cannot handle keeps no plan;
 * P3 replaces every loop carrying a plan and strips both annotations
   unconditionally.

@@ -1,5 +1,10 @@
 # P1/P2/P3 `T.Parallel` 降级：真实缺陷修复清单
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **用途**：本文只记录在 Ascend 950PR 上**实测确认的 3 个真实实现缺陷**，
 > 供在另一台机器上照着改代码。测试文件自身的断言错误、CANN 限制、
 > 既有 `Simplify` 语义问题**不在本文范围**，见
@@ -32,7 +37,7 @@
 
 ### 现状代码
 
-`src/ascend/transform/polyhedral/emit.cc:1624-1627`（`EmitVectorWrite`，普通 NZ 直存）：
+`src/ascend/transform/parallel_vectorize/emit.cc:1624-1627`（`EmitVectorWrite`，普通 NZ 直存）：
 
 ```cpp
 int64_t block = store->nz_block_stride.has_value() ? *store->nz_block_stride : 0;
@@ -40,7 +45,7 @@ int64_t elem = store->nz_elem_stride.has_value() ? *store->nz_elem_stride : 1;
 PrimExpr stride = IntImm(DataType::Int(32), (block << 16) | (elem & 0xffff));
 ```
 
-`src/ascend/transform/polyhedral/emit.cc:1731-1733`（`EmitPackedNzStore`，配对 pack2 形态）：
+`src/ascend/transform/parallel_vectorize/emit.cc:1731-1733`（`EmitPackedNzStore`，配对 pack2 形态）：
 
 ```cpp
 int64_t block = store->nz_block_stride.has_value() ? *store->nz_block_stride : 0;
@@ -48,7 +53,7 @@ int64_t elem_stride = store->nz_elem_stride.has_value() ? *store->nz_elem_stride
 PrimExpr stride = IntImm(DataType::Int(32), (block << 16) | (elem_stride & 0xffff));
 ```
 
-`src/ascend/transform/polyhedral/plan.cc:2001` 把 `nz_elem_stride` 恒设为 `1`：
+`src/ascend/transform/parallel_vectorize/plan.cc:2001` 把 `nz_elem_stride` 恒设为 `1`：
 
 ```cpp
 store.CopyOnWrite()->nz_elem_stride = ffi::Optional<int64_t>(1);
@@ -115,7 +120,7 @@ CANN 侧印证：`asc_store_align_config` 是 `{ repeat_stride : 16; block_strid
 
 ### 连带需要改的 pass 级断言
 
-`testing/ascend/transform/test_ascend_polyhedral_vectorize.py` 有 5 处断言写死了 `| 1`：
+`testing/ascend/transform/test_ascend_parallel_vectorize_*.py` 有 5 处断言写死了 `| 1`：
 
 | 行 | 断言 |
 | --- | --- |
@@ -464,7 +469,7 @@ python -m pytest testing/ascend/language/test_tilelang_ascend_simdvf_parallel.py
   -q -p no:cacheprovider -k "row_reduction or sibling_reduction or mixed_recipe"
 
 # pass 级（D1 会改断言）
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py \
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py \
   -q -p no:cacheprovider
 ```
 
@@ -561,8 +566,8 @@ print(k(s.npu()).cpu()[:3])   # 现状 [4096, 4096, 4096]；正确 [128, 128, 12
 | `emit.cc::EmitPackedNzStore` | 同上 |
 | `plan.cc` | 删除 `nz_elem_stride = 1` 赋值 |
 | `model.h` | 删除 `nz_elem_stride` 字段与反射（该字段没有正确语义） |
-| `analyze_polyhedral.cc` | plan 渲染改为 `layout=nz[<block>]`，不再打印低 16 位 |
-| `test_ascend_polyhedral_vectorize.py` | 断言改为 `(_WIDE << 16)` / `(rows << 16)` / `(129 << 16)`，删除 `nz_elem_stride` 断言 |
+| `analyze_parallel_vectorize.cc` | plan 渲染改为 `layout=nz[<block>]`，不再打印低 16 位 |
+| `test_ascend_parallel_vectorize_nz.py` | 断言改为 `(_WIDE << 16)` / `(rows << 16)` / `(129 << 16)`，删除 `nz_elem_stride` 断言 |
 | `p2_p3_design_implementation_report.md` | §F.5.2 / §F.6 的配方改为 `(129 << 16)` |
 
 ### 6.2 D2：屏障加在 P3 发射，不是 `pipeline.py` 的 `AscendThreadSync("global")`
@@ -758,7 +763,7 @@ __simd_vf__ inline void main_kernel_simd_vf_0(__ubuf__ uint8_t* buf_dyn_shmem) {
 
 - 设备：`test_parallel_lane_uniform_condition_broadcasts_the_mask` 改为断言
   `vdup<` + `vcmps_` 存在、`update_mask` 不存在。
-- 离线（`test_ascend_polyhedral_vectorize.py`）：三个 lane-uniform `vsel` 用例与
+- 离线（`test_ascend_parallel_vectorize_delta.py`）：三个 lane-uniform `vsel` 用例与
   R2 用例改为断言 `tl.simd.vcmps` / 不再断言 `tl.simd.update_mask`（尾块谓词除外）；
   "整条 fully-uniform select" 用例改为断言 `vsel` + `vcmps` + `vdup`
   （标量 `?:` 同样是 VF 内标量指令）。

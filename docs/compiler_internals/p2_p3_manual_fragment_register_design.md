@@ -1,5 +1,10 @@
 # Ascend P2/P3 手动 `alloc_fragment`（V 核寄存器）支持设计
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **⚠️ 已废弃（`p_123_parallel_new_p1` 分支）**：本设计描述的 fragment 寄存器文件
 > （`PlanOptions.vf_alloc_scope`、G0–G8 门禁、V1–V4 校验、`FragmentRegisterFile`、
 > `kRegLoad` recipe、`vf_alloc_scope` 等）已从 P1/P2/P3 与离线 planner 中**全部删除**。
@@ -16,9 +21,9 @@
 >
 > **现状事实来源**（行号对应当前工作树）：
 >
-> - 测试：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py:487-534`（§0 Case III）
-> - 规划：`src/ascend/transform/polyhedral/plan.cc`、`value.cc`、`model.cc`
-> - 发射：`src/ascend/transform/polyhedral/emit.cc`、`stage_passes.cc`
+> - 测试：`testing/ascend/transform/test_ascend_parallel_vectorize_delta.py:139-167`（§0 Case III）
+> - 规划：`src/ascend/transform/parallel_vectorize/plan.cc`、`value.cc`、`model.cc`
+> - 发射：`src/ascend/transform/parallel_vectorize/emit.cc`、`stage_passes.cc`
 > - 后端：`src/ascend/transform/lower_tile_op.cc`、`src/ascend/codegen/codegen_ascend.cc`
 > - 管线：`tilelang/ascend/pipeline.py:95`（VFChecker）、`:124`（polyhedral）、`:126`（LowerTileOp）
 
@@ -616,7 +621,7 @@ DEFINED   --读-----------> 输出寄存器值
 | | `polyhedral/stage_passes.cc` | P3 driver 维护 per-VF 寄存器文件；移除 fragment alloc/layout 条目 |
 | S4 后端 | `transform/lower_tile_op.cc` | 对 register-managed data var 跳过 layout 重映射 |
 | | `codegen/codegen_ascend.cc` | 防御性检查：SimdVF 内 `local.fragment` 不得再走 `vld/vsts`；`local.var` 向量声明沿用 |
-| S5 测试/基准 | `testing/ascend/transform/test_ascend_polyhedral_vectorize.py`、`testing/ascend/language/simdvf/`、`examples/ascend/` | 见第 3 节 |
+| S5 测试/基准 | `testing/ascend/transform/test_ascend_parallel_vectorize_*.py`、`testing/ascend/language/simdvf/`、`examples/ascend/` | 见第 3 节 |
 
 实施顺序建议：S0（修 key）→ S1/S1b（默认仍按内存，但 G0 立即拦截 VF 外分配）
 → S2（VF 级校验/原子回退）→ S3（寄存器发射）→ S4（清理后端）→ S5。
@@ -636,10 +641,10 @@ DEFINED   --读-----------> 输出寄存器值
 
 | 文件 | 删除内容 |
 | --- | --- |
-| `src/ascend/transform/polyhedral/access.h` | `AccessInfoNode::in_global` 字段（约 L111）及其反射项（约 L128） |
-| `src/ascend/transform/polyhedral/access.cc` | `node->in_global = buffer.scope() == "global";`（约 L213） |
-| `src/ascend/transform/polyhedral/value.cc` | `LoadNode` 开头的 `if (info->in_global) throw Unsupported("global-memory operand ...")`（约 L780-784） |
-| `src/ascend/transform/polyhedral/plan.h/.cc` | 本设计新增的 `StorageClass` 不包含 `kGlobal`（见 2.1.1） |
+| `src/ascend/transform/parallel_vectorize/access.h` | `AccessInfoNode::in_global` 字段（约 L111）及其反射项（约 L128） |
+| `src/ascend/transform/parallel_vectorize/access.cc` | `node->in_global = buffer.scope() == "global";`（约 L213） |
+| `src/ascend/transform/parallel_vectorize/value.cc` | `LoadNode` 开头的 `if (info->in_global) throw Unsupported("global-memory operand ...")`（约 L780-784） |
+| `src/ascend/transform/parallel_vectorize/plan.h/.cc` | 本设计新增的 `StorageClass` 不包含 `kGlobal`（见 2.1.1） |
 | `tilelang/ascend/analysis/vf_checker.py` | **保留**（它正是 GM 在 P1/P2 之前被拒绝的原因） |
 
 删除后，P2/P3 内不再出现 `global`/`in_global`/`global-memory operand` 字样；
@@ -647,7 +652,7 @@ GM 的拒绝行为完全由前端负责。
 
 #### 2.9.2 测试删除/改造清单
 
-文件：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py`
+文件：`testing/ascend/transform/test_ascend_parallel_vectorize_*.py`
 
 | 用例/位置 | 处理 |
 | --- | --- |
@@ -678,7 +683,7 @@ GM 的拒绝行为完全由前端负责。
 
 ### 3.1 单元测试（离线、无硬件）
 
-文件：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py`（沿用
+文件：`testing/ascend/transform/test_ascend_parallel_vectorize_*.py`（沿用
 `build_plan`/`emit_plan`/P1/P2/P3 三段离线断言）。
 
 | 用例 | 断言 |
@@ -740,7 +745,7 @@ GM 的拒绝行为完全由前端负责。
 
 ### 3.4 回归门槛
 
-- `pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py` 全绿；
+- `pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py` 全绿；
 - `pytest testing/ascend/` 全绿；
 - 现有 166 个 polyhedral 用例的 plan/emit 输出对 UB 场景逐字段不变；
 - `TL_POLYHEDRAL_DUMP_IR=1` 下所有诊断可读、无 P3 内部 WARNING。
@@ -776,7 +781,7 @@ GM 的拒绝行为完全由前端负责。
 
 ### 3.6 多 parallel 循环专项测试用例集
 
-文件建议：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py`
+文件建议：`testing/ascend/transform/test_ascend_parallel_vectorize_*.py`
 （离线结构）+ `testing/ascend/language/simdvf/test_fragment_register_reuse.py`
 （端到端/运行时）。
 

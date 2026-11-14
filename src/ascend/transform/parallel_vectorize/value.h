@@ -2,7 +2,7 @@
  * \file value.h
  * \brief Value DAG: lift scalar expressions into per-lane vector value nodes.
  *
- * C++ counterpart of ``polyhedral/value.py``. The decision is again purely the
+ * C++ counterpart of ``parallel_vectorize/value.py``. The decision is again purely the
  * finite difference along the vector axis:
  *
  *   Delta_v == 1  -> vload             (contiguous)
@@ -14,8 +14,8 @@
  * ``ValueNode`` is instruction-selection agnostic: ``recipe`` is a primitive
  * name, the concrete ``T.simd.*`` instruction is chosen by the emit layer.
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_VALUE_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_VALUE_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_VALUE_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_VALUE_H_
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/any.h>
@@ -34,7 +34,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 class ValueNodeNode;
 
@@ -191,7 +191,7 @@ class ValueNodeNode : public ffi::Object {
   bool is_uniform{false};
 
   static constexpr const bool _type_mutable = false;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.ValueNode", ValueNodeNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.ValueNode", ValueNodeNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -313,8 +313,8 @@ bool ReadsOtherAddress(const ValueNode& node, const tirx::Buffer& buffer,
 bool AccessProvablyInBounds(const AccessInfo& info, const ValueContext& ctx,
                             int64_t lo = 0, std::optional<int64_t> hi = std::nullopt);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_VALUE_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_VALUE_H_

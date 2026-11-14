@@ -1,5 +1,10 @@
 # P2/P3 C++ 化设计、接口与使用说明
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > 配套文档：[p2_p3_cpp_port_plan.md](p2_p3_cpp_port_plan.md)（分步计划）、
 > [p2_p3_cpp_port_survey.md](p2_p3_cpp_port_survey.md)（现状与契约）、
 > [p2_unsupported_catalog.md](p2_unsupported_catalog.md)（40 条拒绝点）。
@@ -9,7 +14,7 @@
 ## 1. 模块图
 
 ```
-src/ascend/transform/polyhedral/
+src/ascend/transform/parallel_vectorize/
 ├── primitives.h / .cc   recipe 表、归约表、硬件常量、Unsupported、dtype 工具
 ├── access.h     / .cc   Axis / AccessClass / AccessInfo、线性化、有限差分、分类
 ├── body.h       / .cc   StoreSpec、normalize_body、别名折叠
@@ -44,7 +49,7 @@ P3  AscendLowerArrayPlan        消费 "tl.vsimd.array_plan"
 
 未被 P1 lift 或 P2 拒绝的 nest 原样保留（不再有 legacy emitter 兜底）。
 
-`AscendPolyhedralVectorize` 是组合 pass：在同一个 PrimFunc 上顺序调用
+`AscendParallelVectorize` 是组合 pass：在同一个 PrimFunc 上顺序调用
 `LiftParallelToArray → PlanArray → LowerArrayPlan`，等价于把三个 pass 串起来。
 
 三个 pass 的输入输出契约：
@@ -59,7 +64,7 @@ P3  AscendLowerArrayPlan        消费 "tl.vsimd.array_plan"
 
 | 行为 |
 | --- |
-| 插入 `AscendPolyhedralVectorize`（P1→P2→P3）；被拒 nest 原样保留为串行循环 |
+| 插入 `AscendParallelVectorize`（P1→P2→P3）；被拒 nest 原样保留为串行循环 |
 
 流水线只接受 C++ 实现；此前的 Python 孪生 pass 仅用于灰度对拍，已删除。
 `AscendSimdVFLowerParallel` 不再接入流水线（P1/P2/P3 取代它，不再有兜底 emitter）。
@@ -67,12 +72,12 @@ PassContext 开关 `tl.ascend.polyhedral.impl` 已删除。
 
 离线 API（`build_plan` / `emit_plan` / `render_plan` / `vectorize_parallel_nests`
 / `finite_difference` / `classify_delta`）**只有 C++ 一个实现**：
-`tilelang/ascend/analysis/polyhedral/__init__.py` 是纯 C++ 门面（`_cpp` 的转发，
+`tilelang/ascend/analysis/parallel_vectorize/__init__.py` 是纯 C++ 门面（`_cpp` 的转发，
 不 import 任何 Python 实现模块），共享值类型 `AccessClass` / `Unsupported`
 定义在 `polyhedral/_contract.py`。旧的 `TL_ASCEND_POLYHEDRAL_IMPL` 环境变量与
 `dual` 对拍模式已删除。
 
-Python 参考实现整体移到独立包 `tilelang/ascend/analysis/polyhedral_reference/`
+Python 参考实现整体移到独立包 `tilelang/ascend/analysis/parallel_vectorize_reference/`
 （oracle，需要时显式 import），生产门面与测试的依赖树里都不出现它。
 
 ***
@@ -90,23 +95,23 @@ Python 参考实现整体移到独立包 `tilelang/ascend/analysis/polyhedral_re
 | `PrimFunc PlanArray(PrimFunc)`                               | P2 阶段：region 载体 → `tl.vsimd.array_plan` |
 | `PrimFunc LowerArrayPlan(PrimFunc)`                          | P3 阶段：plan 载体 → `T.simd.*`   |
 | `PrimFunc VectorizeParallelNests(PrimFunc)`                  | 组合：P1 → P2 → P3               |
-| `Pass AscendPolyhedralVectorize()`                           | 组合 pass（流水线入口）                |
+| `Pass AscendParallelVectorize()`                           | 组合 pass（流水线入口）                |
 
 ### 3.2 FFI 表（Python 侧 `tilelang.transform._ffi_api`）
 
 | 名称                                             | 返回                                                     |
 | ---------------------------------------------- | ------------------------------------------------------ |
-| `AscendPolyhedralBuildPlan(stmt, lanes)`       | `{ok, program}` 或 `{ok: False, message, diagnostics}`   |
-| `AscendPolyhedralEmitPlan(plan)`               | `{ok, stmt}` / 错误同形                                    |
-| `AscendPolyhedralRenderPlan(plan)`             | `{ok, text}` / 错误同形                                    |
-| `AscendPolyhedralVectorizeNests(stmt, lanes)`  | `{ok, stmt}`（driver）                                   |
-| `AscendPolyhedralAxisClass(info, axis)`        | `[kind, stride?]`                                      |
-| `AscendPolyhedralFiniteDifference(expr, var, use_analyzer)` | 差分表达式                                     |
-| `AscendPolyhedralClassifyDelta(delta, use_analyzer)`        | `[kind, stride?]`                              |
+| `AscendParallelVectorizeBuildPlan(stmt, lanes)`       | `{ok, program}` 或 `{ok: False, message, diagnostics}`   |
+| `AscendParallelVectorizeEmitPlan(plan)`               | `{ok, stmt}` / 错误同形                                    |
+| `AscendParallelVectorizeRenderPlan(plan)`             | `{ok, text}` / 错误同形                                    |
+| `AscendParallelVectorizeNests(stmt, lanes)`  | `{ok, stmt}`（driver）                                   |
+| `AscendParallelVectorizeAxisClass(info, axis)`        | `[kind, stride?]`                                      |
+| `AscendParallelVectorizeFiniteDifference(expr, var, use_analyzer)` | 差分表达式                                     |
+| `AscendParallelVectorizeClassifyDelta(delta, use_analyzer)`        | `[kind, stride?]`                              |
 | `AscendLiftParallelToArray()`                  | P1 PrimFunc pass                                      |
 | `AscendPlanArray()`                            | P2 PrimFunc pass                                      |
 | `AscendLowerArrayPlan()`                       | P3 PrimFunc pass                                      |
-| `AscendPolyhedralVectorize()`                  | 组合 PrimFunc pass（P1→P2→P3）                            |
+| `AscendParallelVectorize()`                  | 组合 PrimFunc pass（P1→P2→P3）                            |
 
 ### 3.3 计划对象（FFI Object，Python 字段同名）
 
@@ -116,12 +121,12 @@ Python 参考实现整体移到独立包 `tilelang/ascend/analysis/polyhedral_re
 
 - `StorePlan` 的 C++ 字段名是 `kind_value`（字符串），Python 类用属性 `kind`
   返回 `AccessClass`。原因：`def_ro` 会以同名属性覆盖类里定义的 property；
-- `AccessInfo.axis_class(axis)` 由 C++ 转发（`AscendPolyhedralAxisClass`），
+- `AccessInfo.axis_class(axis)` 由 C++ 转发（`AscendParallelVectorizeAxisClass`），
   避免把内部 `per_axis` 映射暴露成 FFI 字段。
 
 ### 3.4 错误约定
 
-- C++ 侧只抛 `polyhedral::Unsupported`（`message` + `diagnostics`），
+- C++ 侧只抛 `parallel_vectorize::Unsupported`（`message` + `diagnostics`），
   **不用** `LOG(FATAL)`；内部不变量才用 `TVM_FFI_ICHECK`。
 - FFI 层统一转成 `Map{ok:false, message, diagnostics}`；Python 包装层重新抛
   `Unsupported(...)`，`str(err)` 与 `err.diagnostics` 与 Python 实现逐字一致。
@@ -197,7 +202,7 @@ mod = tilelang.lower(func, target="ascend")
 - 默认关闭（`legacy`）；流水线内**只有 C++ 一个 pass**（Python 孪生 pass 已删除）；
 - 灰度顺序：G0 `legacy` → G1 `cpp` 对拍（与 `polyhedral_reference` 的 IR/文本 diff）
   → G2 白名单集群 → G3 `cpp` 默认；
-- Python 参考实现整体位于独立包 `tilelang/ascend/analysis/polyhedral_reference/`，
+- Python 参考实现整体位于独立包 `tilelang/ascend/analysis/parallel_vectorize_reference/`，
   不再是任何 pass、也不被生产门面或测试导入；只有在 A1–A10 全部通过、与参考实现
   在真实 kernel 集合上零差异、性能数据归档后，才考虑连同该包一起删除。
 
@@ -210,17 +215,17 @@ Python 孪生 pass 已在筛选阶段删除，见 §7.1：
 
 | 名称                                     | 类型                | 用途                             | Python 调用方                                    | 必需性     |
 | -------------------------------------- | ----------------- | ------------------------------ | --------------------------------------------- | ------- |
-| `AscendPolyhedralBuildPlan`            | FFI 函数            | P2 入口                          | `_cpp.build_plan`                             | 必需      |
-| `AscendPolyhedralEmitPlan`             | FFI 函数            | P3 入口                          | `_cpp.emit_plan`                              | 必需      |
-| `AscendPolyhedralRenderPlan`           | FFI 函数            | 文本 oracle                      | `_cpp.render_plan`                            | 必需（A5）  |
-| `AscendPolyhedralAxisClass`            | FFI 方法转发          | 读 `AccessInfo.per_axis`         | `_cpp.AccessInfo.axis_class`                  | 必需      |
-| `AscendPolyhedralVectorizeNests`       | FFI 函数            | driver（离线替换）                    | `_cpp.vectorize_parallel_nests`               | 必需      |
-| `AscendPolyhedralFiniteDifference`     | FFI 函数            | 数学核心对拍                         | `_cpp.finite_difference`                      | 对拍/调试   |
-| `AscendPolyhedralClassifyDelta`        | FFI 函数            | 数学核心对拍                         | `_cpp.classify_delta`                         | 对拍/调试   |
+| `AscendParallelVectorizeBuildPlan`            | FFI 函数            | P2 入口                          | `_cpp.build_plan`                             | 必需      |
+| `AscendParallelVectorizeEmitPlan`             | FFI 函数            | P3 入口                          | `_cpp.emit_plan`                              | 必需      |
+| `AscendParallelVectorizeRenderPlan`           | FFI 函数            | 文本 oracle                      | `_cpp.render_plan`                            | 必需（A5）  |
+| `AscendParallelVectorizeAxisClass`            | FFI 方法转发          | 读 `AccessInfo.per_axis`         | `_cpp.AccessInfo.axis_class`                  | 必需      |
+| `AscendParallelVectorizeNests`       | FFI 函数            | driver（离线替换）                    | `_cpp.vectorize_parallel_nests`               | 必需      |
+| `AscendParallelVectorizeFiniteDifference`     | FFI 函数            | 数学核心对拍                         | `_cpp.finite_difference`                      | 对拍/调试   |
+| `AscendParallelVectorizeClassifyDelta`        | FFI 函数            | 数学核心对拍                         | `_cpp.classify_delta`                         | 对拍/调试   |
 | `AscendLiftParallelToArray`            | **PrimFunc pass** | P1 阶段（加 region 载体）              | `transform.AscendLiftParallelToArray()`       | 必需      |
 | `AscendPlanArray`                      | **PrimFunc pass** | P2 阶段（region → plan 载体）          | `transform.AscendPlanArray()`                 | 必需      |
 | `AscendLowerArrayPlan`                 | **PrimFunc pass** | P3 阶段（plan 载体 → TIR）             | `transform.AscendLowerArrayPlan()`            | 必需      |
-| `AscendPolyhedralVectorize`            | **PrimFunc pass** | 组合 pass（P1→P2→P3，流水线入口）          | `transform.AscendPolyhedralVectorize()`       | 必需      |
+| `AscendParallelVectorize`            | **PrimFunc pass** | 组合 pass（P1→P2→P3，流水线入口）          | `transform.AscendParallelVectorize()`       | 必需      |
 
 对象类型 8 个（`Axis` / `AccessInfo` / `StoreSpec` / `ValueNode` / `ReduceInfo` /
 `StorePlan` / `VectorPlan` / `VectorProgram`），全部被测试的字段路径直接引用。
@@ -236,7 +241,7 @@ C++ 公开 API 只有 3 个 `TVM_DLL`：`BuildPlan` / `EmitPlan` / `RenderPlan`
 
 | 归属                 | 数量    | 语言  | 分类                                                     |
 | ------------------ | ----- | --- | ------------------------------------------------------ |
-| `src/ascend/transform` | 35    | C++ | P1=3（`AscendAnalyzeSimdVF{Capture,Memory}`、`AscendAnalyzeVSimdRegion`，只读）；P2/P3=4（`AscendLiftParallelToArray` / `AscendPlanArray` / `AscendLowerArrayPlan` / 组合 `AscendPolyhedralVectorize`）；其余 31 为既有 Ascend 流水线 pass |
+| `src/ascend/transform` | 35    | C++ | P1=3（`AscendAnalyzeSimdVF{Capture,Memory}`、`AscendAnalyzeVSimdRegion`，只读）；P2/P3=4（`AscendLiftParallelToArray` / `AscendPlanArray` / `AscendLowerArrayPlan` / 组合 `AscendParallelVectorize`）；其余 31 为既有 Ascend 流水线 pass |
 | `src/transform`      | 40    | C++ | 后端无关流水线 pass（`Simplify` / `FlattenBuffer` / `SplitHostDevice` …） |
 | `src/cuda/transform` | 16    | C++ | CUDA 后端                                            |
 | `src/cpu/transform`  | 4     | C++ | CPU 后端                                             |
@@ -245,12 +250,12 @@ C++ 公开 API 只有 3 个 `TVM_DLL`：`BuildPlan` / `EmitPlan` / `RenderPlan`
 
 筛选规则：**本地 git 更改内，pass 只保留 C++ 的 P2/P3 实现**。执行结果：
 
-- 删除 `AscendPolyhedralVectorizePython`（Python 孪生 pass）及其 `__all__` 条目；
+- 删除 `AscendParallelVectorizePython`（Python 孪生 pass）及其 `__all__` 条目；
 - `pipeline.py` 的开关从三态收敛为 `legacy|cpp`（删除 `impl=python` 分支）；
-- 保留 `AscendPolyhedralVectorize`（C++ pass）与 9 个 FFI 入口、8 个对象类型，逻辑与接口零改动；
-- 保留 `tilelang/ascend/analysis/polyhedral_reference/*.py`：它们**没有 pass 注册**，
+- 保留 `AscendParallelVectorize`（C++ pass）与 9 个 FFI 入口、8 个对象类型，逻辑与接口零改动；
+- 保留 `tilelang/ascend/analysis/parallel_vectorize_reference/*.py`：它们**没有 pass 注册**，
   是 P2/P3 的参考实现与 113 个用例的 oracle；生产门面
-  `tilelang/ascend/analysis/polyhedral/` 只剩 `__init__.py`（纯 C++ 转发）、`_cpp.py`
+  `tilelang/ascend/analysis/parallel_vectorize/` 只剩 `__init__.py`（纯 C++ 转发）、`_cpp.py`
   与 `_contract.py`，与参考实现之间没有任何导入边；
 - 其余 94 个 C++ pass、12 个既有 Python pass 不在本次更改范围内，未触碰。
 
@@ -284,10 +289,10 @@ emit_reduce.cc  归约两条策略 + 段/程序发射                          (
 - 6 个"在线"入口（build/emit/render/axis_class/vectorize_nests/pass）**不建议合并**：
   合并成一个 `Invoke(op, ...)` 会丢掉参数类型、丢掉文档，Python 侧还需手写分支。
 - 2 个"对拍/调试"入口（`FiniteDifference` / `ClassifyDelta`）保留：它们是数学核心
-  的唯一单测通道。常量表 FFI（`AscendPolyhedralPrimitives`）零调用方且每次重建
+  的唯一单测通道。常量表 FFI（`AscendParallelVectorizePrimitives`）零调用方且每次重建
   Map 约 10 µs，**已删除**（含 `_cpp.primitives()` 与 `PrimitiveTables()`）。
-- pass 入口只保留 C++ 一个（`AscendPolyhedralVectorize`）。Python 孪生
-  `AscendPolyhedralVectorizePython` 已随筛选删除；Python 侧参考实现整体位于
+- pass 入口只保留 C++ 一个（`AscendParallelVectorize`）。Python 孪生
+  `AscendParallelVectorizePython` 已随筛选删除；Python 侧参考实现整体位于
   独立包 `polyhedral_reference/`（无 pass 注册、不被门面或测试导入），
   需要 oracle 对拍时显式 import。
 
@@ -305,7 +310,7 @@ emit_reduce.cc  归约两条策略 + 段/程序发射                          (
 | 不存在"注册了太多 pass"的问题      | 7 个 FFI 函数 + 4 个 pass；入口数量由 API 语义决定，已是最小集              |
 | 文件**不建议合并**            | 每个文件对应一个 Python 模块，是双实现逐模块对拍的天然锚点；合并会牺牲编译粒度与 review 效率         |
 | 唯一推荐的结构调整              | `emit.cc` **拆分**（见 8.1），可选把 `render` 并进 `ffi`                     |
-| API 收敛                 | 已执行：删除零调用的 `AscendPolyhedralPrimitives`                          |
+| API 收敛                 | 已执行：删除零调用的 `AscendParallelVectorizePrimitives`                          |
 
 ***
 
@@ -341,7 +346,7 @@ emit_reduce.cc  归约两条策略 + 段/程序发射                          (
 | P2 | `emit.cc` `EmitSegmentStmts` | 8 个参数收敛为 `EmitOptions` 结构体；`BuildPlanForAxis` 11 参数改为接收 `SegmentSpecs` | 可维护性 | 低 |
 | P3 | `emit.cc` | 拆分（见 8.1） | 增量编译 | 低 |
 
-（原表中 `dual` 对拍、`polyhedral_impl()` 环境变量、`AscendPolyhedralPrimitives`
+（原表中 `dual` 对拍、`polyhedral_impl()` 环境变量、`AscendParallelVectorizePrimitives`
 缓存三条已随相应用户/文档项落地而失效。）
 
 ### 9.3 明确不做
@@ -358,7 +363,7 @@ emit_reduce.cc  归约两条策略 + 段/程序发射                          (
 
 ### 方案 A（保守，推荐）
 
-1. ~~删除 `AscendPolyhedralPrimitives` 入口与 `_cpp.primitives()`~~（已完成）；
+1. ~~删除 `AscendParallelVectorizePrimitives` 入口与 `_cpp.primitives()`~~（已完成）；
 2. `emit.cc` 按 8.1 拆成 3 个 `.cc` + 1 个 `emit_internal.h`；
 3. Python 参考实现保留在独立包 `polyhedral_reference/`，不并入生产门面（已完成）；
 4. `EmitSegmentStmts` / `BuildPlanForAxis` 参数收敛；
@@ -372,14 +377,14 @@ emit_reduce.cc  归约两条策略 + 段/程序发射                          (
 ### 验证方式（任何结构调整都必须过）
 
 ```bash
-python tmp/run_poly_test.py testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q
+python tmp/run_poly_test.py testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
 python tmp/run_poly_test.py testing/ascend/transform/test_ascend_vsimd_p2_input.py -q
 python tmp/bench_p2_p3.py          # 调整结构不应使性能回退
 ```
 
 `test_ascend_vsimd_p2_input.py` 合并了 P1→P2 交接契约（33）与 P2/P3 pass 级
-（`AscendPolyhedralVectorize` + 三个分段 pass + 流水线开关，10）两套用例。
+（`AscendParallelVectorize` + 三个分段 pass + 流水线开关，10）两套用例。
 
-`test_ascend_polyhedral_vectorize.py` 自带 `test_cpp_implementation_is_the_only_one_loaded`：
+`test_ascend_parallel_vectorize_*.py` 自带 `test_cpp_implementation_is_the_only_one_loaded`：
 断言测试期间没有加载 `polyhedral_reference` 的任何模块、每个入口都由 `_cpp` 拥有、
 计划对象来自 C++ FFI。

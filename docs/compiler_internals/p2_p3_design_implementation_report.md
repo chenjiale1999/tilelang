@@ -1,12 +1,17 @@
 # Ascend `T.Parallel` 向量化 P2/P3 设计—实现方案（汇报稿）
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | P2/P3 现有落地实践梳理与设计—实现方案 |
 | 版本 | V1.0 |
 | 日期 | 2026-10-30 |
 | 适用场景 | 内部正式汇报、方案评审、后续迭代基线 |
-| 范围 | `src/ascend/transform/polyhedral/`（P2/P3 实现）、三阶段 pass 接入、P1→P2→P3 协同、配套测试 |
+| 范围 | `src/ascend/transform/parallel_vectorize/`（P2/P3 实现）、三阶段 pass 接入、P1→P2→P3 协同、配套测试 |
 | 代码基线 | 分支 `p2_p3_based_stable-parallel`，提交 `6d46c9bf fix: vcvt narrowing`（功能提交 `ce363f57 feat: add p2, p3`） |
 | 详细实现索引 | [p2_p3_cpp_port_survey.md](p2_p3_cpp_port_survey.md)（逐文件、逐函数、逐分支） |
 
@@ -21,7 +26,7 @@
 
 ## 0. 执行摘要
 
-1. **P2/P3 已完成 C++ 化并接入默认流水线**：`pipeline.py:124` 无条件执行组合 pass `AscendPolyhedralVectorize`，
+1. **P2/P3 已完成 C++ 化并接入默认流水线**：`pipeline.py:124` 无条件执行组合 pass `AscendParallelVectorize`，
    原 legacy 降级 pass 已在 `pipeline.py:125` 停用，`T.Parallel` 目前只有这一条降级路径。
 2. **三阶段通过两个 IR 载体解耦**：P1 产出 `tl.vsimd.array_region`（`VSimdRegion`），P2 产出
    `tl.vsimd.array_plan`（`VectorProgram`），P3 消费计划并发射 `tl.simd.*`；任一阶段拒绝都保留原 nest，
@@ -53,7 +58,7 @@ P1（区域分析）落地后，团队将 P2（规划）与 P3（发射）拆成
 
 | 维度 | 现状 | 佐证 |
 | --- | --- | --- |
-| 实现语言 | P1/P2/P3 全部 C++；Python 仅保留 FFI 门面 | `src/ascend/transform/polyhedral/`、`tilelang/ascend/analysis/polyhedral/_cpp.py` |
+| 实现语言 | P1/P2/P3 全部 C++；Python 仅保留 FFI 门面 | `src/ascend/transform/parallel_vectorize/`、`tilelang/ascend/analysis/parallel_vectorize/_cpp.py` |
 | 流水线接入 | 组合 pass 已无条件接入默认流水线；legacy pass 已停用 | `tilelang/ascend/pipeline.py:120-126` |
 | 交付形态 | 4 个 pass 入口（P1 / P2 / P3 / 组合）+ 12 个 FFI 入口 | `tilelang/ascend/transform/__init__.py:60,193,204,214,219` |
 | 能力覆盖 | 基础向量化 → 归约/展平/索引向量 → serial 吸收/多段 → 混合宽度 → NZ 直写 → 窄化+NZ 配对 → FA 闭环 | 第 2.3、3.3 节 |
@@ -101,7 +106,7 @@ flowchart TD
 
 | 指标 | 数值 | 口径 |
 | --- | ---: | --- |
-| 实现文件数 | 21（10 头文件 + 11 实现） | `src/ascend/transform/polyhedral` |
+| 实现文件数 | 21（10 头文件 + 11 实现） | `src/ascend/transform/parallel_vectorize` |
 | 实现总行数 | 8332（头 1234 / 实现 7098） | `wc -l` |
 | 最大三文件 | `emit.cc` 2340、`plan.cc` 1967、`value.cc` 861，合计 62.0% | 同上 |
 | 注册 pass | 4（P1、P2、P3、组合） | `transform/__init__.py` |
@@ -110,7 +115,7 @@ flowchart TD
 | FFI 全局入口 | 12 | `ffi_polyhedral.cc:202-224`、`vsimd_p2_input.cc:213-217` |
 | 显式拒绝点 | 73 处 `throw Unsupported` | plan 47、value 9、emit 9、body 5、primitives 2、access 1 |
 | 契约断言 | 10 处 `ICHECK` | 计划/入口类型不变量 |
-| 回归用例 | 160 个测试函数 / 165 个 collected case | `test_ascend_polyhedral_vectorize.py` |
+| 回归用例 | 160 个测试函数 / 165 个 collected case | `test_ascend_parallel_vectorize_*.py` |
 | 测试文件行数 | 4481 | 同上 |
 
 ---
@@ -145,7 +150,7 @@ P2 的输入是单个 `tirx::Stmt`（在线路径由 P1 的 region 反向展开�
 | 拒绝点目录 | `p2_unsupported_catalog.md`（原型期整理，当前 C++ 侧以 `throw Unsupported` 现场文本为准，共 73 处） | 拒绝措辞与触发期，测试按此前缀匹配 |
 | 当前实现事实 | `p2_p3_cpp_port_survey.md` | 逐阶段入参/出参/边界/异常，与本报告配套 |
 | 代码契约 | `primitives.h`（唯一拒绝类型）、`model.h`（FFI 字段）、`plan.h`（BuildPlan 签名） | 评审时可直接对照 |
-| 回归契约 | `test_ascend_polyhedral_vectorize.py` | 160 个测试函数（165 collected）锁定行为，不允许“改写式通过” |
+| 回归契约 | `test_ascend_parallel_vectorize_*.py` | 160 个测试函数（165 collected）锁定行为，不允许“改写式通过” |
 
 评审通过的最低标准（当前实际执行口径）：
 
@@ -366,7 +371,6 @@ flowchart LR
 | NZ 直写 | buffer 显式标注且布局可识别 | 保持 ND 或拒绝该 nest | `test_compact_nz_store_*`、`test_canonical_nz_store_*` |
 | 混合宽度 | 窄化且无 tail/谓词/兄弟语句 | 拒绝（不截断累加器、不越界写） | `test_mixed_width_*` |
 | 窄化 + NZ | 唯一、段末、独占、整对 | 拒绝 | `test_half_register_nz_store_is_paired_into_a_full_register` |
-| FA 闭环 | 实际 kernel 形状 | 不适用则保持原 nest | `test_parallel_fa_vectorizes_the_softmax_nest` |
 
 ### 3.5 线上运维监控机制
 
@@ -597,7 +601,7 @@ P2/P3 已完成从“原型验证”到“默认流水线唯一路径”的落�
 
 | 指标 | 口径 | 采集方式 |
 | --- | --- | --- |
-| 文件数/行数 | `src/ascend/transform/polyhedral` 下 `.h` 与 `.cc` | `wc -l` |
+| 文件数/行数 | `src/ascend/transform/parallel_vectorize` 下 `.h` 与 `.cc` | `wc -l` |
 | 拒绝点 | `throw Unsupported(` 出现次数 | 静态扫描（不含 `ICHECK`） |
 | 回归用例 | 测试文件中 `def test_` 与 parametrize 展开 | 测试文件 |
 | 诊断覆盖 | 成功计划是否携带 `diagnostics` | 读取 plan 字段 |
@@ -617,11 +621,11 @@ P2/P3 已完成从“原型验证”到“默认流水线唯一路径”的落�
 
 ```bash
 # P2/P3 场景 + P1 交付 + 三段 pass + 流水线接入（160 个测试函数）
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
 
 # 打印每个用例的 plan 渲染与发射 IR
 TL_POLYHEDRAL_DUMP_IR=1 python -m pytest \
-  testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -s
+  testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -s
 
 # P1 上游回归
 python -m pytest testing/ascend/transform/test_ascend_vsimd_capture_scope.py \
@@ -629,12 +633,12 @@ python -m pytest testing/ascend/transform/test_ascend_vsimd_capture_scope.py \
   testing/ascend/transform/test_ascend_vsimd_region.py -q
 
 # 只跑 P1→P2 交付契约 / NZ 与 pack2
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -k "p1_"
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -k "nz or paired"
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -k "p1_"
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -k "nz or paired"
 ```
 
 > 执行前请确认 `python -c "import tilelang; print(tilelang.__file__)"` 指向包含
-> `src/ascend/transform/polyhedral` 的工作树；否则相关 FFI 符号不存在。
+> `src/ascend/transform/parallel_vectorize` 的工作树；否则相关 FFI 符号不存在。
 
 ### E. 专项分析：P2 核心判定模型 —— 有限差分 Δ(offset)
 
@@ -996,9 +1000,9 @@ P2/P3 的处理：
    - 一条 `vsstb`，步长 `(129 << 16)`（低 16 位是 POST_UPDATE 前进量，普通直存恒 0）；
    - `P_ub` 的 ND 写回用 `vintlv` 还原后发两条 `vsts`。
 
-测试断言（`test_parallel_fa_vectorizes_the_softmax_nest`，3753）：整段 `T.Parallel` 被替换，
-输出含 `vld2`、`PART_ODD`、`vor`、`vsstb` 与 `(129 << 16)`。
-单段形态断言见 `test_half_register_nz_store_is_paired_into_a_full_register`（3554）：
+同形态的单段断言（`test_half_register_nz_store_is_paired_into_a_full_register`）：整段
+`T.Parallel` 被替换，输出含 `vld2`、`PART_ODD`、`vor`、`vsstb` 与 `(129 << 16)`。
+更细的单段形态断言见同名用例：
 `vld2` 恰好 1 条、不出现 `vdintlv`、出现 `vintlv`、`vsstb` 恰好 1 条、不出现 `PK_B32`。
 
 #### F.7 边界、代价与优化空间

@@ -1,5 +1,10 @@
 # Ascend SimdVF `alloc_fragment` 降级：寄存器数组（`AscendSimdVFallocFragment`）
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **⚠️ 已删除（`p_123_parallel_new_p1` 分支）**：本 pass 已从代码库中**完全移除**：
 >
 > - `src/ascend/transform/simdvf_alloc_fragment.cc`（880 行）已删除；
@@ -24,7 +29,7 @@
 > - 实现：`src/ascend/transform/simdvf_alloc_fragment.cc`
 > - 管线：`tilelang/ascend/pipeline.py:126-130`
 > - FFI 包装：`tilelang/ascend/transform/__init__.py:60-70`
-> - 相关既有机制：`src/ascend/transform/polyhedral/{plan,emit}.cc`（P2/P3 fragment register mode）、
+> - 相关既有机制：`src/ascend/transform/parallel_vectorize/{plan,emit}.cc`（P2/P3 fragment register mode）、
 >   `src/ascend/codegen/codegen_ascend.cc`（`vector_<T>` 声明）、
 >   `tilelang/transform/add_bufstore_wrapper.py`（`T.parallel(1)` store wrapper）
 

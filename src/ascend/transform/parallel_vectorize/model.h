@@ -2,15 +2,15 @@
  * \file model.h
  * \brief Instruction-selection-agnostic plan data structures.
  *
- * C++ counterpart of ``polyhedral/model.py``: ``StorePlan`` / ``ReduceInfo`` /
+ * C++ counterpart of ``parallel_vectorize/model.py``: ``StorePlan`` / ``ReduceInfo`` /
  * ``VectorPlan`` / ``VectorProgram`` are TVM FFI objects so Python can read the
  * exact same fields the Python dataclasses expose (D2). Dependency direction
  * stays strictly downward:
  *
  *   primitives -> access -> {body, value} -> model -> plan -> {emit, render}
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_MODEL_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_MODEL_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_MODEL_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_MODEL_H_
 
 #include <tvm/ffi/any.h>
 #include <tvm/ffi/container/array.h>
@@ -26,7 +26,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 class ReduceInfoNode;
 
@@ -101,7 +101,7 @@ class StorePlanNode : public ffi::Object {
   ffi::String role{"main"};
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StorePlan", StorePlanNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.StorePlan", StorePlanNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -148,7 +148,7 @@ class ReduceInfoNode : public ffi::Object {
   bool accumulate{false};
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.ReduceInfo", ReduceInfoNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.ReduceInfo", ReduceInfoNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -196,7 +196,7 @@ class VectorPlanNode : public ffi::Object {
   ffi::Array<ffi::String> diagnostics;
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.VectorPlan", VectorPlanNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.VectorPlan", VectorPlanNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -235,7 +235,7 @@ class VectorProgramNode : public ffi::Object {
   ffi::Array<ffi::String> diagnostics;
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.VectorProgram", VectorProgramNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.VectorProgram", VectorProgramNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -290,8 +290,8 @@ bool IsPrivateScope(const tirx::Buffer& buffer);
 ValueNode AccumulatorCandidate(const StorePlan& store, const VectorPlan& plan,
                                arith::Analyzer* analyzer);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_MODEL_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_MODEL_H_

@@ -2,12 +2,12 @@
  * \file plan.h
  * \brief Planning layer: nest splitting, axis ranking, reductions, build_plan.
  *
- * C++ counterpart of ``polyhedral/plan.py``. ``BuildPlan`` always returns a
+ * C++ counterpart of ``parallel_vectorize/plan.py``. ``BuildPlan`` always returns a
  * :class:`VectorProgram` with 1..N segments; the plan holds no instruction
  * names at all (instruction selection is the emit layer's job).
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PLAN_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PLAN_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PLAN_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PLAN_H_
 
 #include <optional>
 #include <utility>
@@ -18,7 +18,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*!
  * \brief Context P1 hands to the planner alongside the nest statement.
@@ -51,8 +51,8 @@ TVM_DLL VectorProgram BuildPlan(const tirx::Stmt& stmt,
                                 std::optional<int64_t> lanes = std::nullopt,
                                 const PlanOptions& options = PlanOptions());
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PLAN_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PLAN_H_

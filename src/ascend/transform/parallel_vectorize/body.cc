@@ -19,7 +19,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 namespace {
 
@@ -279,6 +279,6 @@ std::vector<StoreSpec> NormalizeBody(const tirx::Stmt& stmt, const AliasMap& ali
   return out;
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

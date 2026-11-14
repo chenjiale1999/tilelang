@@ -5,12 +5,12 @@
 > - 分支：`p_123_parallel_new_p1`
 > - P1：`src/ascend/transform/lift_vsimd.cc`、`vsimd_ir.{h,cc}`、`vsimd_region.{h,cc}`
 > - P1 分析库：`vsimd_memory_legality.{h,cc}`、`vsimd_capture_scope.{h,cc}`、`vsimd_analysis_common.h`
-> - P2/P3：`src/ascend/transform/polyhedral/vsimd_group_passes.{h,cc}`、`region_plan.{h,cc}`
-> - 交接载体：`src/ascend/transform/polyhedral/region_plan.{h,cc}`
-> - 规划/发射核心：`src/ascend/transform/polyhedral/{plan,emit,value,model,access,body,primitives}.{h,cc}`
-> - 流水线接入：`tilelang/ascend/pipeline.py:121-134`
-> - 测试：`testing/ascend/transform/test_ascend_vsimd_*.py` 与 `test_ascend_polyhedral_vectorize.py`
-> - 关联文档：`vsimd_p1_analysis.md`（P1 逐文件详解）、`p1_region_p2_p3_integration_report.md`（对接过程与验收记录）、`p123_vs_pto_parallel_comparison.md`（与 PTO PR-1/PR-2 的能力/方案/设计对比）
+> - P2/P3：`src/ascend/transform/parallel_vectorize/vsimd_group_passes.{h,cc}`、`region_plan.{h,cc}`
+> - 交接载体：`src/ascend/transform/parallel_vectorize/region_plan.{h,cc}`
+> - 规划/发射核心：`src/ascend/transform/parallel_vectorize/{plan,emit,value,model,access,body,primitives}.{h,cc}`
+> - 流水线接入：`tilelang/ascend/pipeline.py:149-150`
+> - 测试：`testing/ascend/transform/test_ascend_vsimd_*.py` 与 `test_ascend_parallel_vectorize_*.py`
+> - 关联文档：`vsimd_p1_analysis.md`（P1 逐文件详解）、`p1_region_p2_p3_integration_report.md`（对接过程与验收记录）、`p123_vs_pto_parallel_comparison.md`（与 PTO PR-1/PR-2 的能力/方案/设计对比）、`p123_parallel_lowering_real_defects.md`（设备实测缺陷与修复记录）、`p123_simdvf_parallel_device_test_report.md`（设备测试报告）
 
 本文是**实现报告**，只描述“代码现在实际做了什么”。第 11 节给出与旧
 `tl.vsimd.program` 实现的变化清单；旧调研文档中关于「`tl.vsimd.array_region`
@@ -26,7 +26,7 @@
 2. **载体是类型化 FFI 对象，都挂在同一个 `T.Parallel` 上**：
    P1 写 `For.annotations["tl.vsimd.region"]`（`tl.vsimd.Region`），
    P2 写同一 `For` 的 `annotations["tl.vsimd.plan"]`
-   （`tl.polyhedral.VSimdRegionPlan`）。**两者都不改 body**，P3 按节点身份直接
+   （`tl.parallel_vectorize.VSimdRegionPlan`）。**两者都不改 body**，P3 按节点身份直接
    替换，不需要 span / 展平下标 / fingerprint。
 3. **P1 是 per-Parallel 的 metadata pass**：给每个顶层 `T.Parallel` 挂一个 region，
    记录折叠后的 axes、有序 ops、captures/outer_vars/shape_syms/local_views/
@@ -52,16 +52,21 @@
 8. **fragment 全链路已移除**：`vsimd_fragment.{h,cc}`、`fragment_plan.{h,cc}`、
    `AscendSimdVFallocFragment` pass、离线 planner 的 fragment 寄存器文件逻辑
    （`vf_alloc_scope`、`FragmentRegisterFile`、`fragment_regs`、`kRegLoad`）全部删除。
-9. **回归结果**：`testing/ascend/transform` **647 passed**，
-   `testing/ascend/analysis` **22 passed**；数值回归用例在没有 NPU 的环境整体 skip。
+9. **回归结果**：`testing/ascend/transform` **982 passed / 8 skipped**（共 999 例，
+   其中 P1/P2/P3 相关 302 例；另有 9 例 PTO VMI 用例在本机 CANN 9.2 下失败，
+   与本链路无关）；设备数值回归
+   `testing/ascend/language/test_tilelang_ascend_simdvf_parallel*.py` **85 例**，
+   在没有 NPU 的环境整体 skip。
 10. **能力边界**：P1 放行 `T.Parallel` 体内的**语句级 `if`**（含 else）与
     **常量边界的 `T.serial` shell**，并把它们建成 region 的 `if` / `serial` op；
     sibling Parallel、非常量边界的 shell 与 `while` 仍是 **per-nest** 的
     `UNSUPPORTED` 回退。P2 的条件建模覆盖：两臂同址 → `vsel`，
     单臂 / 两臂异址（异 buffer） / 一臂自带谓词 → 谓词化 store，mask 的
-    `and/or/not/==/!=` → `pand/por/pnot/pxor`；同 buffer 的两臂异址只有在
-    guard 参与后能证明地址互不相交时才放行（§9 访存合法性）。P2 无法规划的
-    形态只让该 item 回退，P3 保留原语句交 legacy。
+    `and/or/not/==/!=` → `pand/por/pnot/pxor`；lane-uniform 条件（含裸 scalar
+    bool）一律走**向量谓词**（`vdup` 广播 + `vcmps`），不发射标量 select /
+    `update_mask`；掩码粒度跟随条件的元素宽度，与写入宽度不一致时显式拒绝。
+    同 buffer 的两臂异址只有在 guard 参与后能证明地址互不相交时才放行
+    （§9 访存合法性）。P2 无法规划的形态只让该 item 回退，P3 保留原语句交 legacy。
 
 ---
 
@@ -71,32 +76,32 @@
 
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | ---: | --- | --- |
-| `lift_vsimd.cc` | 523 | P1 pass：VF 遍历、per-Parallel region 构造、annotation 写入、未 lift 的 Parallel 诊断 | `RegionBuilder`、`AttachRegion`、`NestTouchesFragment`、`ParallelCounter`、`LiftMutator` |
+| `lift_vsimd.cc` | 669 | P1 pass：VF 遍历、per-Parallel region 构造、annotation 写入、未 lift 的 Parallel 诊断 | `RegionBuilder`、`AttachRegion`、`NestTouchesFragment`、`ParallelCounter`、`LiftMutator` |
 | `vsimd_ir.h` | 314 | region/op/access/capture 类型化 schema + 校验/打印声明（op 只有 parallel/serial/store/if/opaque） | `VSimdRegion`、`VSimdOp`、`VSimdAccess`、`VSimdCapture`、`VSimdAxis`、`VSimdVarBinding`、`VSimdView`；`VerifyRegion`、`DumpRegion` |
 | `vsimd_ir.cc` | 934 | schema 构造、反射注册、verifier、稳定 dump、printer | `VerifyRegion`、`DumpRegion`、`StorageKindOf` |
-| `vsimd_region.h` | 121 | region 构造与结构 oracle 声明 | `BuildRegion`、`ExpandVSimdRegionToLoops`、`VerifyExpandedRegion`、`CompareRegionWithOriginal`、`AnalyzeVSimdRegionReport` |
-| `vsimd_region.cc` | 1116 | 六道闸门 + 参考展开 + 展开校验 + 原 body 结构比较 | `BuildRegion` |
-| `vsimd_capture_scope.h/.cc` | 109 + 627 | PR-B：capture/scope 闭包分析（含 serial shell 计数器） | `AnalyzeVSimdCaptureInfo`、`VSimdCaptureInfo`、`CaptureInfoToFFI` |
-| `vsimd_memory_legality.h/.cc` | 57 + 1252 | PR-A：per-nest 内存合法性（LEGAL/UNPROVEN/ILLEGAL） | `AnalyzeVSimdMemory`、`AnalyzeVSimdMemoryRegions`、`VSimdMemoryRegionStatus` |
-| `vsimd_analysis_common.h` | 421 | VF/nest 索引、公共类型与状态常量、nest 语法白名单 | `VSimdCaptureInfo`、`VSimdMemoryRegionStatus`、`ParallelNest::shell_vars`、`NestCollector` |
+| `vsimd_region.h` | 120 | region 构造与结构 oracle 声明 | `BuildRegion`、`ExpandVSimdRegionToLoops`、`VerifyExpandedRegion`、`CompareRegionWithOriginal`、`AnalyzeVSimdRegionReport` |
+| `vsimd_region.cc` | 991 | 六道闸门 + 参考展开 + 展开校验 + 原 body 结构比较 | `BuildRegion` |
+| `vsimd_capture_scope.h/.cc` | 113 + 636 | PR-B：capture/scope 闭包分析（含 serial shell 计数器） | `AnalyzeVSimdCaptureInfo`、`VSimdCaptureInfo`、`CaptureInfoToFFI` |
+| `vsimd_memory_legality.h/.cc` | 57 + 1400 | PR-A：per-nest 内存合法性（LEGAL/UNPROVEN/ILLEGAL） | `AnalyzeVSimdMemory`、`AnalyzeVSimdMemoryRegions`、`VSimdMemoryRegionStatus` |
+| `vsimd_analysis_common.h` | 668 | VF/nest 索引、公共类型与状态常量、nest 语法白名单 | `VSimdCaptureInfo`、`VSimdMemoryRegionStatus`、`ParallelNest::shell_vars`、`NestCollector` |
 | `analyze_vsimd.cc` | 91 | P1 只读调试入口（三个阶段报告 + 合并 dump pass） | `AscendAnalyzeSimdVFMemoryReport`、`AscendAnalyzeSimdVFCaptureReport`、`AscendAnalyzeVSimdRegionReport`、`AscendDumpVSimd`、`AscendDumpVSimdReport` |
 
-### 1.2 P2/P3 与规划库（`src/ascend/transform/polyhedral/`）
+### 1.2 P2/P3 与规划库（`src/ascend/transform/parallel_vectorize/`）
 
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | ---: | --- | --- |
-| `vsimd_group_passes.h` | 32 | P2/P3 入口声明 | `PlanVSimd`、`EmitVSimd`、`VectorizeVSimd` |
-| `vsimd_group_passes.cc` | 260 | **P2/P3 driver**：per-Parallel 规划、plan 挂载、按 loop 替换与注解清理 | `CollectVfLayouts`、`MakeRegionOptions`、`VfRegionPlanner`、`RegionPlanner`、`RegionEmitter` |
+| `vsimd_group_passes.h` | 37 | P2/P3 入口声明 | `PlanVSimd`、`EmitVSimd`、`VectorizeVSimd` |
+| `vsimd_group_passes.cc` | 276 | **P2/P3 driver**：per-Parallel 规划、plan 挂载、按 loop 替换与注解清理 | `CollectVfLayouts`、`MakeRegionOptions`、`VfRegionPlanner`、`RegionPlanner`、`RegionEmitter` |
 | `region_plan.h` | 81 | P2→P3 类型化载体与反射 | `VSimdRegionPlan`（version/vf_index/region_index/program） |
 | `region_plan.cc` | 112 | 载体构造器 + TVMScript printer | `MakeVSimdRegionPlan`、`RegionPlanDoc` |
-| `plan.h/.cc` | 58 + 2783 | 规划核心：nest 切分、轴打分、归约、布局、pack2、多段、8-bit/加宽装载校验 | `BuildPlan`、`SourceOrderSegments`、`PlanStatementSplit`、`PlanSources`、`ClassifyStoreLayout`、`ClassifyReduce`、`ValidateByteGatherSegment`、`ValidateWideningLoads` |
-| `emit.h/.cc` | 28 + 2751 | 发射核心：value/store/归约/pack2/NZ/多段/字节 gather | `EmitPlan`、`Emitter`、`EmitSegmentStmts`、`EmitParallelAxisParts`、`IsByteGatherValue` |
-| `value.h/.cc` | 304 + 1049 | value DAG：标量表达式 → 逐 lane 向量值（含 mask 真值表） | `BuildValue`、`LoadNode`、`IndexValue`、`GuardFreeBounds`、`Compare` |
-| `model.h/.cc` | 293 + 181 | 计划数据结构构造器 + 反射 + 累加器判据 | `MakeStorePlan`、`VectorPlan`、`VectorProgram`、`AccumulatorCandidate` |
+| `plan.h/.cc` | 58 + 2885 | 规划核心：nest 切分、轴打分、归约、布局、pack2、多段、8-bit/加宽装载校验 | `BuildPlan`、`SourceOrderSegments`、`PlanStatementSplit`、`PlanSources`、`ClassifyStoreLayout`、`ClassifyReduce`、`ValidateByteGatherSegment`、`ValidateWideningLoads` |
+| `emit.h/.cc` | 38 + 2948 | 发射核心：value/store/归约/pack2/NZ/多段/字节 gather | `EmitPlan`、`Emitter`、`EmitSegmentStmts`、`EmitParallelAxisParts`、`IsByteGatherValue` |
+| `value.h/.cc` | 320 + 1129 | value DAG：标量表达式 → 逐 lane 向量值（含 mask 真值表） | `BuildValue`、`LoadNode`、`IndexValue`、`GuardFreeBounds`、`Compare` |
+| `model.h/.cc` | 297 + 183 | 计划数据结构构造器 + 反射 + 累加器判据 | `MakeStorePlan`、`VectorPlan`、`VectorProgram`、`AccumulatorCandidate` |
 | `access.h/.cc` | 221 + 277 | SCoP 建模：线性化、有限差分、访存分类 | `ClassifyAccess`、`FiniteDifference`、`ClassifyDelta`、`StorageClass` |
-| `body.h/.cc` | 104 + 284 | body 归一化（if/两臂/predicate/serial shell 展开）；**不含任何 tile-op 展开** | `NormalizeBodyInto`、`MakeStoreSpec`、`kShellUnrollLimit` |
+| `body.h/.cc` | 109 + 284 | body 归一化（if/两臂/predicate/serial shell 展开）；**不含任何 tile-op 展开** | `NormalizeBodyInto`、`MakeStoreSpec`、`kShellUnrollLimit` |
 | `primitives.h/.cc` | 206 + 419 | ISA 事实表、`Unsupported`、dtype/掩码工具 | `ReducePrimitives`、`VRegLanes`、`MaskBits`、`ReduceIdentity` |
-| `analyze_polyhedral.cc` | 279 | 离线唯一入口：`build_plan`/`emit_plan`/`render_plan` FFI + 文本渲染 | `AscendPolyhedralBuildPlan`、`AscendPolyhedralEmitPlan`、`AscendPolyhedralRenderPlan` |
+| `analyze_parallel_vectorize.cc` | 277 | 离线唯一入口：`build_plan`/`emit_plan`/`render_plan` FFI + 文本渲染 | `AscendParallelVectorizeBuildPlan`、`AscendParallelVectorizeEmitPlan`、`AscendParallelVectorizeRenderPlan` |
 
 ### 1.3 常规降级路径
 
@@ -109,10 +114,10 @@
 | 文件 | 原因 |
 | --- | --- |
 | `src/ascend/transform/vsimd_fragment.{h,cc}` | fragment 事实收集/分组/VF 表；本分支不支持 `T.alloc_fragment` |
-| `src/ascend/transform/polyhedral/fragment_plan.{h,cc}` | VF 级 fragment 寄存器（V1–V4）校验 |
+| `src/ascend/transform/parallel_vectorize/fragment_plan.{h,cc}` | VF 级 fragment 寄存器（V1–V4）校验 |
 | `src/ascend/transform/simdvf_alloc_fragment.cc` | `AscendSimdVFallocFragment`：把 fragment 切成寄存器数组的前置 pass；下游已不存在 |
 | `src/ascend/transform/vsimd_program.{h,cc}` | 旧 P1 `tl.vsimd.program` schema reader/verifier |
-| `src/ascend/transform/polyhedral/vsimd_payload_read.{h,cc}` | 旧 item-map payload 解码；改为在 `vsimd_group_passes.cc` 直接解码 `Call` |
+| `src/ascend/transform/parallel_vectorize/vsimd_payload_read.{h,cc}` | 旧 item-map payload 解码；改为在 `vsimd_group_passes.cc` 直接解码 `Call` |
 | `src/ascend/transform/analyze_simdvf_capture.cc` / `analyze_simdvf_memory.cc` / `analyze_vsimd_region.cc` | 合并进 `analyze_vsimd.cc` |
 
 离线 planner 中的 fragment 寄存器文件逻辑也一并删除：`PlanOptions::vf_alloc_scope`、
@@ -132,15 +137,18 @@
 
 | 文件 | 用例数 | 行数 | 覆盖 |
 | --- | ---: | ---: | --- |
-| `test_ascend_polyhedral_vectorize.py` | 173 | 4530 | 离线 `build_plan`/`emit_plan` 全场景 + 新链路 + FA + fragment 拒绝守卫 + 8-bit 尾块/加宽/多 recipe 拆段 |
-| `test_ascend_vsimd_group_passes.py` | 22 | 790 | P1→P2→P3 契约：plan 挂载与 metadata-only、顶层 tileop 不介入、if（select/谓词/异址/同 buffer 异址 guard）、mask EQ、serial shell（吸收成轴 / 逐迭代展开）、分支下的 Parallel 不 lift、符号尾块、多 VF、降级、幂等、pipeline/config |
-| `test_ascend_vsimd_lift.py` | 16 | 510 | P1 annotation 位置/状态/门控/配置开关、if 放行、tile-op 按 nest OPAQUE |
-| `test_ascend_vsimd_ir.py` | 19 | 330 | region schema、构造器、verifier、dump、参考展开（含 `serial` op） |
-| `test_ascend_vsimd_region.py` | 23 | 553 | region 报告、N-D/广播/view/layout/oracle、合并 dump |
-| `test_ascend_vsimd_capture_scope.py` | 15 | — | PR-B 状态、捕获分类 |
+| `test_ascend_parallel_vectorize_delta.py` | 71 | 1733 | Δ(offset) 分类、访问形态、if/select、归约、多 store、serial 吸收、多段程序、诊断 |
+| `test_ascend_parallel_vectorize_plan.py` | 48 | 1267 | transform 入口、chunk/尾块/对齐、缺陷回归（D1–D13）、壳与 carry、谓词宽度 |
+| `test_ascend_parallel_vectorize_emit_dtypes.py` | 19 | 446 | 混合宽度段、同宽符号重解释、加宽 cast、8-bit 尾块 |
+| `test_ascend_parallel_vectorize_nz.py` | 12 | 299 | NZ 散射（`vsstb`）、pack2、配对形态、P1 布局交接 |
+| `test_ascend_parallel_vectorize_pipeline.py` | 7 | 224 | P1 交付、三段 pass annotation 交接、幂等、pipeline 开关 |
+| `test_ascend_vsimd_group_passes.py` | 23 | 822 | P1→P2→P3 契约：plan 挂载与 metadata-only、顶层 tileop 不介入、if（select/谓词/异址/同 buffer 异址 guard）、mask EQ、serial shell（吸收成轴 / 逐迭代展开 / 壳屏障）、分支下的 Parallel 不 lift、符号尾块、多 VF、降级、幂等、pipeline/config |
+| `test_ascend_vsimd_lift.py` | 27 | 818 | P1 annotation 位置/状态/门控/配置开关、if 放行、extent-1 死轴拒绝、tile-op 按 nest OPAQUE |
+| `test_ascend_vsimd_ir.py` | 19 | 322 | region schema、构造器、verifier、dump、参考展开（含 `serial` op） |
+| `test_ascend_vsimd_region.py` | 23 | 550 | region 报告、N-D/广播/view/layout/oracle、合并 dump |
+| `test_ascend_vsimd_capture_scope.py` | 14 | — | PR-B 状态、捕获分类 |
 | `test_ascend_vsimd_memory_legality.py` | 27 | — | PR-A 状态、快速通道/Z3、别名、去重、if guard |
-| `test_ascend_vsimd_parallel_fa.py` | 2 | — | FA NZ layout 回归 |
-| **`testing/ascend/transform` 合计** | **647** | — | 另 `testing/ascend/analysis` 22 例 |
+| **`testing/ascend/transform` 合计** | **999（982 passed / 8 skipped；9 例 PTO VMI 失败与本链路无关）** | — | 其中 P1/P2/P3 相关 302 例；另 `testing/ascend/analysis` 22 例 |
 
 ---
 
@@ -177,7 +185,7 @@ flowchart TD
 
 ```text
 P1:  For.annotations["tl.vsimd.region"] = tl.vsimd.Region
-P2:  For.annotations["tl.vsimd.plan"]   = tl.polyhedral.VSimdRegionPlan
+P2:  For.annotations["tl.vsimd.plan"]   = tl.parallel_vectorize.VSimdRegionPlan
 ```
 
 两个载体都挂在**同一个 `T.Parallel`** 上，都是 `TVM_FFI` 反射注册的对象，字段名与
@@ -355,7 +363,7 @@ OPAQUE region 携带：
 | 语句 | P1 建模 | P2 | 失败时的结果 |
 | --- | --- | --- | --- |
 | `if`（含 `else`） | `op.kind="if"`，`guard`=条件，`ops`/`else_ops` 为分支 op 列表 | `BuildPlan` 的 `NormalizeBody`：单臂 → 谓词化 store（mask），同址双臂（两臂都无掩码）→ 惰性 `if_then_else`（`vsel`），其余（异址双臂 / 一臂自带谓词）→ 每臂各自谓词化 store | 该 item 被 REJECTED，P3 保留原 Parallel，legacy 标量路径 |
-| 条件表达式 | 原样保留在 `guard` 里 | `value.cc::Compare`：数值比较 → `vcmp`/`vcmps`，lane-uniform → `update_mask`；bool 操作数的 `==`/`!=` → `pnot(pxor)`/`pxor`（排序比较 `Unsupported`） | 该 item REJECTED |
+| 条件表达式 | 原样保留在 `guard` 里 | `value.cc::Compare`：数值比较 → `vcmp`/`vcmps`；两侧都 lane-uniform 且依赖内存时 → **向量谓词** `vcmps(广播一侧, 标量一侧)`（`vdup` + `vcmps`，全 0/全 1 掩码），不再折成标量比较、也不发 `update_mask`；只有编译期常量才折成常量掩码。bool 操作数的 `==`/`!=` → `pnot(pxor)`/`pxor`（排序比较 `Unsupported`） | 该 item REJECTED |
 | `T.serial`（嵌套在 Parallel 体内，边界 lane 不变） | `op.kind="serial"`，`axes=[counter]`（**不是 region 轴**）+ `ops` | `SingleSegmentSource` 优先吸收成候选轴（归约 shell）；小于等于 `kShellUnrollLimit=8` 的常量壳逐迭代展开；其余（运行期边界 / 末写覆盖 / 多地址写）保留为 **plan 级 `shells` 标量壳**，壳包住 chunk 程序 | 写标量地址、bound 依赖 lane var 或读 buffer → `body.nested_loop`，整条语句 legacy |
 | `T.serial` **包围** Parallel（VF 内） | 照常 lift：Parallel 即 nest root，`outer_shells` 记录外壳；外壳计数器判为已绑定 | 规划的是 Parallel 体，外壳连计数器留在原位（地址里作为 lane 均匀值） | 仅当 Parallel 本身不可规划时回退 |
 | Parallel 体内 tile-op（`copy`/`reduce`/`fill`/atomic…） | **不建模**：任何非空 `Evaluate` → 该 nest OPAQUE | 不进入 inventory（region 为 OPAQUE） | 该 nest 走 legacy；同 VF 其他 nest 照常。注意：正常 pipeline 里前端语义检查会更早拒绝整个程序 |
@@ -477,7 +485,14 @@ P3 只是 driver；真正的 TIR 生成在 `EmitPlan`：
 - pack2 / NZ 目标由 `StorePlan.layout_kind` 决定（`nd` 之外的走 `vsstb` 等 scatter 形态）；
 - 标量壳（`plan.shells`）与**外层串行壳**的每次迭代末尾发一条
   `simd_inst::mem_bar(VST_VLD)`（`emit.h::VstVldBarrier`）：壳迭代按内存序执行，
-  读改写体不能让下一轮的 `vld` 越过上一轮的 `vst`。没有壳的 nest 不发。
+  读改写体不能让下一轮的 `vld` 越过上一轮的 `vst`。没有壳的 nest 不发；
+- 循环不变的值只建一次：`vdup` 走 `ScalarHoistable` 提到 prologue（按
+  `(scalar, elem)` 去重）；lane 索引 / 常量 `ramp` 在 `lane_base_` 不含自由变量
+  （单 chunk，例如行循环内）时走 `PrologueBind`；其余循环不变绑定由
+  `SplitLoopInvariant` 提到外层轴 / 壳之外；
+- 8-bit 字节源的**掩码载入**在 **b16** 宽度建谓词：`vgather2` 每字节扩成一个
+  16 位 lane，所以尾掩码是 `update_mask(n, 16)`，b8 尾掩码不会被声明；
+  `vcvt` 仍用 b8 `PAT_ALL`，多余 lane 的转换结果由 store 掩码丢弃。
 
 ---
 
@@ -563,9 +578,8 @@ at.AscendDumpVSimd()(mod)                  # 只打印、不改 IR 的 pass
 | region lift | `test_ascend_vsimd_region.py` | N-D/广播/转置/view/layout/动态 shape、oracle、合并 dump |
 | P1 pass | `test_ascend_vsimd_lift.py` | annotation 位置与 body 不变、状态、门控、配置开关、pipeline |
 | P2/P3 | `test_ascend_vsimd_group_passes.py` | 见下表 |
-| 离线 planner | `test_ascend_polyhedral_vectorize.py` | `build_plan`/`emit_plan` 全场景 |
-| 设备数值回归 | `testing/ascend/language/test_tilelang_ascend_vsimd_numeric.py` | max/min 的 NaN/±0 契约、tail chunk、8-bit tail（字节 gather + `PK_B16`）与 `i8↔u8` 尾块、单臂谓词化 / 异址双臂、mask EQ/NE、常量 shell（末写生效）与 shell 归约、不可吸收 shell 的标量壳（16 次迭代不展开）、serial 包围 Parallel、stride-2 装载、间接 gather、窄化 cast（bf16 / fp8 / u8）、同宽符号 reinterpret、加宽 cast（`UNPK`，含 `i8/u8→i16/u16/f16`）；无 NPU 时整体 skip |
-| FA 回归 | `test_ascend_vsimd_parallel_fa.py` | NZ layout 与整条链路 |
+| 离线 planner | `test_ascend_parallel_vectorize_*.py` | `build_plan`/`emit_plan` 全场景（含 NZ layout 与整条链路） |
+| 设备数值回归 | `testing/ascend/language/test_tilelang_ascend_simdvf_parallel*.py`（85 例） | 1-D 元素级 / 原地 RMW / 多 VF、max/min 的 NaN/±0 契约、tail chunk、8-bit 整块与尾块（字节 gather + `PK_B16`）与 `i8↔u8`、N-D 折叠 / 外层广播 / 展平下标、stride / 反转 / 间接 gather / 转置 scatter、单臂谓词化 / 同址 `vsel` / 异址互补掩码 / mask EQ-NE、**lane-uniform 条件的向量谓词**、行归约与串行壳（含壳屏障）、窄化/加宽 cast 全矩阵（含 `bf16→f16` 溢出为 `±inf`）、NZ / pack2；无 NPU 时整体 skip |
 
 `test_ascend_vsimd_group_passes.py` 的用例：
 
@@ -593,13 +607,18 @@ at.AscendDumpVSimd()(mod)                  # 只打印、不改 IR 的 pass
 cd /home/cjl/workspace/tilelang
 ./build.sh -j8                                   # 干净通过
 TILELANG_CACHE_DIR=/tmp/tilelang_cache \
-  python -m pytest testing/ascend/transform -q   # 647 passed
+  python -m pytest testing/ascend/transform -q   # 982 passed / 8 skipped（9 例 PTO VMI 失败与本链路无关）
 TILELANG_CACHE_DIR=/tmp/tilelang_cache \
   python -m pytest testing/ascend/analysis -q    # 22 passed
 ```
 
-`testing/ascend/language/test_tilelang_ascend_vsimd_numeric.py` 新增 8-bit 尾块、
-`i8↔u8` 尾块与 `i8/u8→i16/u16/f16` 加宽用例；无 NPU 时整文件 skip。
+设备套件（`test_tilelang_ascend_simdvf_parallel*.py`，85 例）最近一次上板
+**84 passed / 1 failed**：失败项是 `bf16→f16` 用例的 golden 假设（误以为该对
+转换会饱和），实测溢出为 `±inf`，已按硬件契约修正并改名为
+`test_parallel_bf16_to_f16_overflow_is_inf`，待复跑。其余 84 例（含 lane-uniform
+向量谓词、8-bit 尾块、串行壳屏障、NZ/pack2、cast 矩阵）全部通过。把 84 个
+`__simd_vf__` 生成体与 84 个用例逐一对上后可以确认：**没有静默回退**，每个
+nest 都真的走了 P1→P2→P3。
 
 ### 8.3 全链路 lower 验证
 
@@ -608,8 +627,7 @@ TILELANG_CACHE_DIR=/tmp/tilelang_cache \
 | 1-D 元素级（shared → shared） | OK | `simd_inst::` 存在 |
 | fragment 两段（fill/consume） | OK（回退） | 1327 字符；无 `simd_inst::`；`float frag[64]` + 朴素循环 |
 | fragment + 非 fragment Parallel 同 VF | OK（部分向量化） | 1743 字符；fragment nest 标量，兄弟 nest 为 `vlds_norm`/`vmuls`/`vsts_norm` |
-| FA（`parallel_fa.py`） | **失败（设计变更后预期）** | VF 顶层 `T.reduce_max/sum`（shared→shared）不再由 P2 规划，`AscendLowerTileOp` 不支持该形态 → `InternalError`。见 §10 L9 |
-| FA v2（`parallel_fa_v2.py`，parallel softmax） | OK | 45 处 `tl.simd.*`；softmax 段经循环分布后 scale（`vmuls`+`vscatter`）与 rowmax（`vmax` 累加器）都向量化，仅 `l_cur` 的 2D 并行内联归约 nest 仍是标量 |
+| FA 闭环（已移除） | — | 示例 `examples/ascend/flash_attention/parallel_fa.py` 与对应离线/设备测试已从本分支删除；VF 顶层 tile-op 的限制仍见 §10 L9 |
 
 字节级回归：把 P1 的 fragment 拒绝临时改成 `if (false && ...)` 重新构建后，
 上述 kernel 的 `kernel_source` 与改动后**逐字节一致**，说明 P1 拒绝与
@@ -622,7 +640,7 @@ planner 守卫拒绝产生相同的最终代码。
 | 能力 | 状态 | 位置 |
 | --- | --- | --- |
 | 顶层 `T.Parallel` 元素级向量化 | 支持 | P1 region + P2 `BuildPlan` |
-| 多轴 / 多维折叠 | 支持 | `CollapseAxes` + `PlanSources` |
+| 多轴 / 多维折叠 | 支持，但“折叠”指 **P1 region 折叠**：单链 `T.Parallel` 折成一个 region（`axes` 保留各轴）。P2 只选一个轴做向量轴，其余轴在外层保留为串行循环（`T.Parallel(2,4,64)` → `for i { for j { 64-lane chunk } }`，**不是**把 512 元素整体展平成 8 个 chunk） | `CollapseAxes` + `PlanSources` + `emit.cc::InnerAxes` |
 | 广播 / strided / 置换 / gather-scatter | 支持 | `access.cc` 分类 + `value.cc` |
 | Parallel 体内的任何 tile-op（`copy` / `reduce_*` / `fill` / atomic） | **不支持且不由本链路处理**：前端 `nested_loop_checker.py` 在 P1 之前报
  “Only elementwise operations are allowed inside a parallel loop”；P1 对直接分析调用给出 per-nest `OPAQUE` | 语义检查 + `NestCollector` |
@@ -649,6 +667,8 @@ planner 守卫拒绝产生相同的最终代码。
 | `i64→f32` / `i64→i32` | **不支持**：64 位源寄存器没有对应的 store/加宽配方 | `emit.cc::Vcvt` |
 | 8-bit 源的尾部块 | 支持：掩码字节装载走 `vgather2`（每字节扩到 16 位 lane，**CANN 契约为零扩展**），写回用 `PK_B16` 把低字节压紧；要求静态 tail ≤ 128（半寄存器）且无语句谓词，否则 P2 以 `body.byte_gather` 回退。strided/indirect 的 8-bit 源没有全寄存器 gather 形态，同样回退 | `plan.cc::ValidateByteGatherSegment` + `emit.cc::IsByteGatherValue` |
 | 8-bit 源的尾部**加宽**（`i8/u8 → i16/u16/f16`） | 支持：`vgather2` 给出零扩展的 16-bit lane；`uint8→uint16` 即为结果，`int8` 再补一条 `vcvt(PART_EVEN)` 做符号扩展（与整块 `UNPK_B8` 配方一致） | `emit.cc::Vcvt` 的 `gather_widened` 分支 |
+| 8-bit 字节源的**掩码载入谓词宽度** | 支持：`vgather2` 每字节扩成一个 16 位 lane，所以尾掩码按 **b16** 建（`update_mask(n, 16)`），b8 尾掩码不再被声明（此前会在 prologue 留下未使用的 `update_mask_b8`）。`vcvt` 仍用 b8 `PAT_ALL`，多余 lane 的转换结果由 store 掩码丢弃 | `emit.cc::Emitter::Build`（`byte_source` 分支） |
+| lane 索引 / 常量 ramp 的建立位置 | 支持：`lane_base_` 不含自由变量（单 chunk，例如行循环内）时在 prologue 建一次 `vci`，不再逐外层迭代重建；逐 chunk 变化时仍按 chunk 建 | `emit.cc::kLaneIndex` + `PrologueBind` |
 | 访存声明面（`access_ptr` extent） | 连续访问=一个寄存器（8-bit `PK_B16` 写为半寄存器）；常量 stride = `(lanes-1)*stride+1` 包络；gather/scatter/NZ 散射 = **整个 allocation owner**（may-access，与 PTO descriptor 契约一致） | `emit.cc::AccessPtr` |
 | 连续流的基址 32B 对齐（`vlds`/`vsts` 整块路径） | **要求**：chunk 起始元素偏移必须是 `32B / elem_size` 的整数倍（f32=8、f16=16、i8=32）。不满足时 P2 以 `plan.alignment` 拒绝该轴；nest 还有其它可向量化轴时换轴为 gather/scatter 形态（正确但更慢）。gather/scatter（按元素寻址）与单元素 `ONEPT` 不受限 | `plan.cc::ValidateStreamAlignment`；设备证据见 `p123_parallel_lowering_real_defects.md` §7 |
 | `T.Parallel` 的 extent 太小（`extent == 1`，nest 只能标量） | **不支持**：`Simplify` 在 P1 之前把该轴折叠进 body（`i`→0），nest 没有 lane 可向量化，`__simd_vf__` 内的标量循环会被 bisheng 拒绝；P1 直接报错（不再落到"axis 从未使用"的提示） | `vsimd_analysis_common.h::NestCollector::RejectDeadParallelAxes`（`IsOneExtent`） |
@@ -679,7 +699,7 @@ planner 守卫拒绝产生相同的最终代码。
 | L2b | `if` 臂内嵌 tile-op / 嵌套并行循环 | P1 递归进入两臂时即记 unsupported，该 nest `OPAQUE`，同 VF 其他 nest 不受影响 | `NestCollector`；不再需要 P2 的 segment 级 if 支持 |
 | L3 | ~~顶层 COPY/REDUCE 解码~~ | 已移出 P2：Parallel 外的 tile-op 不再由本条链路处理 | — |
 | L4 | P2/P3 之间插入重建 loop 的 pass | plan 注解丢失 | P3 跳过该 loop（保留原语句），不会有错位替换 |
-| L9 | Parallel 外的 tile-op（VF 顶层 copy/reduce）没有承接者 | copy → codegen `Generic vector BufferStore ... inside SimdVF`；reduce → `Reduce for buffers in scope (shared.dyn, shared.dyn) is not implemented`。FA 因此无法 lower | 设计取舍（P1/P2/P3 只处理 Parallel）；后续由 tile-op 降级补齐或加前置展开 pass |
+| L9 | Parallel 外的 tile-op（VF 顶层 copy/reduce）没有承接者 | copy → codegen `Generic vector BufferStore ... inside SimdVF`；reduce → `Reduce for buffers in scope (shared.dyn, shared.dyn) is not implemented`。FA 示例因此已从本分支移除 | 设计取舍（P1/P2/P3 只处理 Parallel）；后续由 tile-op 降级补齐或加前置展开 pass |
 | L5 | fragment 不支持 | 触碰到 `T.alloc_fragment` 的 Parallel 走标量 | 已删除全部 fragment 代码；P1 按 Parallel 粒度判 OPAQUE |
 | L6 | `region_index` 与 `nest_index` 语义不同 | 误用会错位 | P2/P3 只用 `For` + `region_index` |
 | L7 | `AscendSimdVFLowerParallel` 在 pipeline 中被注释 | 被拒 nest 生成标量循环而非 MicroAPI 向量指令 | 属既有配置状态；恢复该 pass 可重新启用兜底向量化 |
@@ -688,6 +708,8 @@ planner 守卫拒绝产生相同的最终代码。
 | L11 | `T.Parallel` 位于 branch / `while` 下时不 lift | 该 Parallel 完全不被 P1/P2/P3 处理，走 legacy 标量路径 | 只给 WARNING（`ParallelCounter`）；serial 包围的形态已支持，branch/while 仍需在 `RegionBuilder::Build` 里下钻控制流 |
 | L15 | 连续流的基址必须 32B 对齐 | 行距不是 32B 倍数（如 f32 `k=100` → 400B）时，`vlds_norm`/`vsts_norm` 在非首行解错 32B 块（设备实测 507035，`k=104` → 416B 通过）。P2 以 `plan.alignment` 拒绝该轴；若 nest 还有其它轴可向量化，换轴后得到 gather/scatter 的正确代码 | 已实现拒绝（`plan.cc::ValidateStreamAlignment`）；后续可在发射侧把残余元素偏移放进 ISA 的 offset 形参（`vlds_norm(src, offset)` / `vsts_norm(data, base, offset, mask)` 已就绪，`simd_inst.h` 无需改动），届时解除限制 |
 | L16 | 并行 extent 不能退化到 1 | `T.Parallel(1)` 在 P1 之前被 `Simplify` 折叠（`i`→0），整个 nest 变标量；`__simd_vf__` 内的标量被 bisheng 以 `Unsupported scalar instruction in AIV loop` 拒绝 | P1 直接报错（`RejectDeadParallelAxes` 的 `IsOneExtent` 分支），要求该 nest 可向量化；后续可让 codegen 把标量代码移出 `__simd_vf__` |
+| L17 | 相邻两个 `T.SimdVF` 块之间的 VST→VLD 没有屏障 | 前一个 VF 原地写、后一个 VF 读同一 UB 时（`test_parallel_two_vfs_in_one_kernel`）只依赖发射顺序；当前 2-chunk 规模通过，规模变大后存在竞态风险（与设备报告 §F 的串行壳屏障缺陷同类），尚未上板复现 | 待设备复现（扩 chunk 数 / VF 数）后，对“前一 region 写过、后一 region 读过”的 VF 边界补 `VstVldBarrier()`；单 VF 内核不受影响（`test_parallel_in_place_update_without_a_shell` 的“无屏障”契约保持不变） |
+| L18 | 掩码粒度跟随**条件**的元素宽度 | lane-uniform 条件（`vcmps`）与裸 bool 叶子（`vdup` + `vcmps ≠ 0`）只能产出与条件同宽的掩码；当写入元素宽度不同（如 f32 条件守卫 int8 store）时没有合法形态，`emit.cc::PredicateDataBits` 显式拒绝 | 拒绝而非错编译；需要跨宽度守卫时请在 DSL 侧显式 `T.Cast` 条件 |
 
 ---
 
@@ -728,7 +750,7 @@ planner 守卫拒绝产生相同的最终代码。
 | `reason_code` | string | `ILLEGAL`/`UNPROVEN`/`UNSUPPORTED`/`INTERNAL` |
 | `reason` | string | 人读诊断 |
 
-### A.2 `tl.polyhedral.VSimdRegionPlan`（P2 → P3，挂在 `For` 上）
+### A.2 `tl.parallel_vectorize.VSimdRegionPlan`（P2 → P3，挂在 `For` 上）
 
 | 字段 | 类型 | 备注 |
 | --- | --- | --- |
@@ -777,12 +799,18 @@ import pytest
 raise SystemExit(pytest.main(["testing/ascend/transform", "-q"]))
 PY
 
-# P1→P2→P3 契约（10 例）
+# P1→P2→P3 契约（23 例）
 python -m pytest testing/ascend/transform/test_ascend_vsimd_group_passes.py -v
 
-# 只跑 fragment 相关
-python -m pytest testing/ascend/transform -k fragment -v
+# 离线 plan/emit 全场景（169 例）
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
 
-# 离线 plan/emit 全场景
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q
+# 设备数值回归（需 NPU；内核源码变更后必须绕开 kernel cache）
+TILELANG_DISABLE_CACHE=1 python -m pytest \
+  testing/ascend/language/test_tilelang_ascend_simdvf_parallel*.py -q
 ```
+
+> 本机只有 CANN 9.2，bisheng device-compile 会被 `__float128 is not supported`
+> 卡住（baseline 空核同样失败，与实现无关）。验证发射形态请用离线
+> `build_plan`/`emit_plan`，或从异常消息的 `Source:` 段取生成的 CCE 源；
+> 数值验证必须在 CANN 9.3 的设备上跑。

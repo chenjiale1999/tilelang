@@ -1,6 +1,11 @@
 
 # P1 → P2/P3：VSimdRegion 接口规则
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 状态：PR-D staged（2026-10-27）。默认 pipeline 仍为 legacy；本文描述的是 P1 交给
 后续阶段的 typed interface，不是已接入的 codegen 路径。
 

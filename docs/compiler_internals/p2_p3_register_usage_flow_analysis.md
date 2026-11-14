@@ -1,9 +1,14 @@
 # Ascend P2 Plan / P3 发射寄存器使用逻辑专项分析
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **分析对象**：`T.alloc_fragment`（V 核寄存器 tile）在 `T.SimdVF` 内经
 > `T.Parallel` 读写的场景，重点回答「P2/P3 是否复用用户手动申请的寄存器」。
 >
-> **方法**：代码溯源（`src/ascend/transform/polyhedral/*`、`stage_passes.cc`、
+> **方法**：代码溯源（`src/ascend/transform/parallel_vectorize/*`、`stage_passes.cc`、
 > `emit.cc`、`model.cc`、`vf_checker.py`、`eager/builder.py`）+ 离线实测
 > （构造 kernel → 看 eager IR → 看 P1 交付 → 看 plan/emit → 看完整 lowering 源码）。
 >
@@ -271,7 +276,7 @@ main_kernel_simd_vf_0(buf_dyn_shmem, frag);
 | **SimdVF 内 BufferStore 到 GM** | `vf_checker.py:152-158` | **GM 显式拒绝** |
 | **SimdVF 内 BufferLoad 从 GM** | `vf_checker.py:161-170` | **GM 显式拒绝** |
 
-调用点：`pipeline.py:95`，在 `AscendPolyhedralVectorize`（`:124`）之前。
+调用点：`pipeline.py:95`，在 `AscendParallelVectorize`（`:124`）之前。
 
 ### 4.2 对「GM 不在支持范围」的修正
 

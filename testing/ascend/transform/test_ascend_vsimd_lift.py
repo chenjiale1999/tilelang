@@ -699,7 +699,7 @@ def test_p1_can_be_disabled_by_config():
     assert _regions(out) == []
 
 
-def test_default_pipeline_keeps_legacy_lowering():
+def test_default_pipeline_vectorizes_the_parallel_nest():
     n = 64
 
     @T.prim_func
@@ -715,9 +715,11 @@ def test_default_pipeline_keeps_legacy_lowering():
 
     with tvm.target.Target("ascend"):
         out = tilelang.lower(main)
-    # The pass is metadata-only; the legacy parallel lowering still runs.
-    assert out is not None
+    # The default pipeline runs P1 -> P2 -> P3, so the nest becomes vector code.
     assert "main_kernel_simd_vf_0" in out.kernel_source
+    assert "simd_inst::" in out.kernel_source
+    assert "tl.vsimd.region" not in out.kernel_source
+    assert "tl.vsimd.plan" not in out.kernel_source
 
 
 def _rewrite_loop_bounds(func, kind, *, min_value=None, step=None):

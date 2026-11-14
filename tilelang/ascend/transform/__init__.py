@@ -250,7 +250,7 @@ def AscendPlanVSimd():
     """P2 pass: plan liftable regions onto the ``T.Parallel`` they came from.
 
     The body is unchanged. Every LIFTED region is planned independently and the
-    resulting ``tl.polyhedral.VSimdRegionPlan`` is attached to that loop as
+    resulting ``tl.parallel_vectorize.VSimdRegionPlan`` is attached to that loop as
     ``tl.vsimd.plan``; a region the planner cannot handle keeps no plan and is
     left to the legacy lowering. Only Parallel loops are considered: tile-ops
     outside a Parallel belong to the regular tile-op lowering.

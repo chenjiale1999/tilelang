@@ -20,7 +20,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 namespace {
 
@@ -2880,6 +2880,6 @@ VectorProgram BuildPlan(const tirx::Stmt& stmt, std::optional<int64_t> lanes,
   return AssembleProgram(split, planned, single);
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

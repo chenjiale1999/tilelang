@@ -7,6 +7,7 @@ from tvm import tirx
 from tilelang.ascend import transform as at
 from tilelang.ascend import vsimd_ir as ir
 from tilelang.layout import Layout
+from testing.ascend.transform._vsimd_report_helpers import no_vf_kernel
 
 
 def _report(func):
@@ -430,13 +431,7 @@ def test_4d_recursive_lift():
 
 
 def test_no_vf_reports_empty():
-    @T.prim_func
-    def main(A: T.Tensor((16,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((16,), "float32")
-            T.copy(A, a_ub)
-
-    assert "no SIMD_VF" in _report(main)
+    assert "no SIMD_VF" in _report(no_vf_kernel())
 
 
 def test_region_matches_its_original_parallel_loop():

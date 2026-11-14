@@ -32,7 +32,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 using namespace tirx;
 using namespace tirx::transform;
@@ -271,6 +271,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   });
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

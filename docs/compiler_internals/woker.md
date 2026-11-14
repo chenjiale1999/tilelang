@@ -1,4 +1,9 @@
 # PR1
+
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
 ## Background and Goal
 
 **Goal**: users write scalar-parallel `T.Parallel` element-wise programs inside `T.SimdVF(lanes=L)`; the compiler vectorizes them into PTO VMI instructions, which PTOAS compiles to run correctly on Ascend 950. The full capability lands in tile-ai mainline over several PRs; each PR submission is a milestone. Control flow and reduce support are planned for PR-2 and PR-3, respectively.

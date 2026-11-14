@@ -1,5 +1,10 @@
 # P2/P3 对接新 P1（`tl.vsimd.program`）设计方案
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **⚠️ 已废弃（`p_123_parallel_new_p1` 分支）**：本设计针对的 `tl.vsimd.program`
 > 载体与 fragment 寄存器规划已**全部删除**；`src/ascend/transform/vsimd_program.{h,cc}`
 > 已不存在。现行方案是 P1 在每个顶层 `T.Parallel` 上挂
@@ -15,7 +20,7 @@
 | 编写目的 | 定义 P2/P3 如何消费 `vsimd-frag` 分支的新 P1 输出，并给出能力差距与待完善列表 |
 | P1 设计基线 | `vsimd-frag` 分支，尖端 `45bebb8b`；P1 实现提交 `c1133a7f`、`45bebb8b` |
 | P1 旧基线 | `stable-parallel` 尖端 `5b254ed7`（PR-E，只读分析库） |
-| P2/P3 基线 | `p2_p3_based_stable-parallel`（已合并 `stable-parallel`，P2/P3 C++ 位于 `src/ascend/transform/polyhedral/`） |
+| P2/P3 基线 | `p2_p3_based_stable-parallel`（已合并 `stable-parallel`，P2/P3 C++ 位于 `src/ascend/transform/parallel_vectorize/`） |
 | 关联文档 | `docs/compiler_internals/vsimd_p1_analysis.md`、`p2_p3_cpp_port_survey.md`、`p2_p3_design_implementation_report.md` |
 | 适用范围 | P2（规划）、P3（发射）、流水线接入、测试与迁移；不包含 P1 算法本身的修改 |
 
@@ -98,7 +103,7 @@ SBlock("SIMD_VF").annotations["tl.vsimd.program"] = Map<String, Any>
 ### 1.3 旧 P2/P3 的输入路径
 
 ```text
-AscendPolyhedralVectorize
+AscendParallelVectorize
   = LiftParallelToArray
       BuildP2PlanInputs(func)
         AnalyzeVSimdMemoryStatuses(func)     // per-VF
@@ -925,10 +930,10 @@ P3 只提交 group 0 的 item 0/2；group 1 的 item 1/3 原样保留，交 lega
 | `src/ascend/transform/vsimd_program.{h,cc}` | typed reader/verifier | 增加 `ReadVSimdRegion/Copy/Reduce`、`has_validation_error` |
 | `src/ascend/transform/vsimd_handoff.{h,cc}` | 新 handoff 层 | 展平、span 替换、fingerprint |
 | `src/ascend/transform/vsimd_group_plan.{h,cc}` | 新 group plan 对象 | FFI 反射 + P2/P3 共用 |
-| `src/ascend/transform/polyhedral/stage_passes.cc` | 旧 P2/P3 driver + 载体 | 改为读 annotation / group plan；删除旧 region 载体 |
-| `src/ascend/transform/polyhedral/vsimd_p2_input.cc` | 旧 P1→P2 交接 | 降级为离线/兼容 API |
-| `src/ascend/transform/polyhedral/plan.cc` | P2 规划 | 接入 assumptions/bindings；补 L1–L4 |
-| `src/ascend/transform/polyhedral/emit.cc` | P3 发射 | 支持 group 级发射；补 L2/L3 |
+| `src/ascend/transform/parallel_vectorize/stage_passes.cc` | 旧 P2/P3 driver + 载体 | 改为读 annotation / group plan；删除旧 region 载体 |
+| `src/ascend/transform/parallel_vectorize/vsimd_p2_input.cc` | 旧 P1→P2 交接 | 降级为离线/兼容 API |
+| `src/ascend/transform/parallel_vectorize/plan.cc` | P2 规划 | 接入 assumptions/bindings；补 L1–L4 |
+| `src/ascend/transform/parallel_vectorize/emit.cc` | P3 发射 | 支持 group 级发射；补 L2/L3 |
 | `tilelang/ascend/pipeline.py` | 流水线 | P1→P2→P3→legacy；P2/P3 开关 |
 | `tilelang/ascend/transform/__init__.py` | Python API | `AscendPlanVSimd` / `AscendEmitVSimd` / `AscendVectorizeVSimd` |
 

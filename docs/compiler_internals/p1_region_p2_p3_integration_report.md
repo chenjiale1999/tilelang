@@ -1,5 +1,10 @@
 # 新 P1（`tl.vsimd.region`）对接 P2/P3 代码变更与测试验证报告
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 ## 文档信息
 
 | 项目 | 内容 |
@@ -37,7 +42,6 @@
 | `src/ascend/transform/analyze_vsimd.cc` | 91 | 统一只读 debug 入口（3 个报告 + 合并 dump） |
 | `tilelang/ascend/vsimd_ir.py` | 119 | Python 类型绑定 + `region()` 构造器 |
 | `testing/ascend/transform/test_ascend_vsimd_ir.py` | 385 | schema/verifier/expander 测试（22） |
-| `testing/ascend/transform/test_ascend_vsimd_parallel_fa.py` | 55 | FA P1 回归测试（2） |
 
 ### 2.2 替换/重写
 
@@ -48,9 +52,9 @@
 | `src/ascend/transform/vsimd_capture_scope.{h,cc}` | +6 行 | 新增 `root_for` 指针身份；VF-local assume 注入 |
 | `src/ascend/transform/vsimd_memory_legality.{h,cc}` | +55 行 | 新增 per-nest `VSimdMemoryRegionStatus` + `root`；`AnalyzeVSimdMemory` |
 | `src/ascend/transform/vsimd_analysis_common.h` | +82 行 | `VFAssumeCollector`、sibling nest 检测、per-nest `MarkUnsupported`、`IsSupportedParallelTileOp` |
-| `src/ascend/transform/polyhedral/vsimd_group_passes.cc` | 873 → ~330 行 | 只处理带 `tl.vsimd.region` 的 `T.Parallel`；plan 写到同一 `For`；按 loop 替换/回滚；无 fragment、无 span |
-| `src/ascend/transform/polyhedral/vsimd_group_passes.h` | 文档重写 | 删除 VF fragment 表 / fragment group 描述 |
-| `src/ascend/transform/polyhedral/region_plan.{h,cc}` | 新增（替代 `group_plan.{h,cc}`） | `VSimdRegionPlan{version,vf_index,region_index,program}`，挂在 `For` 上 |
+| `src/ascend/transform/parallel_vectorize/vsimd_group_passes.cc` | 873 → ~330 行 | 只处理带 `tl.vsimd.region` 的 `T.Parallel`；plan 写到同一 `For`；按 loop 替换/回滚；无 fragment、无 span |
+| `src/ascend/transform/parallel_vectorize/vsimd_group_passes.h` | 文档重写 | 删除 VF fragment 表 / fragment group 描述 |
+| `src/ascend/transform/parallel_vectorize/region_plan.{h,cc}` | 新增（替代 `group_plan.{h,cc}`） | `VSimdRegionPlan{version,vf_index,region_index,program}`，挂在 `For` 上 |
 | `tilelang/ascend/transform/__init__.py` | 改写 debug 包装 | `AscendDumpVSimd*`；旧 `AscendAnalyzeSimdVFMemory/Capture/VSimdRegion` 删除 |
 | `tilelang/transform/pass_config.py` | +10 行 | `TL_ASCEND_SIMD_LIFT` 说明更新 + `TL_ASCEND_SIMD_REGION_VERIFY` |
 | `src/ascend/op/builtin.cc` | +1 行 | 注册 `tl.ascend_simd_region_verify` |
@@ -58,7 +62,7 @@
 | `testing/ascend/transform/test_ascend_vsimd_lift.py` | 516 行 | 17 个 P1 pass 测试（含 if/tile-op 放行与按 nest 拒绝） |
 | `testing/ascend/transform/test_ascend_vsimd_region.py` | 551 行 | 23 个 region 报告/oracle 测试（含 if/tile-op 往返） |
 | `testing/ascend/transform/test_ascend_vsimd_group_passes.py` | 498 行 | 13 个 P2/P3 对接测试（含 if/tile-op 端到端与按 nest 降级） |
-| `testing/ascend/transform/test_ascend_polyhedral_vectorize.py` | 删除 10 个 fragment 离线用例 + helper，新增 1 个守卫用例 | 适配 `tl.vsimd.region`；fragment 寄存器文件用例随 planner 逻辑一并删除，改为断言 `build_plan` 对 fragment nest 抛 `Unsupported` |
+| `testing/ascend/transform/test_ascend_parallel_vectorize_*.py` | 删除 10 个 fragment 离线用例 + helper，新增 1 个守卫用例 | 适配 `tl.vsimd.region`；fragment 寄存器文件用例随 planner 逻辑一并删除，改为断言 `build_plan` 对 fragment nest 抛 `Unsupported` |
 | `testing/ascend/transform/test_ascend_vsimd_capture_scope.py` / `..._memory_legality.py` | 各 1 行 | debug pass 改 `AscendDumpVSimd` |
 
 ### 2.3 删除文件
@@ -69,16 +73,16 @@
 | `src/ascend/transform/analyze_simdvf_memory.cc` | 同上 |
 | `src/ascend/transform/analyze_vsimd_region.cc` | 同上 |
 | `src/ascend/transform/vsimd_program.{h,cc}` | 旧 `tl.vsimd.program` schema reader/verifier，无调用者 |
-| `src/ascend/transform/polyhedral/vsimd_payload_read.{h,cc}` | 旧 item-map payload 解码；改为在 `vsimd_group_passes.cc` 直接解码 `Call` |
+| `src/ascend/transform/parallel_vectorize/vsimd_payload_read.{h,cc}` | 旧 item-map payload 解码；改为在 `vsimd_group_passes.cc` 直接解码 `Call` |
 | `src/ascend/transform/vsimd_fragment.{h,cc}` | fragment 事实收集/分组/VF 表；本分支不处理 `T.alloc_fragment` |
-| `src/ascend/transform/polyhedral/fragment_plan.{h,cc}` | VF 级 fragment 寄存器（V1–V4）校验；已无调用者 |
+| `src/ascend/transform/parallel_vectorize/fragment_plan.{h,cc}` | VF 级 fragment 寄存器（V1–V4）校验；已无调用者 |
 
 ### 2.4 保留复用
 
 | 文件 | 说明 |
 | --- | --- |
-| `src/ascend/transform/polyhedral/plan.cc` / `emit.cc` / `model.*` | 规划/发射核心的 fragment 寄存器文件逻辑已一并删除（`PlanOptions::vf_alloc_scope`、`FragmentRegisterFile`、`FragmentReg`/`FragmentRegisterMap`、`kRegLoad` recipe 等），只保留"fragment 操作数抛 `Unsupported`"的守卫 |
-| `examples/ascend/flash_attention/parallel_fa.py` | 保持基线版本，验证旧 FA 形态仍可全链路 lower |
+| `src/ascend/transform/parallel_vectorize/plan.cc` / `emit.cc` / `model.*` | 规划/发射核心的 fragment 寄存器文件逻辑已一并删除（`PlanOptions::vf_alloc_scope`、`FragmentRegisterFile`、`FragmentReg`/`FragmentRegisterMap`、`kRegLoad` recipe 等），只保留"fragment 操作数抛 `Unsupported`"的守卫 |
+| `examples/ascend/flash_attention/parallel_fa.py` | 已删除（FA 示例与对应离线/设备测试已随本分支裁剪移除） |
 
 ***
 
@@ -154,9 +158,8 @@ PY
 | `test_ascend_vsimd_region.py` | 23 passed（含 if/tile-op 结构 oracle 往返） |
 | `test_ascend_vsimd_capture_scope.py` | 15 passed |
 | `test_ascend_vsimd_memory_legality.py` | 23 passed |
-| `test_ascend_vsimd_parallel_fa.py` | 2 passed |
 | `test_ascend_vsimd_group_passes.py` | 18 passed（plan 挂载、metadata-only、顶层 tileop 不介入、if/copy/reduce、符号尾块、多 VF、降级、幂等） |
-| `test_ascend_polyhedral_vectorize.py` | 156 passed |
+| `test_ascend_parallel_vectorize_*.py` | 156 passed |
 
 ### 4.3 全链路 lower 验证
 
@@ -173,7 +176,7 @@ PY
 | Parallel 体内 `if`（异址双臂） | OK（回退） | 该 nest 的 item 被 P2 拒绝、原语句保留走标量；同 VF 的兄弟 Parallel 仍 `simd_inst::` |
 | Parallel 体内 `reduce`（P1 结构化建模） | OK | P2 经 `ExpandParallelTileOps` 规划，产物含 `tl.simd.vld`/`vmax`/`vsts` |
 | Parallel 体内 `if` 臂嵌 `T.copy` | OK（回退） | P1 LIFTED，P2 报 `nested parallel loop ... not affine-vectorizable` 并只拒绝该 item |
-| FA（parallel_fa.py） | **失败（设计变更后预期）** | VF 顶层 copy/reduce 不再由 P2 规划；后续 lower 分别报 `Generic vector BufferStore ... inside SimdVF`（copy）与 `Reduce ... not implemented`（reduce）；见 L8 |
+| FA（已移除） | — | 示例 `parallel_fa.py` 与对应测试已删除；VF 顶层 copy/reduce 的限制见 L8 |
 
 > Parallel 体内的 copy/reduce 目前只在 pass 级验证（`AscendLiftVSimd` →
   `AscendPlanVSimd` → `AscendEmitVSimd`）：`tilelang.lower` 的前端语义检查
@@ -246,19 +249,7 @@ raise SystemExit(pytest.main([
 ]))
 PY
 
-# 4) 全链路 lower（FA）
-TILELANG_CACHE_DIR=/tmp/tilelang_cache PYTHONPATH=$PWD python - <<'PY'
-import sys
-sys.meta_path = [f for f in sys.meta_path
-                 if "editable" not in type(f).__module__]
-sys.path.insert(0, "examples/ascend/flash_attention")
-import tilelang, tvm
-from parallel_fa import parallel_flash_attention_fwd
-with tvm.target.Target("ascend"), tilelang.transform.PassContext():
-    out = tilelang.lower(parallel_flash_attention_fwd())
-assert "simd_inst::" in out.kernel_source
-print("FA lower OK", len(out.kernel_source))
-PY
+# 4) 全链路 lower（FA 示例已删除，本节命令不再适用）
 ```
 
 ***

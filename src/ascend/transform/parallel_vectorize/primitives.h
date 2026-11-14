@@ -1,14 +1,14 @@
 /*!
  * \file primitives.h
- * \brief Polyhedral primitive fact tables, hardware constants and the single
+ * \brief ParallelVectorize primitive fact tables, hardware constants and the single
  *        rejection type used by P2 (plan) and P3 (emit).
  *
- * This is the C++ counterpart of ``tilelang/ascend/analysis/polyhedral/
+ * This is the C++ counterpart of ``tilelang/ascend/analysis/parallel_vectorize/
  * primitives.py``. Every table here is a fact about the SIMD ISA (recipe names,
  * reduction primitives, mask widths); P2/P3 must never invent a new one.
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PRIMITIVES_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PRIMITIVES_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PRIMITIVES_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PRIMITIVES_H_
 
 #include <tvm/ffi/any.h>
 #include <tvm/ffi/container/array.h>
@@ -25,10 +25,10 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*!
- * \brief The only rejection type of the polyhedral vectorizer.
+ * \brief The only rejection type of the parallel_vectorize vectorizer.
  *
  * Mirrors ``primitives.Unsupported``: ``message`` is the one-line summary that
  * tests match with ``pytest.raises(Unsupported, match=...)``, and
@@ -199,8 +199,8 @@ std::string PrintStmt(const tirx::Stmt& stmt);
 /*! \brief ForKind name used by diagnostics (``_for_kind_name``). */
 std::string ForKindName(tirx::ForKind kind);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_PRIMITIVES_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_PRIMITIVES_H_

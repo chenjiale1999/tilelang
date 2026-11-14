@@ -1,6 +1,6 @@
-"""FFI bindings and value types of the polyhedral P2/P3 implementation.
+"""FFI bindings and value types of the parallel_vectorize P2/P3 implementation.
 
-The C++ port (``src/ascend/transform/polyhedral``) registers its plan objects as
+The C++ port (``src/ascend/transform/parallel_vectorize``) registers its plan objects as
 TVM FFI objects whose reflected field names match the Python dataclasses, so
 tests (and the emit layer) read ``program.segments[0].stores[0].value.recipe``
 without any re-construction. Only two derived members need a Python-side helper:
@@ -17,7 +17,7 @@ free to change.
 
 The two value types below are the only Python-owned definitions: an enum and an
 exception cannot cross the FFI boundary as objects, so they mirror the C++
-``AccessClass`` strings and the ``polyhedral::Unsupported`` payload.
+``AccessClass`` strings and the ``parallel_vectorize::Unsupported`` payload.
 """
 
 from __future__ import annotations
@@ -82,37 +82,37 @@ class Unsupported(Exception):
 # ---------------------------------------------------------------------------
 
 
-@tvm_ffi.register_object("tl.polyhedral.Axis")
+@tvm_ffi.register_object("tl.parallel_vectorize.Axis")
 class Axis(Node):
     """One iteration axis (``0 <= var < extent``)."""
 
 
-@tvm_ffi.register_object("tl.polyhedral.AccessInfo")
+@tvm_ffi.register_object("tl.parallel_vectorize.AccessInfo")
 class AccessInfo(Node):
     """One buffer access plus its per-axis classification."""
 
     def axis_class(self, axis):
         """Return ``(AccessClass, stride)`` for ``axis`` (``stride`` may be None)."""
-        kind, stride = _ffi_api.AscendPolyhedralAxisClass(self, axis)
+        kind, stride = _ffi_api.AscendParallelVectorizeAxisClass(self, axis)
         return (AccessClass(kind), stride)
 
 
-@tvm_ffi.register_object("tl.polyhedral.StoreSpec")
+@tvm_ffi.register_object("tl.parallel_vectorize.StoreSpec")
 class StoreSpec(Node):
     """Where to write, what to write, and an optional predicate."""
 
 
-@tvm_ffi.register_object("tl.polyhedral.ValueNode")
+@tvm_ffi.register_object("tl.parallel_vectorize.ValueNode")
 class ValueNode(Node):
     """A value DAG node (instruction-selection agnostic recipe)."""
 
 
-@tvm_ffi.register_object("tl.polyhedral.ReduceInfo")
+@tvm_ffi.register_object("tl.parallel_vectorize.ReduceInfo")
 class ReduceInfo(Node):
     """Reduction description of one store."""
 
 
-@tvm_ffi.register_object("tl.polyhedral.StorePlan")
+@tvm_ffi.register_object("tl.parallel_vectorize.StorePlan")
 class StorePlan(Node):
     """Full plan of one write."""
 
@@ -123,12 +123,12 @@ class StorePlan(Node):
         return AccessClass(self.kind_value)
 
 
-@tvm_ffi.register_object("tl.polyhedral.VectorPlan")
+@tvm_ffi.register_object("tl.parallel_vectorize.VectorPlan")
 class VectorPlan(Node):
     """Segment-level plan (one body + optional pre/post siblings)."""
 
 
-@tvm_ffi.register_object("tl.polyhedral.VectorProgram")
+@tvm_ffi.register_object("tl.parallel_vectorize.VectorProgram")
 class VectorProgram(Node):
     """``build_plan`` result: 1..N segments."""
 
@@ -158,7 +158,7 @@ def build_plan(stmt, lanes=None, layouts=None):
     pair. P1 keeps such nests out of the vectorization path, so this only
     guards direct planner callers.
     """
-    result = _ffi_api.AscendPolyhedralBuildPlan(stmt, lanes, layouts)
+    result = _ffi_api.AscendParallelVectorizeBuildPlan(stmt, lanes, layouts)
     if not result["ok"]:
         _raise(result)
     return result["program"]
@@ -166,7 +166,7 @@ def build_plan(stmt, lanes=None, layouts=None):
 
 def emit_plan(plan):
     """C++ ``emit_plan``: plan -> ``T.simd.*`` TIR."""
-    result = _ffi_api.AscendPolyhedralEmitPlan(plan)
+    result = _ffi_api.AscendParallelVectorizeEmitPlan(plan)
     if not result["ok"]:
         _raise(result)
     return result["stmt"]
@@ -174,7 +174,7 @@ def emit_plan(plan):
 
 def render_plan(plan):
     """C++ ``render_plan``: plan -> human-readable text."""
-    result = _ffi_api.AscendPolyhedralRenderPlan(plan)
+    result = _ffi_api.AscendParallelVectorizeRenderPlan(plan)
     if not result["ok"]:
         _raise(result)
     return result["text"]
@@ -187,10 +187,10 @@ def finite_difference(offset, var, analyzer):
     creates a fresh :class:`arith.Analyzer` (identical for every caller that does
     not pre-bind variables; the parity harness covers this).
     """
-    return _ffi_api.AscendPolyhedralFiniteDifference(offset, var, analyzer is not None)
+    return _ffi_api.AscendParallelVectorizeFiniteDifference(offset, var, analyzer is not None)
 
 
 def classify_delta(delta, analyzer=None):
     """C++ ``classify_delta``: ``(AccessClass, stride_or_None)``."""
-    kind, stride = _ffi_api.AscendPolyhedralClassifyDelta(delta, analyzer is not None)
+    kind, stride = _ffi_api.AscendParallelVectorizeClassifyDelta(delta, analyzer is not None)
     return (AccessClass(kind), stride)

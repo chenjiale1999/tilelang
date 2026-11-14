@@ -12,7 +12,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 VSimdRegionPlan MakeVSimdRegionPlan(int64_t vf_index, int64_t region_index,
                                     VectorProgram program) {
@@ -36,7 +36,7 @@ using script::printer::LiteralDoc;
 
 /*
  * Without this printer the script printer treats the carrier as an opaque
- * object and prints ``metadata["tl.polyhedral.VSimdRegionPlan"][0]``, so a
+ * object and prints ``metadata["tl.parallel_vectorize.VSimdRegionPlan"][0]``, so a
  * rejected/accepted plan never shows up readably in an IR dump. Rendering it
  * as a plain dict is diagnostic only: P3 always consumes the typed object.
  */
@@ -107,6 +107,6 @@ TVM_STATIC_IR_FUNCTOR(IRDocsifier, vtable)
 
 TVM_FFI_STATIC_INIT_BLOCK() { VSimdRegionPlanNode::RegisterReflection(); }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

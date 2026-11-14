@@ -13,7 +13,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 const std::string& StoreRoleName(StoreRole role) {
   static const std::string kMain = "main";
@@ -178,6 +178,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   VectorProgramNode::RegisterReflection();
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

@@ -1,5 +1,10 @@
 # `T.Parallel` 降级（P1/P2/P3）全功能设备测试报告
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **测试对象**
 >
 > | 项 | 内容 |
@@ -13,7 +18,8 @@
 > | 构建 | 本地 `build/lib/libtilelang.so`（`PYTHONPATH=.`，全新 `TILELANG_CACHE_DIR`） |
 >
 > **更新（2026-11-12）**：本报告是第二轮上板结果。第一轮针对旧的
-> `test_tilelang_ascend_vsimd_numeric.py`（31 例）已完成，结论见
+> `test_tilelang_ascend_vsimd_numeric.py`（31 例，该文件后经去重删除、用例并入
+> `test_tilelang_ascend_simdvf_parallel*.py`）已完成，结论见
 > `p123_vs_pto_parallel_comparison.md` §8。本轮以覆盖更全的合并文件为准。
 
 ---
@@ -300,7 +306,7 @@ pass 之前就被 `Simplify` 折成 `a[i] <= 0.0`，生成 `vcmps_le`。
 
 | 优先级 | 改动 | 位置 | 影响用例 |
 | --- | --- | --- | --- |
-| P0 | `vsstb` 步长改为 `block << 16`（去掉低 16 位 `elem`） | `src/ascend/transform/polyhedral/emit.cc`（`EmitVectorWrite`、`EmitPackedNzStore`） | 3 |
+| P0 | `vsstb` 步长改为 `block << 16`（去掉低 16 位 `elem`） | `src/ascend/transform/parallel_vectorize/emit.cc`（`EmitVectorWrite`、`EmitPackedNzStore`） | 3 |
 | P1 | shell 包裹的向量体每次迭代末尾补 `mem_bar(VST_VLD)` | P3 发射 | 1 |
 | P2 | 混合段拆分后的归约壳按 chunk 分块 | P2 规划 / P3 发射 | 1 |
 | — | 同步修正 `p2_p3_design_implementation_report.md` §F.5.2 的 `(129<<16)\|1` | 文档 | — |
@@ -358,7 +364,7 @@ python -m pytest \
 
 | 项 | 第一轮 | 本轮 |
 | --- | --- | --- |
-| 文件 | `test_tilelang_ascend_vsimd_numeric.py`（31 例） | `test_tilelang_ascend_simdvf_parallel.py`（77 例，合并） |
+| 文件 | `test_tilelang_ascend_vsimd_numeric.py`（31 例，后去重删除） | `test_tilelang_ascend_simdvf_parallel.py`（77 例，合并） |
 | 结果 | 31 passed | 40 passed / 37 failed |
 | 串行 RMW | 判为 CANN `-O2` 限制（已改只读形态） | **推翻**：漏 `VST_VLD` 屏障，可修 |
 | max/min | 契约改为以 CANN 为基准 | 实现符合契约，测试 golden 未同步 |

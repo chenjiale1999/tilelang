@@ -2,7 +2,7 @@
  * \file access.h
  * \brief SCoP modelling: iteration axes, affine memory access classification.
  *
- * C++ counterpart of ``polyhedral/access.py``. The model is:
+ * C++ counterpart of ``parallel_vectorize/access.py``. The model is:
  *
  *   iteration domain  D = { 0 <= x_k < E_k }
  *   access function   off(x) = elem_offset + sum_d idx_d * stride_d
@@ -11,8 +11,8 @@
  * Everything downstream (contiguity / broadcast / stride / gather) is decided
  * by the shape of ``Delta_v`` — never by matching code shapes.
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_ACCESS_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_ACCESS_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_ACCESS_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_ACCESS_H_
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/any.h>
@@ -30,7 +30,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*! \brief Access shape along one axis (``AccessClass``). */
 enum class AccessClass {
@@ -90,7 +90,7 @@ class AxisNode : public ffi::Object {
   bool is_parallel{true};
 
   static constexpr const bool _type_mutable = false;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.Axis", AxisNode, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.Axis", AxisNode, ffi::Object);
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -137,7 +137,7 @@ class AccessInfoNode : public ffi::Object {
   std::map<int64_t, AxisClass> per_axis;
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.AccessInfo", AccessInfoNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.AccessInfo", AccessInfoNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -214,8 +214,8 @@ AccessInfo ClassifyAccess(const tirx::Buffer& buffer,
                           const std::vector<Axis>& axes, arith::Analyzer* analyzer,
                           bool is_store);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_ACCESS_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_ACCESS_H_

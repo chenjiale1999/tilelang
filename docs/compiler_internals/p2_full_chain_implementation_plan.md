@@ -1,12 +1,17 @@
 # P2 全链路实现方案（方案 A：复用 P1 展开 + Parallel 适配）
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > 目标：在**不修改** P1 分析/展开逻辑、**不修改** `build_plan` 算法的前提下，新增一个独立 C++ 函数，复用 P1 三个 Pass 的内部函数，构造 `Stmt` 并交给现有 `build_plan`，打通 `P1 → P2 → P3` 全链路。
 >
 > 依据代码：
 >
 > - P1：`/home/cjl/workspace/tilelang-stable/src/ascend/transform/vsimd_region.cc`
-> - P2：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/plan.py`（`build_plan`）
-> - P3：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/emit.py`（`emit_plan`）
+> - P2：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/parallel_vectorize/plan.py`（`build_plan`）
+> - P3：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/parallel_vectorize/emit.py`（`emit_plan`）
 > - 样例：`/home/cjl/workspace/p.log`、`testing/ascend/transform/test_ascend_vsimd_region.py`
 
 ***
@@ -207,8 +212,8 @@ BuildP2PlanInput(const tirx::PrimFunc &func, int vf_index, int nest_index);
 
 实现位置二选一（推荐新文件，保持 `vsimd_region.cc` 只负责 P1 报告）：
 
-- `src/ascend/transform/polyhedral/vsimd_p2_input.h`
-- `src/ascend/transform/polyhedral/vsimd_p2_input.cc`
+- `src/ascend/transform/parallel_vectorize/vsimd_p2_input.h`
+- `src/ascend/transform/parallel_vectorize/vsimd_p2_input.cc`
 
 CMake 已用 `file(GLOB src/ascend/transform/*.cc)`，新文件无需修改构建脚本。
 
@@ -395,8 +400,8 @@ except Unsupported as err:
 
 | 文件                                                       | 变更     | 说明                         |
 | -------------------------------------------------------- | ------ | -------------------------- |
-| `src/ascend/transform/polyhedral/vsimd_p2_input.h`                  | 新增     | `VSimdP2Input` + 两个 API 声明 |
-| `src/ascend/transform/polyhedral/vsimd_p2_input.cc`                 | 新增     | 实现、`AsParallelNest`、`RestoreBindings`、FFI 注册 |
+| `src/ascend/transform/parallel_vectorize/vsimd_p2_input.h`                  | 新增     | `VSimdP2Input` + 两个 API 声明 |
+| `src/ascend/transform/parallel_vectorize/vsimd_p2_input.cc`                 | 新增     | 实现、`AsParallelNest`、`RestoreBindings`、FFI 注册 |
 | `tilelang/ascend/transform/__init__.py`                  | 追加     | 两个 Python 薄封装 + `__all__`  |
 | `testing/ascend/transform/test_ascend_vsimd_p2_input.py` | 新增     | 全链路/边界/负向测试                |
 | 现有 P1/P2 文件                                              | **不改** | 保证复用与零回归                   |
@@ -658,8 +663,8 @@ pytest testing/ascend/transform/test_ascend_vsimd_p2_input.py -q
 - P1 参考展开（N-D 递归）：`vsimd_region.cc:219-249`
 - P1 `VSimdAccess`：`vsimd_region.h:37-42`
 - P1 `VSimdRegion`：`vsimd_region.h:53-75`
-- P2 `build_plan`：`tilelang/ascend/analysis/polyhedral/plan.py`
-- P3 `emit_plan`：`tilelang/ascend/analysis/polyhedral/emit.py`
+- P2 `build_plan`：`tilelang/ascend/analysis/parallel_vectorize/plan.py`
+- P3 `emit_plan`：`tilelang/ascend/analysis/parallel_vectorize/emit.py`
 - 测试样例：`testing/ascend/transform/test_ascend_vsimd_region.py`（1-D + 2-D）
 - 运行样例：`/home/cjl/workspace/p.log`（当前 2-D `[8,64]`）
 
@@ -671,8 +676,8 @@ pytest testing/ascend/transform/test_ascend_vsimd_p2_input.py -q
 
 | 文件 | 内容 |
 | --- | --- |
-| `src/ascend/transform/polyhedral/vsimd_p2_input.h` | `VSimdP2Input`；`BuildP2PlanInputs` / `BuildP2PlanInput` / `AsParallelNest` / `RestoreBindings` 声明 |
-| `src/ascend/transform/polyhedral/vsimd_p2_input.cc` | 实现 + `tl.transform.AscendBuildP2PlanInputs` / `AscendBuildP2PlanInput` FFI |
+| `src/ascend/transform/parallel_vectorize/vsimd_p2_input.h` | `VSimdP2Input`；`BuildP2PlanInputs` / `BuildP2PlanInput` / `AsParallelNest` / `RestoreBindings` 声明 |
+| `src/ascend/transform/parallel_vectorize/vsimd_p2_input.cc` | 实现 + `tl.transform.AscendBuildP2PlanInputs` / `AscendBuildP2PlanInput` FFI |
 | `tilelang/ascend/transform/__init__.py` | 两个 Python 薄封装 + `__all__` |
 | `testing/ascend/transform/test_ascend_vsimd_p2_input.py` | 33 个全链路/边界/负向/报告回归用例 |
 
@@ -710,7 +715,7 @@ python tmp/run_poly_test.py \
   testing/ascend/transform/test_ascend_vsimd_p2_input.py -q
 # 88 passed（P1 55 + 新增 33）
 
-python tmp/run_poly_test.py testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q
+python tmp/run_poly_test.py testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
 # 113 passed
 ```
 

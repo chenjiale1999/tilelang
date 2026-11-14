@@ -1,15 +1,20 @@
 # P2/P3 C++ 化改造分步执行计划
 
-> 目标：把 `tilelang/ascend/analysis/polyhedral/`（P2 规划 + P3 发射，共 4637 行 Python）逐模块移植为 C++，并以 PrimFuncPass 的形式无缝接入 Ascend 编译流水线，做到**行为零差异、测试零改写、性能显著优于现状**。
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
+> 目标：把 `tilelang/ascend/analysis/parallel_vectorize/`（P2 规划 + P3 发射，共 4637 行 Python）逐模块移植为 C++，并以 PrimFuncPass 的形式无缝接入 Ascend 编译流水线，做到**行为零差异、测试零改写、性能显著优于现状**。
 >
 > 依据代码：
 >
-> - P2：`tilelang/ascend/analysis/polyhedral/{access,body,value,model,plan}.py`
-> - P3：`tilelang/ascend/analysis/polyhedral/{emit,render}.py`
+> - P2：`tilelang/ascend/analysis/parallel_vectorize/{access,body,value,model,plan}.py`
+> - P3：`tilelang/ascend/analysis/parallel_vectorize/{emit,render}.py`
 > - P1（已是 C++，直接复用）：`src/ascend/transform/{vsimd_memory_legality,vsimd_capture_scope,vsimd_region}`
-> - P1→P2 适配：`src/ascend/transform/polyhedral/vsimd_p2_input.{h,cc}`
+> - P1→P2 适配：`src/ascend/transform/parallel_vectorize/vsimd_p2_input.{h,cc}`
 > - 流水线：`tilelang/ascend/pipeline.py:121`（`AscendSimdVFLowerParallel`）
-> - 测试：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py`（113）、`testing/ascend/transform/test_ascend_vsimd_p2_input.py`（33）、P1 三文件（55）
+> - 测试：`testing/ascend/transform/test_ascend_parallel_vectorize_*.py`（113）、`testing/ascend/transform/test_ascend_vsimd_p2_input.py`（33）、P1 三文件（55）
 
 ***
 
@@ -30,9 +35,9 @@ P2/P3 目前**不是 pass**，而是：
 
 | #      | 决策                                                                                                                                                     | 理由                                                                                                                |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| **D1** | P2/P3 落成 **C++ 库 + FFI 调试入口**，另加**一个** driver pass `AscendPolyhedralVectorize`                                                                         | plan 不是 IR；若拆成两个 pass 必须把 plan 塞进 IR（AttrStmt/annotation），引入序列化与失效风险。单 pass 与现有 `vectorize_parallel_nests` 语义一一对应 |
+| **D1** | P2/P3 落成 **C++ 库 + FFI 调试入口**，另加**一个** driver pass `AscendParallelVectorize`                                                                         | plan 不是 IR；若拆成两个 pass 必须把 plan 塞进 IR（AttrStmt/annotation），引入序列化与失效风险。单 pass 与现有 `vectorize_parallel_nests` 语义一一对应 |
 | **D2** | plan 对象（`VectorProgram/VectorPlan/StorePlan/ValueNode/AccessInfo/StoreSpec/Axis`）直接注册为 **TVM FFI Object**（`def_ro` 字段），不做 Map 序列化                      | P3 直接消费同一份 C++ 对象；Python 侧 `program.segments[0].stores[0].value.recipe` 等 40+ 处断言零改写；无往返拷贝                        |
-| **D3** | 拒绝统一为 C++ `polyhedral::Unsupported`（带 `message` + `diagnostics`），FFI 层转成 `Map{ok:false,message,diagnostics}`，Python wrapper 再 `raise Unsupported(...)` | 现有测试用 `pytest.raises(Unsupported, match=...)` 与 `err.diagnostics`，message 必须逐字兼容                                  |
+| **D3** | 拒绝统一为 C++ `parallel_vectorize::Unsupported`（带 `message` + `diagnostics`），FFI 层转成 `Map{ok:false,message,diagnostics}`，Python wrapper 再 `raise Unsupported(...)` | 现有测试用 `pytest.raises(Unsupported, match=...)` 与 `err.diagnostics`，message 必须逐字兼容                                  |
 | **D4** | 硬件常量表（`lanes/mask bits/MODE/recipe 表/归约表`）集中到 `primitives.h`，并提供 FFI 导出做表对拍                                                                            | 40 个拒绝点 + 大量特化都依赖这些表，表错=行为错                                                                                       |
 | **D5** | 与 legacy 并存，`PassContext` 开关 `tl.ascend.polyhedral.impl = legacy \| python \| cpp`，默认 `legacy`                                                         | 灰度与回滚需要三态；对拍需要同一 IR 跑三份实现                                                                                         |
 | **D6** | 数学三件套（`linear_element_offset / finite_difference / classify_delta`）也 C++ 化并FFI 导出                                                                      | 它们是 P2 的数学核心，Python 保留实现会形成双份真理                                                                                   |
@@ -112,7 +117,7 @@ P2/P3 目前**不是 pass**，而是：
 
 目标（阶段五之后）：
   P1 诊断（只读）/ 可选
-  AscendPolyhedralVectorize   ← 新增 C++ pass（plan + emit + 就地替换）
+  AscendParallelVectorize   ← 新增 C++ pass（plan + emit + 就地替换）
        ├─ 成功：把 Parallel 链换成 T.simd.*（与 legacy 产物同级）
        └─ 失败：原样保留，后续仍由 AscendSimdVFLowerParallel 兜底
   ↓ 其余 pass 不变
@@ -128,7 +133,7 @@ P2/P3 目前**不是 pass**，而是：
 
 | 测试集       | 数量     | 位置                                                            | 对 C++ 化的约束                                                                                                                                               |
 | --------- | ------ | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P2 单测     | 113    | `testing/ascend/transform/test_ascend_polyhedral_vectorize.py`        | 34 处 `.recipe`、13 处 `segments[...]`、8 处 `.spec./.access.`、85 处 `emit_plan`、4 处 `render_plan`、20 处 `pytest.raises(Unsupported, match=…)`、5 个数学核心单测（8 处调用） |
+| P2 单测     | 113    | `testing/ascend/transform/test_ascend_parallel_vectorize_*.py`        | 34 处 `.recipe`、13 处 `segments[...]`、8 处 `.spec./.access.`、85 处 `emit_plan`、4 处 `render_plan`、20 处 `pytest.raises(Unsupported, match=…)`、5 个数学核心单测（8 处调用） |
 | P1→P2 全链路 | 33     | `testing/ascend/transform/test_ascend_vsimd_p2_input.py`      | `render_plan` parity + `structural_equal(emit_plan)`                                                                                                     |
 | P1 回归     | 55     | `test_ascend_vsimd_{memory_legality,capture_scope,region}.py` | 报告文本零回归（P1 不改）                                                                                                                                           |
 | Ascend 全量 | 107 文件 | `testing/ascend/**`                                           | 阶段六回归范围                                                                                                                                                  |
@@ -181,7 +186,7 @@ P2/P3 目前**不是 pass**，而是：
 ### 2.1 目录与构建
 
 ```
-src/ascend/transform/polyhedral/
+src/ascend/transform/parallel_vectorize/
 ├── primitives.h              # recipe/归约/硬件常量表 + Unsupported
 ├── access.h / access.cc      # Axis / AccessClass / 线性化 / 有限差分
 ├── body.h   / body.cc        # StoreSpec / normalize_body
@@ -194,7 +199,7 @@ src/ascend/transform/polyhedral/
 ```
 
 **必须修改的一处构建脚本**：`src/ascend/CMakeLists.txt:101-109` 的 glob 不递归，需要新增
-`src/ascend/transform/polyhedral/*.cc`（P1 那次新增文件之所以免改，是因为在同一层目录）。
+`src/ascend/transform/parallel_vectorize/*.cc`（P1 那次新增文件之所以免改，是因为在同一层目录）。
 
 ### 2.2 规范对齐
 
@@ -203,8 +208,8 @@ src/ascend/transform/polyhedral/
 | 格式      | 仓库 `.clang-format`（pre-commit `clang-format v23.1.2`），提交前必须过                                                                                  |
 | 命名      | TVM 风格：类 `PascalCase`、函数 `PascalCase`（对外）/ `snake_case`（本地 helper 可随 Python 名）、成员 `field_`                                                    |
 | 导出      | 对外 API `TVM_DLL`；内部实现放匿名 namespace                                                                                                            |
-| 错误      | 拒绝用 `polyhedral::Unsupported`（异常），**不用** `LOG(FATAL)`；编译器内部不变量用 `TVM_FFI_ICHECK`                                                              |
-| pass 注册 | `CreatePrimFuncPass(pass_func, 0, "tl.AscendPolyhedralVectorize", {})` + `refl::GlobalDef().def("tl.transform.AscendPolyhedralVectorize", …)` |
+| 错误      | 拒绝用 `parallel_vectorize::Unsupported`（异常），**不用** `LOG(FATAL)`；编译器内部不变量用 `TVM_FFI_ICHECK`                                                              |
+| pass 注册 | `CreatePrimFuncPass(pass_func, 0, "tl.AscendParallelVectorize", {})` + `refl::GlobalDef().def("tl.transform.AscendParallelVectorize", …)` |
 | 内存      | 全部 `ffi::ObjectRef` / 值语义，禁止裸 `new`；容器传 `const &`                                                                                             |
 
 ### 2.3 基础适配件（先于业务逻辑落地）
@@ -212,12 +217,12 @@ src/ascend/transform/polyhedral/
 1. **FFI 错误桥**：`Unsupported` → `Map{"ok": false, "message": ..., "diagnostics": [...]}`；
 2. **Object 注册样板**：先注册 `Axis` + `VectorProgram` 两个最小对象，Python 侧验证 `@register_object` 字段可读；
 3. **dtype helper**：`_vec_dtype/_mask_bits/_elem_dtype` 移植 + FFI 导出做表对拍；
-4. **常量表 FFI 导出**：`AscendPolyhedralPrimitives()` 返回所有表，Python 与 `primitives.py` 全等比对。
+4. **常量表 FFI 导出**：`AscendParallelVectorizePrimitives()` 返回所有表，Python 与 `primitives.py` 全等比对。
 
 ### 2.4 退出条件（Gate 2）
 
 - `./build.sh` 通过、零新增告警；
-- `python -c "from tilelang.ascend import transform as at; at.AscendPolyhedralVectorize()"` 可用（空 pass 原样返回 IR）；
+- `python -c "from tilelang.ascend import transform as at; at.AscendParallelVectorize()"` 可用（空 pass 原样返回 IR）；
 - 常量表/ dtype helper 对拍 100% 相等；
 - 空 pass 接入 `pipeline.py` 后（默认关闭）全量测试与改动前一致。
 
@@ -292,7 +297,7 @@ src/ascend/transform/polyhedral/
 ### 5.1 新 pass 设计
 
 ```
-AscendPolyhedralVectorize(PrimFunc) -> PrimFunc
+AscendParallelVectorize(PrimFunc) -> PrimFunc
   for each SIMD_VF nest (P1 已产出 VSimdP2Input):
       if status != LIFTED:               continue           # legacy 接管
       try:  program = BuildPlan(stmt)                        # P2 (C++)
@@ -330,7 +335,7 @@ AscendPolyhedralVectorize(PrimFunc) -> PrimFunc
 | 层  | 内容                                     | 命令                                                                                      |
 | -- | -------------------------------------- | --------------------------------------------------------------------------------------- |
 | L0 | C++ 单测（ASAN/UBSAN）：数学核心、规范化、值 DAG、发射骨架 | `ctest -R polyhedral` 或等价                                                               |
-| L1 | P2 单测 113（`impl=cpp`）                  | `python tmp/run_poly_test.py testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q`   |
+| L1 | P2 单测 113（`impl=cpp`）                  | `python tmp/run_poly_test.py testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q`   |
 | L2 | 全链路 33（`impl=cpp`）                     | `python tmp/run_poly_test.py testing/ascend/transform/test_ascend_vsimd_p2_input.py -q` |
 | L3 | P1 回归 55                               | 同上三文件                                                                                   |
 | L4 | Ascend 全量 107 文件                       | `python tmp/run_poly_test.py testing/ascend -q`                                         |
@@ -406,7 +411,7 @@ L0–L4 全绿、A1–A10 全部满足、性能报告归档。
 ### 8.1 文档
 
 1. **设计文档** `docs/compiler_internals/p2_p3_cpp_design.md`：模块图、数据流、与 P1/legacy 的边界、关键决策（D1–D7）、已知差异；
-2. **接口文档**：C++ API（`BuildPlan/EmitPlan/RenderPlan/AsParallelNest/RestoreBindings`）、FFI 表（`tl.transform.AscendPolyhedral*`）、pass 选项（`tl.ascend.polyhedral.impl`）、错误码/diagnostics 约定；
+2. **接口文档**：C++ API（`BuildPlan/EmitPlan/RenderPlan/AsParallelNest/RestoreBindings`）、FFI 表（`tl.transform.AscendParallelVectorize*`）、pass 选项（`tl.ascend.polyhedral.impl`）、错误码/diagnostics 约定；
 3. **使用指南**：如何开开关、如何看 diagnostics、常见拒绝原因与改法（GM 需 staging、bool 需转 f32、stencil 需改写法…）；
 4. **迁移说明**：Python 实现进入 deprecated，删除时间点与替代入口。
 
@@ -462,9 +467,9 @@ P1(调研/契约/基线) ──► P2(工程基座) ──► P3(P2 实现) ─�
 
 **总交付物清单**
 
-1. `src/ascend/transform/polyhedral/**`（P2/P3/driver/FFI）；
+1. `src/ascend/transform/parallel_vectorize/**`（P2/P3/driver/FFI）；
 2. `src/ascend/CMakeLists.txt` 一行 glob 增补；
-3. `tilelang/ascend/analysis/polyhedral/__init__.py` 改为 FFI 薄封装（实现保留至灰度结束）；
+3. `tilelang/ascend/analysis/parallel_vectorize/__init__.py` 改为 FFI 薄封装（实现保留至灰度结束）；
 4. `tilelang/ascend/transform/__init__.py` 新 pass + FFI 封装；
 5. `tilelang/ascend/pipeline.py` 开关化接入；
 6. 文档四件套（调研 / 设计 / 接口 / 使用）+ `p2_unsupported_catalog.md`；
@@ -480,7 +485,7 @@ P1(调研/契约/基线) ──► P2(工程基座) ──► P3(P2 实现) ─�
 | 阶段 | 交付物                                                                                                        | 验收                                       |
 | -- | ---------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | 一  | `p2_p3_cpp_port_survey.md`、`p2_unsupported_catalog.md`（40 条）、`tmp/bench_p2_p3.py`                        | 基线复测 750.2 µs                            |
-| 二  | `src/ascend/transform/polyhedral/{primitives,access,body,value,model}.{h,cc}` + CMake glob + FFI 错误桥 + 常量表导出 | `-Wall -Wextra` 零新增告警（仅第三方头告警）            |
+| 二  | `src/ascend/transform/parallel_vectorize/{primitives,access,body,value,model}.{h,cc}` + CMake glob + FFI 错误桥 + 常量表导出 | `-Wall -Wextra` 零新增告警（仅第三方头告警）            |
 | 三  | `plan.{h,cc}`、`model.cc` 的累加器判据                                                                          | **113/113**（`impl=cpp`），`dual` 模式 `render_plan` 逐字一致 |
 | 四  | `render.{h,cc}`、`emit.{h,cc}`                                                                              | **113/113**（`dual`：Python/C++ 发射 `structural_equal` 一致） |
 | 五  | `ffi_polyhedral.cc`（driver pass + 8 个 FFI 入口）、`transform/__init__.py` 的 C++ pass、`pipeline.py` `legacy|cpp` 开关 | 同 kernel 下 `cpp` 与 Python 参考实现产物 `structural_equal` 一致；默认 `legacy` 不插入（灰度期临时 Python 孪生 pass 已在筛选阶段删除） |
@@ -489,7 +494,7 @@ P1(调研/契约/基线) ──► P2(工程基座) ──► P3(P2 实现) ─�
 
 | 层 | 命令 | 结果 |
 | -- | --- | --- |
-| L1（113） | `TL_ASCEND_POLYHEDRAL_IMPL=cpp python tmp/run_poly_test.py testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q` | 113 passed |
+| L1（113） | `TL_ASCEND_POLYHEDRAL_IMPL=cpp python tmp/run_poly_test.py testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q` | 113 passed |
 | L1 对拍 | 同上，`impl=dual`（Python vs C++ plan 文本 + 发射 IR） | 113 passed |
 | L2（33） | `TL_ASCEND_POLYHEDRAL_IMPL=cpp ... test_ascend_vsimd_p2_input.py` | 33 passed |
 | L3（55） | P1 三文件 | 23 + 15 + 17 = 55 passed |

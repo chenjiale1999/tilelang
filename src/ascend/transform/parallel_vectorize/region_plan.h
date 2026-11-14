@@ -7,15 +7,15 @@
  * loop node**:
  *
  *     For.annotations["tl.vsimd.region"] = tl.vsimd.Region    // P1
- *     For.annotations["tl.vsimd.plan"]   = tl.polyhedral.VSimdRegionPlan  // P2
+ *     For.annotations["tl.vsimd.plan"]   = tl.parallel_vectorize.VSimdRegionPlan  // P2
  *
  * Keeping the plan on the loop means P3 does not need spans, flattened body
  * indices or fingerprints: the annotation is the contract, and P3 replaces the
  * loop it is attached to. Loops P2 could not plan carry no plan annotation and
  * stay for the legacy lowering.
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_REGION_PLAN_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_REGION_PLAN_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_REGION_PLAN_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_REGION_PLAN_H_
 
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/string.h>
@@ -29,7 +29,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*! \brief Contract version of the ``tl.vsimd.plan`` payload. */
 inline constexpr int64_t kRegionPlanVersion = 1;
@@ -49,7 +49,7 @@ class VSimdRegionPlanNode : public ffi::Object {
   VectorProgram program;
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.VSimdRegionPlan",
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.VSimdRegionPlan",
                                     VSimdRegionPlanNode, ffi::Object);
 
   static void RegisterReflection() {
@@ -74,8 +74,8 @@ TVM_DLL VSimdRegionPlan MakeVSimdRegionPlan(int64_t vf_index,
                                             int64_t region_index,
                                             VectorProgram program);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_REGION_PLAN_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_REGION_PLAN_H_

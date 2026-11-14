@@ -1,6 +1,6 @@
 /*!
  * \file primitives.cc
- * \brief Polyhedral primitive fact tables and small shared helpers.
+ * \brief ParallelVectorize primitive fact tables and small shared helpers.
  */
 #include "primitives.h"
 
@@ -18,7 +18,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 namespace {
 
@@ -414,6 +414,6 @@ std::string ForKindName(tirx::ForKind kind) {
   return "serial";
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

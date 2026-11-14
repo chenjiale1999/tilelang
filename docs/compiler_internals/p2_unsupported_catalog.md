@@ -1,9 +1,14 @@
 # P2/P3 拒绝点目录（40 条，逐条对拍契约）
 
-> 来源：`tilelang/ascend/analysis/polyhedral/` 全部 `raise Unsupported`（实测 40 条）。
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
+> 来源：`tilelang/ascend/analysis/parallel_vectorize/` 全部 `raise Unsupported`（实测 40 条）。
 > 分布：`plan.py` 21 / `value.py` 9 / `body.py` 5 / `emit.py` 4 / `access.py` 1。
 > 口径：**message 逐字一致**（测试用 `pytest.raises(Unsupported, match=...)` 做前缀/正则匹配），
-> `diagnostics` **按列表顺序**比较。C++ 侧每条对应**有且仅有一条**分支，用 `polyhedral::Unsupported` 抛出。
+> `diagnostics` **按列表顺序**比较。C++ 侧每条对应**有且仅有一条**分支，用 `parallel_vectorize::Unsupported` 抛出。
 
 图例：`[触发期]` = build（P2）期 / emit（P3）期；`[死代码?]` = 需在阶段四确认是否可达。
 

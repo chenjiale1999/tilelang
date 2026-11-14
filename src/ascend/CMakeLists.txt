@@ -106,9 +106,9 @@ file(GLOB TILE_LANG_ASCEND_ACTIVE_SRCS
   src/ascend/runtime/*.cc
   src/ascend/transform/*.cc
   src/ascend/transform/auto_schedule/*.cc
-  # The polyhedral P2/P3 port lives one directory deeper; the globs above do not
+  # The parallel_vectorize P2/P3 port lives one directory deeper; the globs above do not
   # recurse, so this line has to be updated whenever the port gains a new file.
-  src/ascend/transform/polyhedral/*.cc
+  src/ascend/transform/parallel_vectorize/*.cc
 )
 list(REMOVE_ITEM TILE_LANG_ASCEND_ACTIVE_SRCS ${TILE_LANG_ASCEND_ALWAYS_SRCS})
 list(APPEND TILE_LANG_SRCS ${TILE_LANG_ASCEND_ACTIVE_SRCS})

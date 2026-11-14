@@ -2,7 +2,7 @@
  * \file body.h
  * \brief Body normalization: multi-statement / branches -> ordered stores.
  *
- * C++ counterpart of ``polyhedral/body.py``. The rules are operator-agnostic:
+ * C++ counterpart of ``parallel_vectorize/body.py``. The rules are operator-agnostic:
  *
  *  * ``SeqStmt``       -> flatten in order (§3);
  *  * ``BufferStore``   -> one store;
@@ -11,8 +11,8 @@
  *                         the same location;
  *  * everything else   -> explicit ``Unsupported`` (no silent downgrade).
  */
-#ifndef TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_BODY_H_
-#define TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_BODY_H_
+#ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_BODY_H_
+#define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_BODY_H_
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/any.h>
@@ -28,7 +28,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 /*! \brief Where to write, what to write, and an optional predicate. */
 class StoreSpecNode : public ffi::Object {
@@ -39,7 +39,7 @@ class StoreSpecNode : public ffi::Object {
   ffi::Optional<PrimExpr> mask;
 
   static constexpr const bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.polyhedral.StoreSpec", StoreSpecNode,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.StoreSpec", StoreSpecNode,
                                     ffi::Object);
 
   static void RegisterReflection() {
@@ -102,8 +102,8 @@ void NormalizeBodyInto(const tirx::Stmt& stmt, const AliasMap& aliases,
                        std::vector<StoreSpec>* out, ffi::Optional<PrimExpr> mask,
                        std::vector<ShellLoop>* shells = nullptr);
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
 
-#endif  // TVM_TL_ASCEND_TRANSFORM_POLYHEDRAL_BODY_H_
+#endif  // TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_BODY_H_

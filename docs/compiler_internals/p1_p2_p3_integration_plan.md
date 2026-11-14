@@ -1,5 +1,10 @@
 # Ascend `T.Parallel` 三阶段（P1→P2→P3）跨模块对接与 C++ 改造方案
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > 目标数据流（严格按 `Parallel_ascend.md` 顶层设计）：
 >
 > ```
@@ -15,7 +20,7 @@
 > TIR + tl.simd.*（真实 Ascend 向量指令）
 > ```
 >
-> 三个 Pass 由组合 Pass `AscendPolyhedralVectorize` 连续执行，是流水线里
+> 三个 Pass 由组合 Pass `AscendParallelVectorize` 连续执行，是流水线里
 > `T.Parallel` 的唯一降级路径；未被规划的 nest 原样保留（不再有第二个 emitter 兜底）。
 
 本文档覆盖现状差异、对接设计、C++ 迁移、测试验证与分阶段执行计划。
@@ -146,8 +151,8 @@
 
 ### 1.2 P2/P3 现状（Python 原型）
 
-来源：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/polyhedral/`（分支 `Parallel_lowering`）。
-设计文档：`tilelang/ascend/analysis/polyhedral_design.md`；场景目录：
+来源：`/home/cjl/workspace/tilelang/tilelang/ascend/analysis/parallel_vectorize/`（分支 `Parallel_lowering`）。
+设计文档：`tilelang/ascend/analysis/parallel_vectorize_design.md`；场景目录：
 `docs/compiler_internals/polyhedral_parallel_scenarios.md`。
 
 #### 1.2.1 模块与职责
@@ -408,7 +413,7 @@ tirx::Stmt EmitPlan(const VectorProgram &plan, const EmitContext &ctx);
   该 nest 原样保留。
 
 > 备选方案：若自定义 Object 节点成本过高，可先把 P2/P3 实现为同一个
-> `AscendPolyhedralVectorize` Pass 内的两个阶段（仍保留独立 FFI 查询入口）。
+> `AscendParallelVectorize` Pass 内的两个阶段（仍保留独立 FFI 查询入口）。
 > 该方案不改变 P2/P3 的职责边界，只放弃“两个独立 Pass 对象”。建议优先做正式的双 Pass 载体。
 
 ### 2.5 语义映射表
@@ -491,7 +496,7 @@ tirx::Stmt EmitPlan(const VectorProgram &plan, const EmitContext &ctx);
 
 ```python
 mod = ascend_transform.NormalizeBufferVersion()(mod)
-mod = ascend_transform.AscendPolyhedralVectorize()(mod)   # P1 -> P2 -> P3
+mod = ascend_transform.AscendParallelVectorize()(mod)   # P1 -> P2 -> P3
 mod = ascend_transform.AscendLowerTileOp()(mod)
 ```
 
@@ -505,7 +510,7 @@ mod = ascend_transform.AscendLowerTileOp()(mod)
 
 ### 3.4 与旧 emitter 的关系
 
-- `AscendPolyhedralVectorize` 取代 `AscendSimdVFLowerParallel`，后者不再接入流水线；
+- `AscendParallelVectorize` 取代 `AscendSimdVFLowerParallel`，后者不再接入流水线；
 - P3 不做整 VF 替换，只替换单 nest；同一 VF 内“可规划 + 不可规划”的混合是合法结果，
   不可规划的那个保持 `T.Parallel`（最终按串行循环发射）；
 - 需要回归用例：同一 VF 内“一个可规划 + 一个不可规划 nest”，验证混合 IR 不产生重复发射/漏发射。
@@ -592,13 +597,10 @@ pytest testing/ascend/transform/test_ascend_vsimd_memory_legality.py \
 # P2 原型 oracle（不得回归）
 python tmp/run_poly_test.py
 
-# 新增 P1/P2/P3 C++ 测试
-pytest testing/ascend/transform/test_ascend_polyhedral_p1.py \
-       testing/ascend/transform/test_ascend_polyhedral_plan.py \
-       testing/ascend/transform/test_ascend_polyhedral_emit.py -q
-
-# parity（逐场景）
-python testing/ascend/transform/run_polyhedral_parity.py --all
+# 新增 P1/P2/P3 离线测试（实际落地的文件；原计划的
+# test_ascend_polyhedral_{p1,plan,emit}.py 与 run_polyhedral_parity.py 未创建）
+pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
+pytest testing/ascend/transform/test_ascend_vsimd_group_passes.py -q
 ```
 
 ---
@@ -669,7 +671,7 @@ P2 代码不包含任何 `PrimFunc/IRModule/SIMD_VF` 依赖（CI grep）。
 
 | 任务 | 内容 | 交付物 | 验收标准 |
 | --- | --- | --- | --- |
-| T5.1 | Python 端到端脚本：`func → P1 info → P2 info → P3 stmt` | `testing/.../test_ascend_polyhedral_e2e.py` | 不经过 Pass 直接调 FFI 即可跑通；与 Pass 路径结果一致 |
+| T5.1 | Python 端到端脚本：`func → P1 info → P2 info → P3 stmt` | `testing/ascend/transform/test_ascend_parallel_vectorize_pipeline.py`（实际落地） | 不经过 Pass 直接调 FFI 即可跑通；与 Pass 路径结果一致 |
 | T5.2 | 基线场景全量 + 扩展批次 X1–X5 | 测试矩阵 | 基线全绿；扩展逐批全绿；X6 按需 |
 | T5.3 | 真实 kernel 编译（至少 3 个：elementwise / reduce / 多语句） | 编译日志 + IR 断言 | 无残留 `T.Parallel`；预期 `tl.simd.*` 序列；无编译错误 |
 | T5.4 | 回归 + 编译时间/IR 体积对比 | 报告 | P1 49 + P2 135 + parity 全绿；编译时间与 IR 体积无显著恶化 |
@@ -701,7 +703,7 @@ P2 代码不包含任何 `PrimFunc/IRModule/SIMD_VF` 依赖（CI grep）。
 | 性能回退 | 计划/发射与旧 emitter 不一致 | 记录 IR 体积/编译时间/指令数；先灰度后默认开启 |
 
 **回滚**：不再提供 PassContext 开关；需要回滚时在 `pipeline.py` 里移除
-`AscendPolyhedralVectorize` 的调用（P1/P2/P3 均为纯 IR 变换，仍可用独立 FFI 入口调用）。
+`AscendParallelVectorize` 的调用（P1/P2/P3 均为纯 IR 变换，仍可用独立 FFI 入口调用）。
 
 ---
 

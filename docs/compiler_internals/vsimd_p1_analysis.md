@@ -1,5 +1,10 @@
 # TileLang Ascend VSIMD（P1）分析链路技术解析（stable-parallel 新 P1 版）
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 ## 文档信息
 
 | 项目 | 内容 |
@@ -170,13 +175,12 @@ tilelang/ascend/pipeline.py
 | `testing/ascend/transform/test_ascend_vsimd_region.py` | 494 | 21 个 region 报告/oracle 测试 |
 | `testing/ascend/transform/test_ascend_vsimd_capture_scope.py` | 327 | 15 个 PR-B 测试 |
 | `testing/ascend/transform/test_ascend_vsimd_memory_legality.py` | 511 | 23 个 PR-A 测试 |
-| `testing/ascend/transform/test_ascend_vsimd_parallel_fa.py` | 55 | 2 个 FA 回归测试 |
 
 > 上表是 **stable-parallel @ 64feedf6 的上游原始值**。当前开发分支
 > `p_123_parallel_new_p1` 在对接 P2/P3 并移除 fragment 处理后的实际值：
 > `lift_vsimd.cc` 491、`vsimd_ir.h` 348、`vsimd_ir.cc` 847、`vsimd_region.cc` 771、
 > `tilelang/ascend/vsimd_ir.py` 117。测试用例数与上表一致
-> （lift 14 / ir 22 / region 21 / capture_scope 15 / memory_legality 23 / parallel_fa 2 = 97）。
+> （lift 14 / ir 22 / region 21 / capture_scope 15 / memory_legality 23 = 95）。
 
 ### 2.4 模块依赖方向
 
@@ -1292,11 +1296,11 @@ for entry in inventory:
 
 | 文件 | 动作 |
 | --- | --- |
-| `src/ascend/transform/polyhedral/vsimd_group_passes.cc` | 重写输入为 typed region；逐项规划；内嵌 body 驱动 COPY/REDUCE；移除 fragment 处理 |
-| `src/ascend/transform/polyhedral/vsimd_payload_read.{h,cc}` | 删除（解码逻辑已移入 `vsimd_group_passes.cc`） |
+| `src/ascend/transform/parallel_vectorize/vsimd_group_passes.cc` | 重写输入为 typed region；逐项规划；内嵌 body 驱动 COPY/REDUCE；移除 fragment 处理 |
+| `src/ascend/transform/parallel_vectorize/vsimd_payload_read.{h,cc}` | 删除（解码逻辑已移入 `vsimd_group_passes.cc`） |
 | `src/ascend/transform/vsimd_program.{h,cc}` | 删除（旧 schema） |
 | `src/ascend/transform/vsimd_fragment.{h,cc}` | 删除（本分支不处理 fragment） |
-| `src/ascend/transform/polyhedral/fragment_plan.{h,cc}` | 删除（VF 级 fragment 寄存器校验已移除） |
+| `src/ascend/transform/parallel_vectorize/fragment_plan.{h,cc}` | 删除（VF 级 fragment 寄存器校验已移除） |
 | `src/ascend/transform/vsimd_handoff.{h,cc}` | 删除（按节点替换后无用户） |
 | `src/ascend/transform/vsimd_region.{h,cc}` | 用新 P1 版本替换；P2 不再 include 旧结构 |
 | `src/ascend/transform/lift_vsimd.cc` | 用新 P1 版本替换（无 fragment 收集/分组） |
@@ -1336,7 +1340,7 @@ for entry in inventory:
 | `test_ascend_vsimd_region.py` | 旧私有 region 报告 | 用新报告/DumpRegion 断言 |
 | `test_ascend_vsimd_capture_scope.py` | `AscendAnalyzeSimdVFCapture` | 改 `AscendDumpVSimd` |
 | `test_ascend_vsimd_memory_legality.py` | `AscendAnalyzeSimdVFMemory` | 改 `AscendDumpVSimd` |
-| `test_ascend_polyhedral_vectorize.py` | offline `build_plan/emit_plan` | 不依赖 P1，保持 |
+| `test_ascend_parallel_vectorize_*.py` | offline `build_plan/emit_plan` | 不依赖 P1，保持 |
 
 ### 8.5 风险与待确认项
 
@@ -1380,8 +1384,7 @@ legacy
 | `test_ascend_vsimd_region.py` | 21 | region 报告、N-D/广播/转置/view/layout/动态 shape、oracle、合并 dump |
 | `test_ascend_vsimd_capture_scope.py` | 15 | PR-B 状态、捕获分类、错误、只读性 |
 | `test_ascend_vsimd_memory_legality.py` | 23 | PR-A 状态、快速通道/Z3、别名、去重、只读性 |
-| `test_ascend_vsimd_parallel_fa.py` | 2 | FA NZ layout 回归 |
-| **合计** | **97** | |
+| **合计** | **95** | |
 
 P2/P3 对接测试（本分支新增/重写）：`test_ascend_vsimd_group_passes.py` 10 个，覆盖 region 规划/发射、partial lift、按 Parallel 粒度的 fragment 回退、stale span、COPY/REDUCE 与 pipeline/config。
 
@@ -1496,7 +1499,6 @@ for (const auto &entry : for_node->annotations) {
 | `testing/ascend/transform/test_ascend_vsimd_region.py` | 494 |
 | `testing/ascend/transform/test_ascend_vsimd_capture_scope.py` | 327 |
 | `testing/ascend/transform/test_ascend_vsimd_memory_legality.py` | 511 |
-| `testing/ascend/transform/test_ascend_vsimd_parallel_fa.py` | 55 |
 
 ## 附录 B：可复现核查命令
 

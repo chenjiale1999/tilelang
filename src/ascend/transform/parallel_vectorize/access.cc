@@ -17,7 +17,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 namespace {
 
@@ -272,6 +272,6 @@ AccessInfo ClassifyAccess(const tirx::Buffer& buffer,
   return info;
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm

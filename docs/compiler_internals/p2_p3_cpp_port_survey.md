@@ -1,11 +1,16 @@
 # Ascend `T.Parallel` 三阶段（P1→P2→P3）实现调研
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **对齐对象（唯一事实来源）**
 >
-> - 实现：`src/ascend/transform/polyhedral/`（21 个文件，8332 行）
-> - 测试：`testing/ascend/transform/test_ascend_polyhedral_vectorize.py`（160 个 `def test_`，165 个 collected case）
+> - 实现：`src/ascend/transform/parallel_vectorize/`（21 个文件，8332 行）
+> - 测试：`testing/ascend/transform/test_ascend_parallel_vectorize_*.py`（160 个 `def test_`，165 个 collected case）
 > - 流水线接入：`tilelang/ascend/pipeline.py:120-126`
-> - Python 门面：`tilelang/ascend/analysis/polyhedral/{__init__,_cpp,_contract}.py`
+> - Python 门面：`tilelang/ascend/analysis/parallel_vectorize/{__init__,_cpp,_contract}.py`
 >
 > 本文替换旧版「Python 原型 + C++ 迁移目标」调研。旧版中所有关于「P2/P3 仍是 Python」「默认流水线未接入」
 > 「`impl` 开关」「113 用例」「性能基线 750 µs / 门槛 150 µs」的表述均已失效，见第 10 节逐条对照。
@@ -17,7 +22,7 @@
 ## 0. 结论速览
 
 1. **P1/P2/P3 已全部是 C++**，且是流水线里 `T.Parallel` 的**唯一**降级路径
-   （`pipeline.py:124` 无条件运行 `AscendPolyhedralVectorize`；legacy `AscendSimdVFLowerParallel`
+   （`pipeline.py:124` 无条件运行 `AscendParallelVectorize`；legacy `AscendSimdVFLowerParallel`
    在 `pipeline.py:125` 已被注释，**没有第二个 emitter 兜底**）。
 2. 三阶段通过两个 `AttrStmt` 载体交接：`tl.vsimd.array_region`（P1→P2，载荷是 `VSimdRegion`）
    与 `tl.vsimd.array_plan`（P2→P3，载荷是 `VectorProgram`），见 `stage_passes.h:36-39`。
@@ -46,7 +51,7 @@
 | `stage_passes.cc` | 290 | 三阶段 driver + region 载体 FFI 包装 + 组合 pass | `LiftParallelToArray`、`PlanArray`、`LowerArrayPlan`、`VectorizeParallelNests`、`VSimdRegionRefNode` |
 | `model.h` | 247 | 计划数据结构（FFI 反射对象） | `StorePlan`、`ReduceInfo`、`VectorPlan`、`VectorProgram`、`AccumulatorCandidate` |
 | `access.cc` | 249 | SCoP 建模：线性化、有限差分、访存分类 | `ClassifyAccess`、`FiniteDifference`、`ClassifyDelta`、`IndexVectorReason` |
-| `ffi_polyhedral.cc` | 228 | FFI 入口 + pass 工厂 + 离线 driver | `AscendPolyhedralBuildPlan/EmitPlan/RenderPlan/VectorizeNests`、`MakeStagePass` |
+| `ffi_polyhedral.cc` | 228 | FFI 入口 + pass 工厂 + 离线 driver | `AscendParallelVectorizeBuildPlan/EmitPlan/RenderPlan/VectorizeNests`、`MakeStagePass` |
 | `vsimd_p2_input.cc` | 220 | P1→P2 交接：region→并行 For 链、Bind 内联、离线报告 | `BuildP2PlanInputs`、`AsParallelNest`、`RegionToPlanInput`、`RestoreBindings` |
 | `primitives.h` | 210 | 上述事实表的声明 + 常量 | `Unsupported`、`kPredicateMaskBits`、`kReduceUnrollLimit`、`kGuardCutLimit` |
 | `access.h` | 198 | `Axis` / `AccessInfo` / `AccessClass` 与分类接口 | `AccessClass`（7 值） |
@@ -69,7 +74,7 @@
 
 | 项 | 数值 | 佐证 |
 | --- | ---: | --- |
-| `def test_` 函数 | 160 | `grep -c "^def test_" test_ascend_polyhedral_vectorize.py` |
+| `def test_` 函数 | 160 | `grep -c "^def test_" test_ascend_parallel_vectorize_*.py` |
 | parametrize 展开后的用例 | 165（3 个 parametrize：4 + 2 + 2） | 文件内 `@pytest.mark.parametrize` 3 处 |
 | 文件行数 | 4481 | `wc -l` |
 | P1→P2 交付契约用例 | 第 3788 行起「P1 -> P2 交付契约」整段 | `test_p1_lift_contract_1d` 等 |
@@ -166,8 +171,8 @@ flowchart TD
 | P1 | `LiftParallelToArray` / `AscendLiftParallelToArray`（`transform/__init__.py:193`） | `tirx::PrimFunc` | 同一 `PrimFunc`，仅新增 `tl.vsimd.array_region` 载体；nest **不改写** | `vsimd_memory_legality.cc`（PR-A）、`vsimd_capture_scope.cc`（PR-B）、`vsimd_region.cc`（PR-C/D） | P2 | 不抛 `Unsupported`；非 LIFTED 不标载体；已存在任一载体时整体跳过（幂等） |
 | P2 | `PlanArray` / `AscendPlanArray`（`transform/__init__.py:204`） | 含 `array_region` 载体的 `PrimFunc` | `array_plan` 载体（node 为 `VectorProgram`），body 仍是原 nest | `BuildPlan`（`plan.cc:1910`）、`RegionToPlanInput`（`vsimd_p2_input.cc:113`） | P3 | `Unsupported` → 解开载体、保留 nest；region 展开失败 → `LOG(WARNING)` + 保留 nest |
 | P3 | `LowerArrayPlan` / `AscendLowerArrayPlan`（`transform/__init__.py:214`） | 含 `array_plan` 载体的 `PrimFunc` | 纯 `T.simd.*` TIR（无 `T.Parallel`） | `EmitPlan`（`emit.cc:2323`） | 下游 pass | `Unsupported` → `LOG(WARNING)` + 保留 nest；残留 `array_region` 载体被解开 |
-| 组合 | `VectorizeParallelNests` / `AscendPolyhedralVectorize`（`transform/__init__.py:219`） | `PrimFunc` | `PrimFunc` | P1→P2→P3 | `pipeline.py:124` | 同上；`P1→P2→P3` 顺序执行（`stage_passes.cc:280-284`） |
-| 离线 | `AscendPolyhedralVectorizeNests`（`ffi_polyhedral.cc:161`） | `tirx::Stmt` + `lanes` + `layouts` | `Stmt` | `NestVectorizer`（pre-order，`ffi_polyhedral.cc:115-135`） | 测试 `vectorize_parallel_nests` | 内层 `Unsupported` 被吞，保留原 nest；只把最外层 `Unsupported` 转成 Map 错误 |
+| 组合 | `VectorizeParallelNests` / `AscendParallelVectorize`（`transform/__init__.py:219`） | `PrimFunc` | `PrimFunc` | P1→P2→P3 | `pipeline.py:124` | 同上；`P1→P2→P3` 顺序执行（`stage_passes.cc:280-284`） |
+| 离线 | `AscendParallelVectorizeNests`（`ffi_polyhedral.cc:161`） | `tirx::Stmt` + `lanes` + `layouts` | `Stmt` | `NestVectorizer`（pre-order，`ffi_polyhedral.cc:115-135`） | 测试 `vectorize_parallel_nests` | 内层 `Unsupported` 被吞，保留原 nest；只把最外层 `Unsupported` 转成 Map 错误 |
 
 ### 3.3 载体协议
 
@@ -191,7 +196,7 @@ flowchart TD
   - 每 nest 一条记录，`status` 取值：`LIFTED` / `FALLBACK` / `INTERNAL_ERROR` / `OPAQUE`（`vsimd_p2_input.h:46`）。
 - **幂等**：`MarkerFinder` 发现任何 `array_region` / `array_plan` 载体即整体返回（`stage_passes.cc:255-258`），
   不叠加载体（测试 `test_passes_are_idempotent`，4407）。
-- **异常**：该阶段不抛 `polyhedral::Unsupported`；region 展开失败只 `LOG(WARNING)`（`vsimd_p2_input.cc:188-193`）。
+- **异常**：该阶段不抛 `parallel_vectorize::Unsupported`；region 展开失败只 `LOG(WARNING)`（`vsimd_p2_input.cc:188-193`）。
 
 ### 4.2 流程图
 
@@ -387,7 +392,7 @@ flowchart TD
 
 ### 5.7 异常处理
 
-- P2 内部**只用** `polyhedral::Unsupported`（`primitives.h:38-51`）表达拒绝，禁止 `LOG(FATAL)`。
+- P2 内部**只用** `parallel_vectorize::Unsupported`（`primitives.h:38-51`）表达拒绝，禁止 `LOG(FATAL)`。
 - `PlanMarkerReplacer` 只捕获 `Unsupported`（`stage_passes.cc:207-209`）；`TVM_FFI_ICHECK`
   类断言（如 `MakeVectorPlan` 的 `ffi::make_object` 失败）会直接崩溃，不属于可恢复路径。
 - FFI 入口统一把 `Unsupported` 转成 `{ok:false, message, diagnostics}`（`ffi_polyhedral.cc:38-58`），
@@ -802,12 +807,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A["tilelang/ascend/pipeline.py:124<br/>ascend_transform.AscendPolyhedralVectorize()(mod)"] --> B["transform/__init__.py:219<br/>_ffi_api.AscendPolyhedralVectorize()"]
-  B --> C["ffi_polyhedral.cc:198-200<br/>MakeStagePass('tl.AscendPolyhedralVectorize', VectorizeParallelNests)"]
+  A["tilelang/ascend/pipeline.py:124<br/>ascend_transform.AscendParallelVectorize()(mod)"] --> B["transform/__init__.py:219<br/>_ffi_api.AscendParallelVectorize()"]
+  B --> C["ffi_polyhedral.cc:198-200<br/>MakeStagePass('tl.AscendParallelVectorize', VectorizeParallelNests)"]
   C --> D["stage_passes.cc:280-284<br/>LiftParallelToArray → PlanArray → LowerArrayPlan"]
   E["测试直接调用<br/>AscendLiftParallelToArray / AscendPlanArray / AscendLowerArrayPlan"] --> F["transform/__init__.py:193/204/214"]
   F --> G["ffi_polyhedral.cc:183-195<br/>MakeStagePass"]
-  H["analysis/polyhedral/_cpp.py<br/>build_plan / emit_plan / render_plan / vectorize_parallel_nests"] --> I["ffi_polyhedral.cc:143-168<br/>Guarded(...) → Map 错误协议"]
+  H["analysis/parallel_vectorize/_cpp.py<br/>build_plan / emit_plan / render_plan / vectorize_parallel_nests"] --> I["ffi_polyhedral.cc:143-168<br/>Guarded(...) → Map 错误协议"]
   I -.->|"Unsupported"| J["_cpp.py:_raise → Unsupported(message, diagnostics)"]
 ```
 
@@ -835,7 +840,6 @@ flowchart TD
 | 阶段一：混合宽度 | `test_mixed_width_segment_uses_min_lane_width`（3250）、`test_mixed_width_segment_emits_packed_store_with_part_even`（3272） | `SelectSegmentLanes`、`vcvt(PART_EVEN)`、`PK_B32` |
 | 阶段二：NZ 目标 | `test_compact_nz_store_is_classified_with_layout_block_stride`（3463）、`test_compact_nz_store_emits_vsstb_with_block_stride`（3476）、`test_nd_destination_keeps_the_contiguous_store`（3511） | `ClassifyStoreLayout`、`vsstb`、ND 零差异护栏 |
 | 阶段 2b：pack2 | `test_half_register_nz_store_is_paired_into_a_full_register`（3554）、`test_paired_store_loops_over_chunk_pairs`（3616）、`test_paired_store_must_be_the_last_store`（3662） | `ValidatePackedNzSegment`、`PairDomain`、`EmitPackedNzStore` |
-| FA 闭环 | `test_parallel_fa_vectorizes_the_softmax_nest`（3753） | P1→P2→P3 整段替换、NZ 块步长 129 |
 | P1→P2 交付 | `test_p1_lift_contract_1d`（4070）、`test_p1_stmt_plans_like_the_original_nest`（4124）、`test_p1_tail_bind_is_inlined_known_boundary`（4195）、`test_p1_gm_operand_branch_b`（4336） | `BuildP2PlanInputs`、`RestoreBindings`、Branch B |
 | 三段 pass | `test_staged_passes_exchange_carriers`（4383）、`test_passes_are_idempotent`（4407）、`test_rejected_nests_fall_through_every_stage`（4417） | 载体交接、幂等、被拒 nest 逐字节不变 |
 | 流水线 | `test_pipeline_vectorizes_by_default`（4469） | `pipeline.py:124` 无条件运行、设备源码含 `simd_inst::` |
@@ -854,7 +858,7 @@ flowchart TD
 | 实现行数 | 7098（85.2%） |
 | Top-3 文件 | `emit.cc` 2340 + `plan.cc` 1967 + `value.cc` 861 = **5168（62.0%）** |
 | 单文件 > 800 行 | 3 个（占 62%） |
-| `polyhedral::` 自由函数（`.cc` 匿名命名空间内） | `plan.cc` 约 40 个、`emit.cc` 约 35 个 |
+| `parallel_vectorize::` 自由函数（`.cc` 匿名命名空间内） | `plan.cc` 约 40 个、`emit.cc` 约 35 个 |
 
 结论：维护成本几乎全部落在 `emit.cc` / `plan.cc`。评审时这两个文件无法在一屏内建立上下文，
 且所有 emitter 状态（memo / predicates / ramps / forward / promoted / carry / pair）都压在
@@ -915,7 +919,7 @@ flowchart TD
 
 > 说明：L1/L2/L3/L4 是本次调研新定位的真实缺陷；L5-L13 为健壮性/可维护性问题。
 > 因为本环境加载的是另一棵工作树的 `tilelang`（`/home/cjl/workspace/tilelang-mlir-ascend`，
-> 不含 `src/ascend/transform/polyhedral`），本次**未执行**测试套件；上述结论均来自静态代码路径，
+> 不含 `src/ascend/transform/parallel_vectorize`），本次**未执行**测试套件；上述结论均来自静态代码路径，
 > 建议在能编译当前树的机器上先补 L1-L4 的回归用例再修改。
 
 ### 9.5 冗余实现清单
@@ -1025,8 +1029,8 @@ flowchart TD
 
 | 旧描述 | 当前事实 | 佐证 |
 | --- | --- | --- |
-| P2/P3 是 Python 原型，C++ 是「目标」 | P2/P3 已全部 C++；Python 只剩 FFI 门面 | `src/ascend/transform/polyhedral/*`、`analysis/polyhedral/_cpp.py` |
-| 默认流水线未接入，`T.Parallel` 仍由 `AscendSimdVFLowerParallel` 降级 | `AscendPolyhedralVectorize` 已无条件运行在 `NormalizeBufferVersion` 之后 | `pipeline.py:120-124` |
+| P2/P3 是 Python 原型，C++ 是「目标」 | P2/P3 已全部 C++；Python 只剩 FFI 门面 | `src/ascend/transform/parallel_vectorize/*`、`analysis/parallel_vectorize/_cpp.py` |
+| 默认流水线未接入，`T.Parallel` 仍由 `AscendSimdVFLowerParallel` 降级 | `AscendParallelVectorize` 已无条件运行在 `NormalizeBufferVersion` 之后 | `pipeline.py:120-124` |
 | 存在 `impl = "cpp"` / Python 双实现开关 | 无开关；`polyhedral_reference` 不被导入，且测试运行时断言 | `_cpp.py`、`test_cpp_implementation_is_the_only_one_loaded`（327） |
 | `AscendSimdVFLowerParallel` 作为兜底 | 已注释；被拒 nest 保持 `T.Parallel`，无第二 emitter | `pipeline.py:125` |
 | 113 个 P2 用例、33 个全链路用例、55 个 P1 用例 | 本文件 160 个 test 函数 / 165 collected；P1 交付与三段 pass 用例已并入 | 第 1.2 节 |
@@ -1034,7 +1038,7 @@ flowchart TD
 | 性能基线 750.2 µs / 门槛 150 µs | 未复测，旧数字作废；本文不给出性能结论 | — |
 | 字段契约「40+ 处访问」 | 字段名/类型仍是硬契约，但规模已随用例增长；`kind` 由 `kind_value` + Python 属性提供 | `model.h:84-89`、`_cpp.py:65-69` |
 | `chunks/tail` 为 `Optional<IntImm>` | 实际为 `ffi::Optional<int64_t>`（Python 侧 `int` 或 `None`） | `model.h:143-144` |
-| `AccessInfo.axis_class` 是反射方法 | 反射不包含 `per_axis`；方法由 Python 门面转发到 FFI `AscendPolyhedralAxisClass` | `access.h:113-114`、`_cpp.py:40-43` |
+| `AccessInfo.axis_class` 是反射方法 | 反射不包含 `per_axis`；方法由 Python 门面转发到 FFI `AscendParallelVectorizeAxisClass` | `access.h:113-114`、`_cpp.py:40-43` |
 
 ---
 
@@ -1042,22 +1046,22 @@ flowchart TD
 
 ```bash
 # P2/P3 场景 + P1 交付 + 三段 pass + 流水线接入（160 个 test）
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q
 
 # 打印每个用例的 plan 渲染与发射 IR
 TL_POLYHEDRAL_DUMP_IR=1 python -m pytest \
-  testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -s
+  testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -s
 
 # P1 侧回归（不受本次改动影响）
 python -m pytest testing/ascend/transform/test_ascend_vsimd_{capture_scope,memory_legality,region}.py -q
 
 # 只跑 P1→P2 交付契约
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -k "p1_"
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -k "p1_"
 
 # 只跑 NZ / pack2
-python -m pytest testing/ascend/transform/test_ascend_polyhedral_vectorize.py -q -k "nz or paired"
+python -m pytest testing/ascend/transform/test_ascend_parallel_vectorize_*.py -q -k "nz or paired"
 ```
 
 > 注意：本仓库的 Python 入口会按 `tilelang` dev root 解析库路径；若加载到不含
-> `src/ascend/transform/polyhedral` 的其他工作树，`AscendPolyhedralBuildPlan` 等 FFI 符号会缺失。
+> `src/ascend/transform/parallel_vectorize` 的其他工作树，`AscendParallelVectorizeBuildPlan` 等 FFI 符号会缺失。
 > 跑测试前先确认 `import tilelang; print(tilelang.__file__)` 指向当前树。

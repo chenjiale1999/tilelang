@@ -1,5 +1,10 @@
 # Ascend SimdVF `alloc_fragment` → 单寄存器数组降级设计（v2）
 
+> **历史文档**：本文记录写作时的实现/设计状态。后续改动已删除或重命名部分
+> 文件、测试与行号；当前实现见 `src/ascend/transform/parallel_vectorize/` 与
+> `src/ascend/transform/vsimd_*`，以代码为准。
+
+
 > **⚠️ 已废弃（`p_123_parallel_new_p1` 分支）**：本设计针对的"一个 fragment 拆成
 > k 个独立寄存器 buffer"的 fragment 寄存器文件实现已**全部删除**（`vsimd_fragment.{h,cc}`、
 > `polyhedral/fragment_plan.{h,cc}`、`FragmentRegisterFile`、`FragmentReg` 等），其前置
@@ -20,10 +25,10 @@
 >
 > **相关既有机制**：
 >
-> - P2/P3 fragment register mode：`src/ascend/transform/polyhedral/{plan,emit}.cc`
+> - P2/P3 fragment register mode：`src/ascend/transform/parallel_vectorize/{plan,emit}.cc`
 > - P1 访问分类：`src/ascend/transform/vsimd_analysis_common.h`、`vsimd_region.cc`
-> - P2 存储分类：`src/ascend/transform/polyhedral/access.cc:89-90`
-> - 寄存器预算：`src/ascend/transform/polyhedral/primitives.h:97-101`
+> - P2 存储分类：`src/ascend/transform/parallel_vectorize/access.cc:89-90`
+> - 寄存器预算：`src/ascend/transform/parallel_vectorize/primitives.h:97-101`
 > - codegen：`src/ascend/codegen/codegen_ascend.cc`
 
 ---
@@ -587,12 +592,12 @@ with T.sblock("SIMD_VF", no_realize=True):
 | `local` / `local.var` alloc codegen | `src/ascend/codegen/codegen_ascend.cc:3066-3162` |
 | generic 向量运算拒绝 | `src/ascend/codegen/codegen_ascend.cc:440-447` |
 | P1 `local.var` 拒绝 | `src/ascend/transform/vsimd_analysis_common.h:206-230`、`vsimd_region.cc:104-115` |
-| P2 存储分类 | `src/ascend/transform/polyhedral/access.cc:89-90` |
-| P2 私有标量判定 | `src/ascend/transform/polyhedral/model.cc:114-120` |
-| P2 fragment register 规划 | `src/ascend/transform/polyhedral/plan.cc`（`ClassifyFragmentRegisters`） |
-| P3 寄存器文件 | `src/ascend/transform/polyhedral/emit.h:28-54`、`emit.cc:615-669` |
-| P3 寄存器读 | `src/ascend/transform/polyhedral/emit.cc:1056-1076` |
-| P3 寄存器分配替换 | `src/ascend/transform/polyhedral/vsimd_group_passes.cc:710-733` |
-| 预算常量 | `src/ascend/transform/polyhedral/primitives.h:97-101` |
+| P2 存储分类 | `src/ascend/transform/parallel_vectorize/access.cc:89-90` |
+| P2 私有标量判定 | `src/ascend/transform/parallel_vectorize/model.cc:114-120` |
+| P2 fragment register 规划 | `src/ascend/transform/parallel_vectorize/plan.cc`（`ClassifyFragmentRegisters`） |
+| P3 寄存器文件 | `src/ascend/transform/parallel_vectorize/emit.h:28-54`、`emit.cc:615-669` |
+| P3 寄存器读 | `src/ascend/transform/parallel_vectorize/emit.cc:1056-1076` |
+| P3 寄存器分配替换 | `src/ascend/transform/parallel_vectorize/vsimd_group_passes.cc:710-733` |
+| 预算常量 | `src/ascend/transform/parallel_vectorize/primitives.h:97-101` |
 | 管线插入点 | `tilelang/ascend/pipeline.py:126-130` |
 | 现有实现文档 | `docs/compiler_internals/simdvf_alloc_fragment_lowering.md` |

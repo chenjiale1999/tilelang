@@ -10,6 +10,7 @@ import tilelang.ascend.language as T
 import tvm
 from tilelang.ascend import transform as at
 from tilelang.layout import make_ascend_compact_nz_layout
+from testing.ascend.transform._vsimd_report_helpers import no_vf_kernel
 
 
 def _report(func):
@@ -479,13 +480,7 @@ def test_opaque_evaluate_unsupported():
 
 
 def test_no_vf_reports_empty():
-    @T.prim_func
-    def main(A: T.Tensor((16,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((16,), "float32")
-            T.copy(A, a_ub)
-
-    assert "no SIMD_VF" in _report(main)
+    assert "no SIMD_VF" in _report(no_vf_kernel())
 
 
 def test_debug_pass_is_read_only():

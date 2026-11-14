@@ -19,7 +19,7 @@
 
 namespace tvm {
 namespace tl {
-namespace polyhedral {
+namespace parallel_vectorize {
 
 namespace {
 
@@ -1124,6 +1124,6 @@ ValueNode LoadNode(const AccessInfo& info, const ValueContext& ctx) {
                     ")");
 }
 
-}  // namespace polyhedral
+}  // namespace parallel_vectorize
 }  // namespace tl
 }  // namespace tvm
