@@ -191,11 +191,6 @@ public:
   ffi::Array<StorePlan> post_stores;
   ffi::Optional<ffi::ObjectRef> reduce; // ReduceInfo
   ffi::Array<int64_t> guard_boundaries;
-  // Scalar shells the plan keeps around its chunk program, outermost first.
-  // Their counters are free lane-uniform values in the store maps; the emitter
-  // wraps the chunk loop in them (a shell the planner could neither absorb as
-  // an axis nor unroll).
-  ffi::Array<Axis> shells;
   ffi::Array<ffi::String> diagnostics;
 
   static constexpr const bool _type_mutable = true;
@@ -217,7 +212,6 @@ public:
         .def_ro("post_stores", &VectorPlanNode::post_stores)
         .def_ro("reduce", &VectorPlanNode::reduce)
         .def_ro("guard_boundaries", &VectorPlanNode::guard_boundaries)
-        .def_ro("shells", &VectorPlanNode::shells)
         .def_ro("diagnostics", &VectorPlanNode::diagnostics);
   }
 };
@@ -229,13 +223,32 @@ public:
   TVM_DEFINE_OBJECT_REF_COW_METHOD(VectorPlanNode);
 };
 
+class ReduceInfo;
+class PlanNode;
+
 /*!
  * \brief ``build_plan`` result: 1..N segments sharing the hoisted parallel
  * axes.
+ *
+ * ``shared_shells`` is the optional scalar chain that wraps *every* segment
+ * (outermost first). It is empty unless the body held sibling scalar shells
+ * whose common ancestors were factored out of the segments, which keeps the
+ * source iteration order (one loop instead of one copy per segment) and leaves
+ * each segment with a single shell chain. The emitter wraps the segment bodies
+ * in it, inside ``axes`` and outside every segment.
+ *
+ * ``root`` is the structural plan tree (design A): the single source of truth
+ * for emission. ``axes`` / ``shared_shells`` / ``segments`` remain as flat
+ * compatibility views (tests and rendering read them); ``segments`` is the
+ * in-order chunk list of the tree.
  */
 class VectorProgramNode : public ffi::Object {
 public:
+  // ``root`` is a PlanNode at runtime; the base type keeps the header
+  // order-independent (PlanNode is defined below).
+  ffi::ObjectRef root;
   ffi::Array<Axis> axes;
+  ffi::Array<Axis> shared_shells;
   ffi::Array<VectorPlan> segments;
   ffi::Array<ffi::String> diagnostics;
 
@@ -246,7 +259,9 @@ public:
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<VectorProgramNode>()
+        .def_ro("root", &VectorProgramNode::root)
         .def_ro("axes", &VectorProgramNode::axes)
+        .def_ro("shared_shells", &VectorProgramNode::shared_shells)
         .def_ro("segments", &VectorProgramNode::segments)
         .def_ro("diagnostics", &VectorProgramNode::diagnostics);
   }
@@ -259,6 +274,78 @@ public:
   TVM_DEFINE_OBJECT_REF_COW_METHOD(VectorProgramNode);
 };
 
+/*!
+ * \brief Structural plan node (design A, tree plan).
+ *
+ * The tree is isomorphic to the planned IR: ``kSeq`` holds ordered siblings,
+ * ``kLoop`` a materialized loop, and ``kChunk`` the only node that carries
+ * vector data instructions (a reused ``VectorPlan``). A lane-uniform ``if`` is
+ * not a node: the planner predicates every leaf store of its arms, because the
+ * VF contract only allows vector work plus masks (no scalar control flow).
+ * Structure nodes only produce control flow; whether a leaf is vectorizable is
+ * decided once, in the leaf.
+ */
+enum class PlanKind : int64_t { kSeq = 0, kLoop = 1, kChunk = 2 };
+
+class PlanNode;
+
+class PlanNodeNode : public ffi::Object {
+public:
+  // Shadow enum (not reflected); Python reads ``kind_value``.
+  PlanKind kind{PlanKind::kSeq};
+  ffi::String kind_value{"seq"};
+
+  // kSeq
+  // Recursive members use the base ObjectRef: PlanNode is both the tree node
+  // and its own reference type, so it is only complete after this class. A
+  // registered PlanNode child keeps its runtime type through reflection /
+  // FFI; C++ call sites Downcast<PlanNode>.
+  ffi::Array<ffi::ObjectRef> children;
+
+  // kLoop (``for_kind`` keeps the source kind for diagnostics; emission is
+  // always a serial loop)
+  tirx::Var loop_var;
+  PrimExpr min;
+  PrimExpr extent;
+  int64_t for_kind{1};
+  ffi::ObjectRef body;
+  bool barrier_at_end{false};
+
+  // kChunk
+  VectorPlan chunk;
+  bool flattened{false};
+
+  // Internal structural summary (not reflected): computed once by the builders
+  // so the planner and the emitter never re-walk a subtree to count chunks.
+  int64_t chunk_count{0};
+
+  static constexpr const bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.parallel_vectorize.PlanNode",
+                                    PlanNodeNode, ffi::Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<PlanNodeNode>()
+        .def_ro("kind_value", &PlanNodeNode::kind_value)
+        .def_ro("children", &PlanNodeNode::children)
+        .def_ro("loop_var", &PlanNodeNode::loop_var)
+        .def_ro("min", &PlanNodeNode::min)
+        .def_ro("extent", &PlanNodeNode::extent)
+        .def_ro("for_kind", &PlanNodeNode::for_kind)
+        .def_ro("body", &PlanNodeNode::body)
+        .def_ro("barrier_at_end", &PlanNodeNode::barrier_at_end)
+        .def_ro("chunk", &PlanNodeNode::chunk)
+        .def_ro("flattened", &PlanNodeNode::flattened);
+  }
+};
+
+class PlanNode : public ffi::ObjectRef {
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PlanNode, ffi::ObjectRef,
+                                             PlanNodeNode);
+  TVM_DEFINE_OBJECT_REF_COW_METHOD(PlanNodeNode);
+};
+
 /*! \brief Builders (defaults mirror the Python dataclass defaults). */
 StorePlan MakeStorePlan(StoreSpec spec, AccessInfo access, ValueNode value,
                         ffi::Optional<ValueNode> mask, AccessClass kind,
@@ -268,10 +355,19 @@ ReduceInfo MakeReduceInfo(Axis axis, std::string op, std::string recipe,
                           bool accumulate = false);
 VectorPlan MakeVectorPlan(ffi::Array<Axis> axes, Axis vector_axis,
                           int64_t lanes, ffi::Optional<int64_t> chunks,
-                          ffi::Optional<int64_t> tail,
-                          ffi::Array<Axis> shells = ffi::Array<Axis>());
+                          ffi::Optional<int64_t> tail);
 VectorProgram MakeVectorProgram(ffi::Array<Axis> axes,
+                                ffi::Array<Axis> shared_shells,
                                 ffi::Array<VectorPlan> segments);
+
+/*! \brief Structural plan builders (design A). */
+PlanNode MakePlanSeq(ffi::Array<PlanNode> children);
+PlanNode MakePlanLoop(tirx::Var var, PrimExpr min, PrimExpr extent,
+                      int64_t for_kind, PlanNode body, bool barrier_at_end);
+PlanNode MakePlanChunk(VectorPlan chunk, bool flattened = false);
+
+/*! \brief The chunk plans of a tree in emission (source) order. */
+TVM_DLL ffi::Array<VectorPlan> TreeSegments(const PlanNode &root);
 
 /*! \brief The reduce info of a store (undefined when the store is not one). */
 ReduceInfo ReduceOf(const StorePlan &store);

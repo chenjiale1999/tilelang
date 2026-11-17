@@ -353,3 +353,83 @@ def test_parallel_same_buffer_disjoint_arm_addresses():
     expected[0::2][positive] = 1.0
     expected[1::2][~positive] = 2.0
     _assert_close(c_npu, expected)
+
+
+# ---------------------------------------------------------------------------
+# structural plan (design A): a lane-uniform branch with sibling element-wise loops
+# ---------------------------------------------------------------------------
+
+
+@tilelang.testing.requires_ascend
+def test_parallel_lane_uniform_branch_with_sibling_elementwise_loops():
+    """``if flag[0] > 0 { for m: s[i,m] = a[i,m]*2; for n: u[i,n] = b[i,n]+1 }``.
+
+    A lane-uniform ``if`` around two sibling element-wise row transforms: the
+    branch must become a store mask, never scalar control flow inside
+    ``__simd_vf__`` (bisheng/AIV rejects it and InsertSync only tracks
+    ``PIPE_V``).  ``m``/``n`` are contiguous and their stores index the loop
+    variable, so both serial loops are absorbed as the vector axes: the VF keeps
+    only the ``i`` loop and runs 64-lane chunks with ``mask = flag[0] > 0``.
+    The flag is run both set and clear, so the masked-off arm is checked too.
+
+    A row *reduction* cannot be expressed this way: it needs a ``T.Parallel``
+    axis (``s[i] += a[i,m]`` cannot use ``m`` as the lane axis), but a nested
+    ``T.Parallel`` under an ``if`` is not lifted by P1 ("not a single
+    rectangular nest") and a guarded cross-lane reduction is unsupported.  This
+    case therefore covers the element-wise shape the pipeline supports.
+    """
+    rows, k = 8, 64
+
+    @T.prim_func
+    def main(
+        FLAG: T.Tensor((1,), F32),
+        A: T.Tensor((rows, k), F32),
+        B: T.Tensor((rows, k), F32),
+        S: T.Tensor((rows, k), F32),
+        U: T.Tensor((rows, k), F32),
+    ):
+        with T.Kernel(1):
+            flag_ub = T.alloc_shared((1,), F32)
+            a_ub = T.alloc_shared((rows, k), F32)
+            b_ub = T.alloc_shared((rows, k), F32)
+            s_ub = T.alloc_shared((rows, k), F32)
+            u_ub = T.alloc_shared((rows, k), F32)
+            T.copy(FLAG, flag_ub)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            T.fill(s_ub, -1.0)
+            T.fill(u_ub, -2.0)
+            with T.SimdVF():
+                for i in T.Parallel(rows):
+                    if flag_ub[0] > 0.0:
+                        for m in T.serial(k):
+                            s_ub[i, m] = a_ub[i, m] * 2.0
+                        for n in T.serial(k):
+                            u_ub[i, n] = b_ub[i, n] + 1.0
+            T.copy(s_ub, S)
+            T.copy(u_ub, U)
+
+    kernel, source = _compile(main, out_idx=None)
+    assert "if (" not in source, "the VF contract has no scalar control flow"
+    assert "simd_inst::vcmps" in source, "the guard becomes a vector store mask"
+    assert source.count("simd_inst::vsts_norm(") == 2, "one store per sibling transform"
+    assert "for (int32_t m" not in source, "the m loop is absorbed as the vector axis"
+    assert "for (int32_t n" not in source, "the n loop is absorbed as the vector axis"
+    assert "simd_inst::mem_bar(" not in source, "element-wise chunks need no VST->VLD barrier"
+    assert "vcadd(" not in source, "no cross-lane reduction is involved"
+
+    a = ((torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 7) - 3).to(torch.float32)
+    b = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 5).to(torch.float32)
+
+    s_on = torch.full((rows, k), -1.0, dtype=torch.float32).npu()
+    u_on = torch.full((rows, k), -2.0, dtype=torch.float32).npu()
+    kernel(torch.tensor([1.0]).npu(), a.npu(), b.npu(), s_on, u_on)
+    _assert_close(s_on, a * 2.0)
+    _assert_close(u_on, b + 1.0)
+
+    # The dead arm must leave both destinations untouched.
+    s_off = torch.full((rows, k), -1.0, dtype=torch.float32).npu()
+    u_off = torch.full((rows, k), -2.0, dtype=torch.float32).npu()
+    kernel(torch.tensor([-1.0]).npu(), a.npu(), b.npu(), s_off, u_off)
+    _assert_close(s_off, torch.full((rows, k), -1.0))
+    _assert_close(u_off, torch.full((rows, k), -2.0))

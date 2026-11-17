@@ -134,9 +134,24 @@ class VectorPlan(Node):
     """Segment-level plan (one body + optional pre/post siblings)."""
 
 
+@tvm_ffi.register_object("tl.parallel_vectorize.PlanNode")
+class PlanNode(Node):
+    """One node of the structural plan tree (design A).
+
+    ``kind`` is one of ``seq`` / ``loop`` / ``chunk``.  ``chunk`` nodes carry a
+    :class:`VectorPlan`; structure nodes only carry control flow.  A
+    lane-uniform ``if`` is not a node: its arms are emitted as predicated
+    chunks (store masks), because the VF contract only allows vector work.
+    """
+
+    @property
+    def kind(self):
+        return self.kind_value
+
+
 @tvm_ffi.register_object("tl.parallel_vectorize.VectorProgram")
 class VectorProgram(Node):
-    """``build_plan`` result: 1..N segments."""
+    """``build_plan`` result: 1..N segments (``root`` is the plan tree)."""
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +199,17 @@ def render_plan(plan):
     if not result["ok"]:
         _raise(result)
     return result["text"]
+
+
+def verify_no_scalar_data_ops(stmt):
+    """Invariant I5: list scalar data instructions in an emitted region.
+
+    An empty list means the region only contains vector data instructions;
+    scalar values appear only in loop bounds, conditions, addresses, chunk
+    indices and ``Bind`` values.
+    """
+    result = _ffi_api.AscendParallelVectorizeVerifyNoScalarDataOps(stmt)
+    return list(result["violations"])
 
 
 def finite_difference(offset, var, analyzer):

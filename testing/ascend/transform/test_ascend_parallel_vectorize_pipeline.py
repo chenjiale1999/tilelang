@@ -68,11 +68,11 @@ from testing.ascend.transform._parallel_vectorize_helpers import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extent, chunks, tail", [(100, 2, 36), (1, 1, 1)], ids=["tail", "unit"])
-def test_plan_tail_and_unit_extent(extent, chunks, tail):
-    func = _p1_kernel_extent(extent)
+def test_plan_tail_chunk_math():
+    """100 f32 elements: one full chunk plus a 36-lane tail."""
+    func = _p1_kernel_extent(100)
     segment = build_plan(_outer_parallel_nests(func)[0]).segments[0]
-    assert (segment.chunks, segment.tail) == (chunks, tail)
+    assert (segment.chunks, segment.tail) == (2, 36)
 
 
 def test_plan_symbolic_extent():

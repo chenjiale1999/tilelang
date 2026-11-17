@@ -67,15 +67,13 @@ ReduceInfo MakeReduceInfo(Axis axis, std::string op, std::string recipe,
 
 VectorPlan MakeVectorPlan(ffi::Array<Axis> axes, Axis vector_axis,
                           int64_t lanes, ffi::Optional<int64_t> chunks,
-                          ffi::Optional<int64_t> tail,
-                          ffi::Array<Axis> shells) {
+                          ffi::Optional<int64_t> tail) {
   auto node = ffi::make_object<VectorPlanNode>();
   node->axes = std::move(axes);
   node->vector_axis = std::move(vector_axis);
   node->lanes = lanes;
   node->chunks = std::move(chunks);
   node->tail = std::move(tail);
-  node->shells = std::move(shells);
   // A static segment starts with every chunk live; ``-1`` is reserved for the
   // dynamic chunk count (unknown at plan time).
   node->chunk_hi = node->chunks.has_value() ? *node->chunks : -1;
@@ -83,11 +81,94 @@ VectorPlan MakeVectorPlan(ffi::Array<Axis> axes, Axis vector_axis,
 }
 
 VectorProgram MakeVectorProgram(ffi::Array<Axis> axes,
+                                ffi::Array<Axis> shared_shells,
                                 ffi::Array<VectorPlan> segments) {
   auto node = ffi::make_object<VectorProgramNode>();
   node->axes = std::move(axes);
+  node->shared_shells = std::move(shared_shells);
   node->segments = std::move(segments);
   return VectorProgram(std::move(node));
+}
+
+namespace {
+
+const char *PlanKindName(PlanKind kind) {
+  switch (kind) {
+  case PlanKind::kLoop:
+    return "loop";
+  case PlanKind::kChunk:
+    return "chunk";
+  case PlanKind::kSeq:
+    break;
+  }
+  return "seq";
+}
+
+void CollectTreeSegments(const PlanNode &node, ffi::Array<VectorPlan> *out) {
+  if (!node.defined())
+    return;
+  switch (node->kind) {
+  case PlanKind::kChunk:
+    out->push_back(node->chunk);
+    return;
+  case PlanKind::kSeq:
+    for (const ffi::ObjectRef &child : node->children)
+      CollectTreeSegments(Downcast<PlanNode>(child), out);
+    return;
+  case PlanKind::kLoop:
+    if (node->body.defined())
+      CollectTreeSegments(Downcast<PlanNode>(node->body), out);
+    return;
+  }
+}
+
+} // namespace
+
+PlanNode MakePlanSeq(ffi::Array<PlanNode> children) {
+  auto node = ffi::make_object<PlanNodeNode>();
+  node->kind = PlanKind::kSeq;
+  node->kind_value = PlanKindName(node->kind);
+  ffi::Array<ffi::ObjectRef> refs;
+  for (const PlanNode &child : children) {
+    refs.push_back(child);
+    node->chunk_count += child->chunk_count;
+  }
+  node->children = std::move(refs);
+  return PlanNode(std::move(node));
+}
+
+PlanNode MakePlanLoop(tirx::Var var, PrimExpr min, PrimExpr extent,
+                      int64_t for_kind, PlanNode body, bool barrier_at_end) {
+  auto node = ffi::make_object<PlanNodeNode>();
+  node->kind = PlanKind::kLoop;
+  node->kind_value = PlanKindName(node->kind);
+  node->loop_var = std::move(var);
+  node->min = min.defined() ? std::move(min) : IntImm32(0);
+  node->extent = std::move(extent);
+  node->for_kind = for_kind;
+  node->body = std::move(body);
+  node->barrier_at_end = barrier_at_end;
+  if (node->body.defined()) {
+    PlanNode inner = Downcast<PlanNode>(node->body);
+    node->chunk_count = inner->chunk_count;
+  }
+  return PlanNode(std::move(node));
+}
+
+PlanNode MakePlanChunk(VectorPlan chunk, bool flattened) {
+  auto node = ffi::make_object<PlanNodeNode>();
+  node->kind = PlanKind::kChunk;
+  node->kind_value = PlanKindName(node->kind);
+  node->chunk = std::move(chunk);
+  node->flattened = flattened;
+  node->chunk_count = 1;
+  return PlanNode(std::move(node));
+}
+
+ffi::Array<VectorPlan> TreeSegments(const PlanNode &root) {
+  ffi::Array<VectorPlan> segments;
+  CollectTreeSegments(root, &segments);
+  return segments;
 }
 
 ReduceInfo ReduceOf(const StorePlan &store) {
@@ -196,6 +277,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   StorePlanNode::RegisterReflection();
   ReduceInfoNode::RegisterReflection();
   VectorPlanNode::RegisterReflection();
+  PlanNodeNode::RegisterReflection();
   VectorProgramNode::RegisterReflection();
 }
 

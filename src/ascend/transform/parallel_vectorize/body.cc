@@ -67,6 +67,27 @@ bool IsTruthyElse(const ffi::Optional<tirx::Stmt> &else_case) {
 
 } // namespace
 
+bool IsScalarShell(const tirx::ForNode *loop) {
+  if (loop == nullptr || loop->kind != tirx::ForKind::kSerial)
+    return false;
+  // The shell is replayed with unit stride (``min + iter``); P1 guarantees
+  // ``step == 1``, direct planner callers need the guard here.
+  if (loop->step.has_value()) {
+    const auto *step = loop->step.value().as<IntImmNode>();
+    if (step == nullptr || step->value != 1)
+      return false;
+  }
+  std::optional<int64_t> min = ConstInt(loop->min, nullptr);
+  if (!min.has_value() || *min != 0)
+    return false;
+  if (WritesScalarAddress(loop->body))
+    return false;
+  std::optional<int64_t> extent = ConstInt(loop->extent, nullptr);
+  if (extent.has_value() && *extent >= 0 && *extent <= kShellUnrollLimit)
+    return false; // unrolled iteration by iteration, not a shell
+  return true;
+}
+
 StoreSpec MakeStoreSpec(tirx::Buffer buffer, ffi::Array<PrimExpr> indices,
                         PrimExpr value, ffi::Optional<PrimExpr> mask) {
   auto node = ffi::make_object<StoreSpecNode>();
@@ -159,6 +180,19 @@ void NormalizeBodyInto(const tirx::Stmt &stmt, const AliasMap &aliases,
                        ffi::Optional<PrimExpr> mask,
                        std::vector<ShellLoop> *shells) {
   if (const auto *seq = stmt.as<tirx::SeqStmtNode>()) {
+    // Sibling scalar shells cannot be modelled as one shell chain: the shell
+    // segmentation must have cut them into one segment each, so reaching here
+    // means the shape is not distributable (e.g. inside a branch). Reject
+    // instead of silently nesting the siblings.
+    int shell_like = 0;
+    for (const tirx::Stmt &child : seq->seq)
+      shell_like += IsScalarShell(child.as<tirx::ForNode>()) ? 1 : 0;
+    if (shell_like >= 2) {
+      throw Unsupported(
+          "a T.Parallel body with multiple sibling scalar shells cannot be "
+          "planned as one segment",
+          {}, "body.sibling_shells");
+    }
     for (const tirx::Stmt &child : seq->seq) {
       NormalizeBodyInto(child, aliases, out, mask, shells);
     }
@@ -270,8 +304,7 @@ void NormalizeBodyInto(const tirx::Stmt &stmt, const AliasMap &aliases,
     // in the store maps, and P3 wraps the chunk program in it. A write to a
     // scalar address is not lane-parallel work (it would be replicated once per
     // lane), so such a shell stays a rejection.
-    if (loop->kind == tirx::ForKind::kSerial && shells != nullptr &&
-        min.has_value() && *min == 0 && !WritesScalarAddress(loop->body)) {
+    if (shells != nullptr && IsScalarShell(loop)) {
       shells->push_back(ShellLoop{loop->loop_var, loop->min, loop->extent});
       NormalizeBodyInto(loop->body, aliases, out, mask, shells);
       return;

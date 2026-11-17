@@ -200,8 +200,7 @@ public:
             // The replaced Parallel sits inside a serial loop that stays in
             // place (a shell around the nest). Its iterations run in memory
             // order and may read back what the previous one stored, so the
-            // replacement ends with a VST->VLD barrier — the same rule the
-            // emitter applies to ``plan.shells``.
+            // replacement ends with a VST->VLD barrier.
             emitted = tirx::SeqStmt({emitted, VstVldBarrier()});
           }
           return emitted;

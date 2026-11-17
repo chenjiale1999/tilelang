@@ -827,8 +827,16 @@ void RequireGuardableScalar(const PrimExpr &expr, const ValueContext &ctx) {
     const auto *load = node.as<tirx::BufferLoadNode>();
     if (load == nullptr || !unpredicable.empty())
       return;
-    AccessInfo info = ClassifyAccess(load->buffer, load->indices, ctx.axes,
-                                     ctx.analyzer, /*is_store=*/false);
+    AccessInfo info;
+    if (ctx.load_infos != nullptr) {
+      auto it = ctx.load_infos->find(load);
+      if (it != ctx.load_infos->end())
+        info = it->second;
+    }
+    if (!info.defined()) {
+      info = ClassifyAccess(load->buffer, load->indices, ctx.axes, ctx.analyzer,
+                            /*is_store=*/false);
+    }
     if (!AccessProvablyInBounds(info, ctx)) {
       unpredicable.push_back(load->buffer->name.operator std::string());
     }
@@ -914,6 +922,21 @@ bool ReadsBuffer(const ValueNode &node, const tirx::Buffer &buffer) {
   return false;
 }
 
+bool ExprHasSameAddressLoad(const PrimExpr &expr, const tirx::Buffer &buffer,
+                            const ffi::Array<PrimExpr> &indices) {
+  bool found = false;
+  tirx::PostOrderVisit(expr, [&](const ffi::ObjectRef &node) {
+    if (found)
+      return;
+    const auto *load = node.as<tirx::BufferLoadNode>();
+    if (load != nullptr && SameBuffer(load->buffer, buffer) &&
+        SameIndices(load->indices, indices)) {
+      found = true;
+    }
+  });
+  return found;
+}
+
 ValueNode SameAddressLoad(const ValueNode &node, const tirx::Buffer &buffer,
                           const ffi::Array<PrimExpr> &indices) {
   if ((node->id == ValueRecipe::kVLoad ||
@@ -948,8 +971,16 @@ bool ReadsOtherAddress(const ValueNode &node, const tirx::Buffer &buffer,
 
 ValueNode BuildValue(const PrimExpr &expr, const ValueContext &ctx) {
   if (const auto *load = expr.as<tirx::BufferLoadNode>()) {
-    AccessInfo info = ClassifyAccess(load->buffer, load->indices, ctx.axes,
-                                     ctx.analyzer, /*is_store=*/false);
+    AccessInfo info;
+    if (ctx.load_infos != nullptr) {
+      auto it = ctx.load_infos->find(load);
+      if (it != ctx.load_infos->end())
+        info = it->second;
+    }
+    if (!info.defined()) {
+      info = ClassifyAccess(load->buffer, load->indices, ctx.axes, ctx.analyzer,
+                            /*is_store=*/false);
+    }
     return LoadNode(info, ctx);
   }
   if (const auto *var = expr.as<tirx::VarNode>()) {

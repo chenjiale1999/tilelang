@@ -416,7 +416,14 @@ def test_strided_access_declares_the_spanned_envelope():
 
 
 def test_indexed_access_declares_the_allocation_owner():
-    """Runtime offsets: a gather/scatter declares the whole owner (may-access)."""
+    """Runtime offsets: a gather/scatter declares the whole owner (may-access).
+
+    The load side uses an indirect (runtime) index.  The store side uses a
+    reversal instead of an indirect store: a runtime store index is
+    data-dependent, so P1 reports the nest ``UNPROVEN`` and never plans it; a
+    permutation store is injective, P1 lifts it, and it exercises the same
+    index-vector ``OwnerElements`` footprint.
+    """
     n = 128
 
     @T.prim_func
@@ -432,15 +439,13 @@ def test_indexed_access_declares_the_allocation_owner():
             T.copy(c, C)
 
     @T.prim_func
-    def store_k(A: T.Tensor((n,), "float32"), B: T.Tensor((n,), "int32"), C: T.Tensor((n,), "float32")):
+    def store_k(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
         with T.Kernel(1):
             a = T.alloc_shared((n,), "float32")
-            b = T.alloc_shared((n,), "int32")
             c = T.alloc_shared((n,), "float32")
             T.copy(A, a)
-            T.copy(B, b)
             for i in T.Parallel(n):
-                c[b[i]] = a[i]
+                c[n - 1 - i] = a[i]
             T.copy(c, C)
 
     assert ("a", 128) in _declared_extents(emit_plan(_plan(load_k)))

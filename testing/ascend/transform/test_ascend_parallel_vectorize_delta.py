@@ -1129,6 +1129,16 @@ def test_atomic_rejected():
 
 
 def test_nested_loop_rejected():
+    """A lane-varying predicate on a shared scalar accumulator has no vector form.
+
+    ``if a[tm, g_i] != 0: cnt[0] += 1`` increments ``cnt[0]`` once per satisfying
+    ``(tm, g_i)``; vectorizing ``tm`` would make several lanes race on the same
+    scalar. The tree planner rejects it at the leaf instead of emitting a single
+    masked broadcast of ``cnt[0] + 1``.
+
+    As in :func:`test_serial_shared_scalar_rejected`, this is a DSL mistake that
+    P1 already hard-errors on; the case covers the planner's defensive check.
+    """
     S, KD = 16, 16
 
     @T.prim_func
@@ -1144,7 +1154,7 @@ def test_nested_loop_rejected():
                         cnt[0] += 1
                         c[tm, g_i] = a[tm, g_i]
 
-    with _rejects("body.nested_loop"):
+    with _rejects("plan.lane_varying_uniform_store"):
         _plan(k)
 
 
@@ -1265,48 +1275,18 @@ def test_direct_serial_reduction_absorbed():
     assert "tl.simd.vcadd" not in ops
 
 
-def test_direct_serial_private_scalar_absorbed():
-    """S2 (§6 step 2): an iteration-private **scalar** accumulator vectorized along the parallel axis.
-
-    Each parallel iteration owns one ``acc`` (local.var) -> it is promoted to a
-    ``local.var`` **vector register**: the ``acc = 0`` in ``pre`` folds into a
-    ``vdup`` initial value, the body only does ``vadd`` each round, one ``ONEPT``
-    writes the private scalar back at the end, and ``c[i] = acc`` in ``post`` reuses
-    the register directly."""
-    MS, KS = 64, 8
-
-    @T.prim_func
-    def k(A: T.Tensor((MS, KS), "float32"), C: T.Tensor((MS,), "float32")):
-        with T.Kernel(1):
-            a = T.alloc_shared((MS, KS), "float32")
-            c = T.alloc_shared((MS,), "float32")
-            for i in T.Parallel(MS):
-                acc = T.alloc_var("float32")
-                acc = 0.0
-                for j in T.serial(KS):
-                    acc += a[i, j]
-                c[i] = acc
-
-    plan = _single_segment(k)
-    assert plan.vector_axis.name == "i"  # one private accumulator per lane; vectorize along the parallel axis
-    assert plan.reduce is None  # not a cross-lane reduction
-    assert [s.kind for s in plan.stores] == [AccessClass.UNIFORM]
-    assert [s.spec.buffer.name for s in plan.pre_stores] == ["acc"]
-    assert [s.spec.buffer.name for s in plan.post_stores] == ["c"]
-    ops = _emitted_ops(emit_plan(plan))
-    assert "tl.simd.vadd" in ops
-    assert "tl.simd.vcadd" not in ops  # a private scalar is not cross-lane reduced
-    assert "tl.simd.vld" not in ops  # the initial value comes from the pre fold; the body's old value comes from the register
-    # ONEPT writes the private scalar back (visible outside the segment) + writes c[i];
-    # post consumes the register directly (no more vdup read-back).
-    assert ops.count("tl.simd.vsts") == 2
-    assert 'scope="local.var"' in str(emit_plan(plan))
-
-
 def test_serial_shared_scalar_rejected():
-    """S4 boundary: reduction into a **shared scalar** ``cnt[0] += 1``. The destination
-    address is invariant along the serial axis and the value does not vary with the
-    axis (not a legal reduction) -> absorption is rejected."""
+    """S4 boundary: a lane-varying predicate on a **shared scalar** accumulator.
+
+    ``if a[i, j] != 0: cnt[0] += 1`` increments ``cnt[0]`` once per satisfying
+    lane; the per-lane condition has no vector form (a cross-lane count is not a
+    mask), so the leaf is rejected.
+
+    This is a DSL mistake: in the production pipeline P1 already hard-errors on
+    the accumulating store that ignores the parallel axis (and on the non-injective
+    scalar write), so P2 never sees the nest.  The case pins the planner's own
+    defensive check (``build_plan`` is also a public test entry point).
+    """
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1321,7 +1301,7 @@ def test_serial_shared_scalar_rejected():
                         cnt[0] += 1
                         c[i, j] = a[i, j]
 
-    with _rejects("body.nested_loop"):
+    with _rejects("plan.lane_varying_uniform_store"):
         _plan(k)
 
 
@@ -1579,9 +1559,14 @@ def test_multi_serial_compose_keeps_source_order():
     assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
 
 
-def test_multi_serial_leading_statement_is_first_segment_pre():
-    """A statement group before the first segment belongs to that segment's ``pre`` (it runs
-    once per parallel iteration, outside the chunk loop)."""
+def test_multi_serial_leading_statement_is_a_source_order_chunk():
+    """A statement group before the first loop chain becomes its own chunk.
+
+    Design A §7: the plan mirrors the IR, so ``s[i] = 0`` is ``Chunk[s]`` and the
+    two loop chains are the following chunks, emitted in source order. (The
+    single-chain case still folds an identity initializer into the reduction's
+    ``pre`` through the whole-body fast path.)
+    """
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1599,8 +1584,9 @@ def test_multi_serial_leading_statement_is_first_segment_pre():
 
     program = _plan(k)
     assert isinstance(program, VectorProgram)
-    assert [store.spec.buffer.name for store in program.segments[0].pre_stores] == ["s"]
-    assert program.segments[1].pre_stores == []
+    assert [seg.stores[0].spec.buffer.name for seg in program.segments] == ["s", "s", "c"]
+    assert program.segments[0].stores[0].value.recipe == "imm"
+    assert [store.spec.buffer.name for store in program.segments[1].pre_stores] == []
 
 
 def test_multi_serial_one_unclean_is_rejected():
@@ -1795,5 +1781,5 @@ def test_multi_segment_failure_reason_is_preserved():
     with _rejects("unsupported") as excinfo:
         _plan(k)
     notes = excinfo.value.diagnostics
-    assert any(note.startswith("segment 1") for note in notes)
-    assert any("not supported" in note for note in notes)
+    assert any(note.startswith("at ") for note in notes), notes
+    assert "not supported" in str(excinfo.value), str(excinfo.value)

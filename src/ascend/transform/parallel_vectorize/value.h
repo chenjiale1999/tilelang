@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -243,6 +244,9 @@ ValueNode PredicateOf(const ValueNode &node);
 /*! \brief Operands of a value node as typed value nodes. */
 std::vector<ValueNode> ArgsOf(const ValueNode &node);
 
+/*! \brief Load classification memo keyed by the statement's load nodes. */
+using LoadInfoCache = std::map<const tirx::BufferLoadNode *, AccessInfo>;
+
 /*! \brief Per-lane expression context (axes, vector axis, analyzer, guard). */
 struct ValueContext {
   std::vector<Axis> axes;
@@ -252,6 +256,13 @@ struct ValueContext {
   int64_t guard_free_until{0};
   std::optional<int64_t> guard_free_from;
   int64_t lanes{0};
+  /*! \brief Load classification memo of the enclosing chunk.
+   *
+   * Keys are the ``BufferLoadNode`` pointers of the statements being planned,
+   * so ``BuildValue`` reuses the classification already computed for axis
+   * ranking instead of running ``ClassifyAccess`` per load (per candidate
+   * axis). A miss falls back to classifying on the spot. */
+  const LoadInfoCache *load_infos{nullptr};
 };
 
 /*! \brief Narrow the context to a new guard (no-op when ``guard`` is None). */
@@ -306,6 +317,13 @@ bool ReadsBuffer(const ValueNode &node, const tirx::Buffer &buffer);
  */
 ValueNode SameAddressLoad(const ValueNode &node, const tirx::Buffer &buffer,
                           const ffi::Array<PrimExpr> &indices);
+/*! \brief Whether the raw expression reads ``buffer`` at the same address.
+ *
+ * The expression-level counterpart of :func:`SameAddressLoad`, shared by the
+ * planner's pre-normalization checks so the "reads its own destination"
+ * predicate exists exactly once. */
+bool ExprHasSameAddressLoad(const PrimExpr &expr, const tirx::Buffer &buffer,
+                            const ffi::Array<PrimExpr> &indices);
 /*! \brief Whether the DAG reads ``buffer`` at a *different* address. */
 bool ReadsOtherAddress(const ValueNode &node, const tirx::Buffer &buffer,
                        const ffi::Array<PrimExpr> &indices);

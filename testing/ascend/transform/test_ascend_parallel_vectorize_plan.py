@@ -20,6 +20,8 @@ from tilelang.ascend.analysis.parallel_vectorize import (
     VectorProgram,
     build_plan,
     emit_plan,
+    render_plan,
+    verify_no_scalar_data_ops,
 )
 from testing.ascend.transform._parallel_vectorize_helpers import (
     _alloc_buffers,
@@ -30,6 +32,7 @@ from testing.ascend.transform._parallel_vectorize_helpers import (
     _first_parallel,
     _for_extents,
     _for_kinds,
+    _loop_var_names,
     _negative_immediate_muls,
     _one_dimensional_copy,
     _over_reading_contiguous_load,
@@ -177,18 +180,21 @@ def test_defect_d1_product_reduction_is_not_emitted_as_sum():
 def test_defect_d2_plain_overwrite_is_not_treated_as_reduction():
     """D2 fixed: an overwrite ``s[i] = a[i,j]`` is not treated as a reduction (no ``vcadd``).
 
-    After vectorizing along the parallel axis i it is a per-lane assignment with the
-    j loop kept as a real loop, so the result matches the scalar last-write-wins
-    semantics exactly."""
-    MS, KS = 64, 8
+    ``j`` is a serial shell (last write wins in memory order), so after vectorizing
+    along the parallel axis i the plan is a per-lane assignment inside a plan-level
+    ``Loop(j)``: the semantics match the scalar program exactly and no cross-lane
+    ``vcadd`` appears.  (A plain overwrite over a **parallel** j would be a racing
+    write; P1 rejects that nest as ILLEGAL, so it never reaches P2.)"""
+    MS, KS = 64, 16
 
     @T.prim_func
     def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
         with T.Kernel(1):
             a = T.alloc_shared((MS, KS), "float32")
             s = T.alloc_shared((MS,), "float32")
-            for i, j in T.Parallel(MS, KS):
-                s[i] = a[i, j]
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = a[i, j]
 
     plan = _single_segment(k)
     assert plan.vector_axis.name == "i"
@@ -294,17 +300,19 @@ def test_defect_d6_two_reductions_in_one_nest_are_both_emitted():
 def test_defect_d13_lane_varying_overwrite_is_not_a_reduction():
     """D13 fixed (unified criterion): ``s[i] = a[i,j] + 1.0`` is a "last write wins" overwrite and is not silently emitted as a sum.
 
-    After vectorizing along the parallel axis i it is a per-lane ``vadds`` + ``vsts``
-    (the j loop stays), with no ``vcadd``."""
-    MS, KS = 64, 8
+    ``j`` is a serial shell, so after vectorizing along the parallel axis i it is a
+    per-lane ``vadds`` + ``vsts`` inside ``Loop(j)``, with no ``vcadd``.  (Over a
+    parallel j this would be a racing write, which P1 rejects as ILLEGAL.)"""
+    MS, KS = 64, 16
 
     @T.prim_func
     def k(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32")):
         with T.Kernel(1):
             a = T.alloc_shared((MS, KS), "float32")
             s = T.alloc_shared((MS,), "float32")
-            for i, j in T.Parallel(MS, KS):
-                s[i] = a[i, j] + 1.0
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s[i] = a[i, j] + 1.0
 
     plan = _single_segment(k)
     assert plan.reduce is None
@@ -366,13 +374,15 @@ def test_defect_d6b_mixed_reductions_keep_their_own_recipe():
     assert "tl.simd.vcadd" not in ops and "tl.simd.vcmax" not in ops
 
 
-def test_reduce_segment_with_uniform_broadcast_sibling():
-    """A store in a reduction segment whose value is uniform along the axis is a broadcast
-    write: it neither takes part in the reduction nor gets dropped.
+def test_broadcast_sibling_store_is_not_dropped():
+    """A lane-invariant sibling store inside a serial shell is a broadcast write: it
+    neither takes part in the accumulation of ``s1`` nor gets dropped.
 
-    After vectorizing along the parallel axis i: ``s1[i] += a[i,j]`` is a per-lane
-    read-modify-write, and ``s2[i] = 3.0`` is a broadcast write (``vdup`` + ``vsts``)."""
-    MS, KS = 64, 8
+    ``j`` is a serial shell (last write wins), so after vectorizing along the parallel
+    axis i: ``s1[i] += a[i,j]`` is a per-lane read-modify-write and ``s2[i] = 3.0``
+    is a broadcast write (``vdup`` + ``vsts``) inside ``Loop(j)``.  The same shape
+    over a parallel j would race on ``s2[i]`` and P1 rejects it as ILLEGAL."""
+    MS, KS = 64, 16
 
     @T.prim_func
     def k(A: T.Tensor((MS, KS), "float32"), S1: T.Tensor((MS,), "float32"), S2: T.Tensor((MS,), "float32")):
@@ -380,9 +390,10 @@ def test_reduce_segment_with_uniform_broadcast_sibling():
             a = T.alloc_shared((MS, KS), "float32")
             s1 = T.alloc_shared((MS,), "float32")
             s2 = T.alloc_shared((MS,), "float32")
-            for i, j in T.Parallel(MS, KS):
-                s1[i] = s1[i] + a[i, j]
-                s2[i] = 3.0
+            for i in T.Parallel(MS):
+                for j in T.serial(KS):
+                    s1[i] = s1[i] + a[i, j]
+                    s2[i] = 3.0
 
     segment = _single_segment(k)
     assert segment.reduce is None
@@ -778,7 +789,6 @@ def test_tail_chunk_guard_is_proved_free():
     # The prefix of two chunks has an always-false predicate and is removed entirely
     # (see the dead_guard case); the remaining tail uses the tail mask directly and
     # emits no comparison.
-    print(f"func:\n\n{k}\n\nemited:\n\n{emit_plan(plan)}")
     ops = _emitted_ops(emit_plan(plan))
     assert ops.count("tl.simd.vcmps") == 0
     assert ops.count("tl.simd.vsts") == 1
@@ -835,47 +845,6 @@ def test_unmasked_store_keeps_every_chunk_live():
     # The full-chunk loop still covers chunks 0/1; the tail still uses the masked gather.
     assert [(name, lo, extent) for name, lo, extent in _chunk_iterations(stmt)] == [("chunk", 0, 2)]
     assert _emitted_ops(stmt).count("tl.simd.vld") == 1
-
-
-def test_defect_d11_build_success_implies_emit_success_for_sibling_statement():
-    """D11 fixed: an indirect pre/post address that is invariant along the vector axis (Delta == 0) is a lane-uniform **scalar** address.
-
-    ``c[b[0]] = 1.0`` does not qualify for the per-lane index-vector channel, but it
-    is not a rejection reason either: it is uniform along the serial axis and is
-    emitted as a single-element ``ONEPT`` write; the serial body is still
-    vectorized as usual (partial vectorization). build succeeded => emit must succeed.
-    """
-    MS, KS = 64, 8
-
-    @T.prim_func
-    def k(
-        A: T.Tensor((MS, KS), "float32"),
-        B: T.Tensor((1,), "int32"),
-        D: T.Tensor((MS, KS), "float32"),
-        C: T.Tensor((MS,), "float32"),
-    ):
-        with T.Kernel(1):
-            a = T.alloc_shared((MS, KS), "float32")
-            b = T.alloc_shared((1,), "int32")
-            d = T.alloc_shared((MS, KS), "float32")
-            c = T.alloc_shared((MS,), "float32")
-            for i in T.Parallel(MS):
-                c[b[0]] = 1.0
-                for j in T.serial(KS):
-                    d[i, j] = a[i, j] * 2.0
-
-    plan = build_plan(_first_parallel(k))
-    segment = plan.segments[0]
-    assert segment.vector_axis.name == "i"  # the parallel body is vectorized; the serial axis stays a loop
-    assert segment.reduce is None
-    assert [store.kind for store in segment.pre_stores] == [AccessClass.UNIFORM]
-    stmt = emit_plan(plan)  # build succeeded => emit must succeed
-    ops = _emitted_ops(stmt)
-    assert "tl.simd.vmuls" in ops  # the body is vectorized as usual
-    # pre does not depend on any axis -> hoisted to the outermost level and degraded to
-    # a single **scalar** store (no more vdup + ONEPT).
-    assert "c[b[0]] = T.float32(1.0)" in str(stmt)
-    assert "ONEPT_B32" not in str(stmt)
 
 
 def test_lane_invariant_indirect_load_is_uniform():
@@ -1011,10 +980,15 @@ def test_lane_uniform_store_condition_is_broadcast_as_a_predicate():
 
 
 def test_conditional_reduction_is_rejected():
-    """R3: the cross-lane reduction mask of ``if cond: s[0] += a[i]`` carries only the tail predicate.
+    """R3: a lane-dependent guard around a reduction has no mask semantics.
 
-    The old implementation **silently dropped** the user predicate and summed over
-    all lanes (a wrong result); it is now rejected explicitly at build time.
+    ``if i < 64: s[0] += a[i]`` is a cross-lane reduction; a partial predicate
+    cannot be expressed by the reduction mask (it would sum over all lanes). The
+    tree planner reports ``tree.predicated_reduce`` with the failing path.
+
+    In the production pipeline P1 already marks this nest ILLEGAL (the guarded
+    accumulating write has a cross-iteration dependency), so P2 never sees it;
+    the case pins the planner's own defensive path.
     """
     M = 100
 
@@ -1027,7 +1001,7 @@ def test_conditional_reduction_is_rejected():
                 if i < 64:
                     s[0] = s[0] + a[i]
 
-    with _rejects("reduce.conditional"):
+    with _rejects("tree.predicated_reduce"):
         _single_segment(k)
 
 
@@ -1075,14 +1049,15 @@ def test_serial_loop_with_non_zero_lower_bound_is_rejected():
         _single_segment(k)
 
 
-def test_multiple_writes_to_one_buffer_inside_a_shell_keep_source_order():
-    """R6 (updated): multiple writes to the same buffer (``c[i,2*j]`` and ``c[i,j]``) in one serial body are no longer rejected.
+def test_multiple_writes_to_one_buffer_inside_a_materialized_loop_keep_source_order():
+    """R6 (updated): multiple writes to the same buffer (``c[i,2*j]`` and ``c[i,2*j+1]``) in one serial body are no longer rejected.
 
-    Here j cannot be absorbed as an axis (the writes to one buffer target different
-    addresses), but it no longer needs to be: the shell stays a **real scalar loop**,
-    the two vector stores inside it are emitted in source order, cross-iteration
-    "last write wins" is guaranteed by loop execution order, and each lane still
-    writes its own address.
+    The two writes target disjoint addresses (even/odd columns), so P1 can prove
+    that no cross-iteration alias exists; ``j`` still cannot be absorbed as a
+    vector axis (two writes to one buffer at different addresses), so it becomes a
+    plan-level ``Loop`` around the chunk.  The two vector stores inside it are
+    emitted in source order, so a source-order bug (replaying both stores from one
+    chunk loop) would be visible.
     """
     MS, KS = 4, 128
 
@@ -1094,75 +1069,67 @@ def test_multiple_writes_to_one_buffer_inside_a_shell_keep_source_order():
             for i in T.Parallel(MS):
                 for j in T.serial(KS):
                     c[i, 2 * j] = a[i, j]
-                    c[i, j] = 2.0
+                    c[i, 2 * j + 1] = 2.0
 
     plan = _single_segment(k)
-    assert [(str(axis.var), int(axis.extent)) for axis in plan.shells] == [("j", KS)]
     assert plan.vector_axis.name == "i"
     text = str(emit_plan(build_plan(_first_parallel(k))))
     assert "for j in range(128):" in text
-    scatter_at_j2 = text.index("c[0, j * 2]")
-    scatter_at_j = text.index("c[0, j], ")
-    assert scatter_at_j2 < scatter_at_j
+    scatter_at_even = text.index("c[0, j * 2]")
+    scatter_at_odd = text.index("c[0, j * 2 + 1]")
+    assert scatter_at_even < scatter_at_odd
 
 
-def test_non_absorbable_shell_is_kept_as_a_scalar_loop():
-    """A shell the planner cannot absorb (last-write-wins) stays a real loop.
+@pytest.mark.parametrize("runtime_bound", [False, True])
+def test_non_absorbable_loop_is_materialized_as_a_plan_loop(runtime_bound):
+    """A loop the planner cannot absorb (last-write-wins) becomes a plan-level Loop.
 
     ``c[i] = S[i, j]`` writes one address per lane, so ``j`` is neither a vector
-    axis nor a reduction; the plan keeps it as a scalar shell around the chunk
-    program instead of rejecting the nest (PR-2's shape).
+    axis nor a reduction; the tree is ``Loop(j, Chunk)`` and the loop wraps the
+    chunk program. A lane-invariant runtime trip count is carried by the same
+    node.
     """
     BR, BC = 128, 128
 
-    @T.prim_func
-    def k(A: T.Tensor((BR, BC), "float32"), C: T.Tensor((BR,), "float32")):
-        with T.Kernel(1):
-            s = T.alloc_shared((BR, BC), "float32")
-            c = T.alloc_shared((BR,), "float32")
-            for i in T.Parallel(BR):
-                for j in T.serial(BC):
-                    c[i] = s[i, j]
+    if runtime_bound:
 
-    plan = _single_segment(k)
-    assert [(str(axis.var), int(axis.extent)) for axis in plan.shells] == [("j", BC)]
-    text = str(emit_plan(plan))
-    # The shell is outside the chunk program: ``j`` wraps ``chunk``. The body is
-    # a sequence (chunk loop + barrier), so the printer keeps both loops apart.
-    assert "for j in range(128):" in text
-    assert "for chunk in range(2):" in text
-    assert text.index("for j in range(128):") < text.index("for chunk in range(2):")
-    # Append a VST->VLD barrier at the end of every shell iteration: cross-iteration
-    # read-modify-writes must not race.
-    assert text.count("tl.simd.mem_bar") == 1
-    assert "VST_VLD" in text
+        @T.prim_func
+        def k(A: T.Tensor((BR, BC), "float32"), C: T.Tensor((BR,), "float32")):
+            with T.Kernel(2) as bx:
+                s = T.alloc_shared((BR, BC), "float32")
+                c = T.alloc_shared((BR,), "float32")
+                t = T.min(BC, BC + bx)
+                for i in T.Parallel(BR):
+                    for j in T.serial(t):
+                        c[i] = s[i, j]
 
+    else:
 
-def test_runtime_shell_bound_is_kept_as_a_scalar_loop():
-    """A lane-invariant runtime trip count is carried by the plan, not rejected."""
-    BR, BC = 128, 128
+        @T.prim_func
+        def k(A: T.Tensor((BR, BC), "float32"), C: T.Tensor((BR,), "float32")):
+            with T.Kernel(1):
+                s = T.alloc_shared((BR, BC), "float32")
+                c = T.alloc_shared((BR,), "float32")
+                for i in T.Parallel(BR):
+                    for j in T.serial(BC):
+                        c[i] = s[i, j]
 
-    @T.prim_func
-    def k(A: T.Tensor((BR, BC), "float32"), C: T.Tensor((BR,), "float32")):
-        with T.Kernel(2) as bx:
-            s = T.alloc_shared((BR, BC), "float32")
-            c = T.alloc_shared((BR,), "float32")
-            t = T.min(BC, BC + bx)
-            for i in T.Parallel(BR):
-                for j in T.serial(t):
-                    c[i] = s[i, j]
-
-    plan = _single_segment(k)
-    assert len(plan.shells) == 1
-    assert str(plan.shells[0].var) == "j"
-    assert not isinstance(plan.shells[0].extent, tirx.IntImm)
-    text = str(emit_plan(plan))
-    assert "for j in range(t):" in text
-    assert "for chunk in range(2):" in text
+    program = _plan(k)
+    assert len(program.segments) == 1
+    assert program.root.kind == "loop" and str(program.root.loop_var) == "j"
+    stmt = emit_plan(program)
+    names = _loop_var_names(stmt)
+    assert "j" in names
+    assert any(name.startswith("chunk") for name in names), f"chunk loop missing: {names}"
+    # ``j`` only reads ``s`` and writes ``c``: no cross-iteration conflict, so no
+    # end-of-iteration VST->VLD barrier is inserted.
+    assert "tl.simd.mem_bar" not in str(stmt)
+    if runtime_bound:
+        assert "t" in [str(extent) for extent in _for_extents(stmt)]
 
 
-def test_lane_dependent_shell_bound_is_rejected():
-    """A shell bound that reads the lane index has no lane-uniform vector form."""
+def test_lane_dependent_loop_bound_is_rejected():
+    """A loop bound that reads the lane index would leave the counter scalar."""
     BR = 64
 
     @T.prim_func
@@ -1174,7 +1141,7 @@ def test_lane_dependent_shell_bound_is_rejected():
                 for j in T.serial(i + 1):
                     c[i] = s[i, j]
 
-    with pytest.raises(Unsupported):
+    with _rejects("tree.scalar_bound"):
         _single_segment(k)
 
 
@@ -1338,3 +1305,352 @@ def test_carry_tracks_the_newest_producer():
         "segment 1's initial value and segment 2's read should both be satisfied by the carry/latest register"
     )
     assert "accs1_0[0]" in str(stmt), "the consuming segment must use the register written back by segment 1 (the newest producer)"
+
+
+# ---------------------------------------------------------------------------
+# design A: structural tree rendering + invariant I5
+# ---------------------------------------------------------------------------
+
+
+def test_emitted_regions_have_no_scalar_data_ops():
+    """I5: successful emissions contain no scalar tensor load/store."""
+    N = 128
+
+    @T.prim_func
+    def copy_k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                c[i] = a[i]
+
+    @T.prim_func
+    def predicated_k(A: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            c = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if a[i] > 0.0:
+                    c[i] = a[i]
+
+    M, K = 4, 128
+
+    @T.prim_func
+    def reduce_k(A: T.Tensor((M, K), "float32"), S: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((M, K), "float32")
+            s = T.alloc_shared((M,), "float32")
+            for i in T.Parallel(M):
+                for j in T.serial(K):
+                    s[i] = s[i] + a[i, j]
+
+    for func in (copy_k, predicated_k, reduce_k):
+        assert verify_no_scalar_data_ops(emit_plan(_plan(func))) == []
+
+    # ... and the checker really flags a scalar tensor store (negative control).
+    buf = tirx.decl_buffer((16,), "float32", name="buf", scope="shared.dyn")
+    stmt = tirx.BufferStore(buf, tirx.FloatImm("float32", 1.0), [0])
+    violations = verify_no_scalar_data_ops(stmt)
+    assert len(violations) == 1 and "buf" in violations[0]
+
+
+def _tree_chunk_nodes(node):
+    """Chunk nodes of a plan tree in emission (source) order."""
+    if node is None:
+        return []
+    if node.kind == "chunk":
+        return [node]
+    if node.kind == "seq":
+        out = []
+        for child in node.children:
+            out.extend(_tree_chunk_nodes(child))
+        return out
+    if node.kind == "loop":
+        return _tree_chunk_nodes(node.body)
+    return []
+
+
+def _contains_if(stmt):
+    """Whether an emitted region still carries scalar control flow."""
+    found = []
+
+    def visit(node):
+        if isinstance(node, tirx.IfThenElse):
+            found.append(node)
+
+    tirx.stmt_functor.post_order_visit(stmt, visit)
+    return bool(found)
+
+
+def test_tree_planner_reports_structure_errors_with_a_path():
+    """``while`` / ``allocate`` / non-transparent attr are hard ``tree.*`` errors."""
+    i = tirx.Var("i", "int32")
+    buf = tirx.decl_buffer((16,), "float32", name="c", scope="shared.dyn")
+    store = tirx.BufferStore(buf, tirx.FloatImm("float32", 0.0), [i])
+    cases = [
+        ("tree.while", tirx.While(tirx.IntImm("int32", 0), store)),
+        ("tree.alloc", tirx.AllocBuffer(buf)),
+        ("tree.opaque", tirx.AttrStmt(tirx.IntImm("int32", 1), "test_scope", tirx.IntImm("int32", 0), store)),
+    ]
+    for code, body in cases:
+        stmt = tirx.For(i, 0, 16, tirx.ForKind.PARALLEL, body)
+        with _rejects(code) as excinfo:
+            build_plan(stmt)
+        assert any(note.startswith("at body") for note in excinfo.value.diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# design A: shared outer shell (one loop around sibling shell chunks)
+#
+# The loop bodies below are deliberately *non-absorbable overwrites*: they are
+# the minimal shape that forces a plan-level ``Loop`` node.  Customer-facing
+# accumulation forms under the same guards are covered by the device suite
+# (``test_parallel_lane_uniform_branch_with_sibling_shells``).
+# ---------------------------------------------------------------------------
+
+
+def _shared_names(program) -> list[str]:
+    return [str(axis.var) for axis in program.shared_shells]
+
+
+def test_sibling_shells_share_one_outer_loop():
+    """``for _kk { for m; for n }`` (all unclean) -> one shared ``_kk`` loop.
+
+    The common ancestor is factored out as ``shared_shells`` instead of being
+    copied into every segment. The tree is ``Loop(_kk, Seq(Loop(m, Chunk),
+    Loop(n, Chunk)))`` and the shared loop is emitted exactly once. No loop needs
+    a barrier: each body only reads a/b and writes s/u.
+    """
+    MS, KS = 64, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), B: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            u = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                for _kk in T.serial(KS):
+                    for m in T.serial(KS):
+                        s[i] = a[i, m] * 2.0
+                    for n in T.serial(KS):
+                        u[i] = b[i, n] + 1.0
+
+    program = _plan(k)
+    assert isinstance(program, VectorProgram)
+    assert _shared_names(program) == ["_kk"], "the ancestor is shared, not copied"
+    assert len(program.segments) == 2
+    assert program.axes == [], "the lane axis is consumed by both segments"
+
+    # The compatibility ``segments`` view is exactly the in-order chunk list.
+    nodes = _tree_chunk_nodes(program.root)
+    assert len(nodes) == len(program.segments) == 2
+    assert all(node.chunk.same_as(segment) for node, segment in zip(nodes, program.segments))
+    assert [node.chunk.vector_axis.name for node in nodes] == [segment.vector_axis.name for segment in program.segments]
+
+    # Tree: Loop(_kk, Seq(Loop(m, Chunk), Loop(n, Chunk))); the header names the
+    # shared chain and the rendered body is the indented plan tree (never the old
+    # ``-- segment``).
+    root = program.root
+    assert root.kind == "loop" and str(root.loop_var) == "_kk"
+    assert root.body.kind == "seq" and len(root.body.children) == 2
+    assert [child.kind for child in root.body.children] == ["loop", "loop"]
+    assert [str(child.loop_var) for child in root.body.children] == ["m", "n"]
+    text = render_plan(program)
+    assert text.startswith("program: axes=[] shells=['_kk'] segments=2")
+    assert "loop _kk [0, 64)" in text and "\n  seq\n" in text
+    assert "chunk #0" in text and "chunk #1" in text and "-- segment" not in text
+
+    stmt = emit_plan(program)
+    assert tirx.ForKind.PARALLEL not in _for_kinds(stmt)
+    names = _loop_var_names(stmt)
+    assert names.count("_kk") == 1, f"the shared loop must appear once: {names}"
+    assert names.count("m") == 1 and names.count("n") == 1
+    ops = _emitted_ops(stmt)
+    assert "tl.simd.vmuls" in ops and "tl.simd.vadds" in ops
+    # Every loop only reads a/b and writes s/u: no cross-iteration conflict, so
+    # no end-of-iteration barrier is needed anywhere.
+    assert ops.count("tl.simd.mem_bar") == 0
+
+
+@pytest.mark.parametrize("condition", ["uniform", "lane_varying"])
+def test_sibling_shells_under_a_branch_are_planned(condition):
+    """``if c { for m; for n }`` keeps one loop chain per arm, guarded by masks.
+
+    Lane-uniform and lane-varying conditions take the same structural path: the
+    guard is pushed into every leaf store (``mask = c``) and no ``If`` node
+    reaches the VF (bisheng only accepts vector work there). Each arm keeps its
+    own loop chain in source order, so the arms are never zipped into one
+    ``for m, n`` loop.
+    """
+    MS, KS = 64, 64
+
+    if condition == "uniform":
+
+        @T.prim_func
+        def k(
+            A: T.Tensor((MS, KS), "float32"), B: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")
+        ):
+            with T.Kernel(1):
+                a = T.alloc_shared((MS, KS), "float32")
+                b = T.alloc_shared((MS, KS), "float32")
+                s = T.alloc_shared((MS,), "float32")
+                u = T.alloc_shared((MS,), "float32")
+                for i in T.Parallel(MS):
+                    if a[0, 0] > 0.0:
+                        for m in T.serial(KS):
+                            s[i] = a[i, m] * 2.0
+                        for n in T.serial(KS):
+                            u[i] = b[i, n] + 1.0
+
+    else:
+
+        @T.prim_func
+        def k(
+            A: T.Tensor((MS, KS), "float32"), B: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")
+        ):
+            with T.Kernel(1):
+                a = T.alloc_shared((MS, KS), "float32")
+                b = T.alloc_shared((MS, KS), "float32")
+                s = T.alloc_shared((MS,), "float32")
+                u = T.alloc_shared((MS,), "float32")
+                for i in T.Parallel(MS):
+                    if i < MS // 2:
+                        for m in T.serial(KS):
+                            s[i] = a[i, m] * 2.0
+                        for n in T.serial(KS):
+                            u[i] = b[i, n] + 1.0
+
+    program = _plan(k)
+    assert len(program.segments) == 2
+    # Every store carries the guard; the tree has no If node.
+    for segment in program.segments:
+        assert segment.stores
+        for store in segment.stores:
+            assert store.mask is not None and store.mask.recipe == "vcmps"
+    root = program.root
+    assert root.kind == "seq"
+    assert [child.kind for child in root.children] == ["loop", "loop"]
+    assert [str(child.loop_var) for child in root.children] == ["m", "n"]
+
+    stmt = emit_plan(program)
+    assert not _contains_if(stmt), "the VF contract has no scalar control flow"
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vcmps") == 2 and ops.count("tl.simd.vsts") == 2
+
+
+def test_lane_uniform_if_with_else_predicates_both_arms():
+    """A two-arm lane-uniform if predicates then with ``c`` and else with ``!c``.
+
+    Both arms are multi-chunk, so the structural path is used. The masks are
+    complementary: exactly one arm writes, matching the scalar branch.
+    """
+    MS, KS = 64, 64
+
+    @T.prim_func
+    def k(A: T.Tensor((MS, KS), "float32"), B: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            b = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            u = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                if a[0, 0] > 0.0:
+                    for m in T.serial(KS):
+                        s[i] = a[i, m] * 2.0
+                    for n in T.serial(KS):
+                        u[i] = b[i, n] + 1.0
+                else:
+                    for p in T.serial(KS):
+                        s[i] = a[i, p] * 3.0
+                    for q in T.serial(KS):
+                        u[i] = b[i, q] - 1.0
+
+    program = _plan(k)
+    assert len(program.segments) == 4
+    recipes = [store.mask.recipe for seg in program.segments for store in seg.stores]
+    assert recipes == ["vcmps"] * 4, "both arms are guarded by a vector compare"
+
+    stmt = emit_plan(program)
+    assert not _contains_if(stmt)
+    body = str(stmt)
+    # The then arm compares ``s[0] > 0`` (canonical ``0 < s[0]``); the else arm
+    # is simplified to the complementary ``s[0] <= 0``.
+    assert body.count('"lt"') == 2 and body.count('"le"') == 2
+    ops = _emitted_ops(stmt)
+    assert ops.count("tl.simd.vsts") == 4
+
+
+def test_store_and_shell_siblings_keep_source_order():
+    """N1 regression: a store that precedes a scalar loop must stay before it.
+
+    Both the plain form (``u[i] = ...`` then ``for m``) and the same shape
+    inside an ``if`` arm used to be replayed by a chunk that wrapped the loop;
+    the loop is now a plan-level node emitted after the store.
+    """
+    MS, KS = 64, 64
+
+    @T.prim_func
+    def flat(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            u = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                u[i] = u[i] + 1.0
+                for m in T.serial(KS):
+                    s[i] = a[i, m] * 2.0
+
+    @T.prim_func
+    def guarded(A: T.Tensor((MS, KS), "float32"), S: T.Tensor((MS,), "float32"), U: T.Tensor((MS,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((MS, KS), "float32")
+            s = T.alloc_shared((MS,), "float32")
+            u = T.alloc_shared((MS,), "float32")
+            for i in T.Parallel(MS):
+                if i < MS // 2:
+                    u[i] = u[i] + 1.0
+                    for m in T.serial(KS):
+                        s[i] = a[i, m] * 2.0
+
+    for kernel in (flat, guarded):
+        program = _plan(kernel)
+        root = program.root
+        assert root.kind == "seq"
+        assert [child.kind for child in root.children] == ["chunk", "loop"]
+        assert str(root.children[1].loop_var) == "m"
+        text = str(emit_plan(program))
+        assert text.index("access_ptr(u[0]") < text.index("for m in range(64):")
+
+
+def test_stores_under_one_guard_share_a_single_compare():
+    """Two stores generated from one source ``if`` share the predicate: the
+    condition is built once per chunk and P3 binds one ``vcmps`` for both.
+
+    The guard reads ``a[0]`` -- a buffer the nest does not write.  A guard on a
+    buffer the nest also writes (e.g. ``s[0]`` while storing to ``s[i]``) is a
+    read/write race that P1 rejects as ILLEGAL, so it never reaches the planner.
+    """
+    N = 64
+
+    @T.prim_func
+    def k(A: T.Tensor((N,), "float32"), B: T.Tensor((N,), "float32"), S: T.Tensor((N,), "float32"), U: T.Tensor((N,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((N,), "float32")
+            b = T.alloc_shared((N,), "float32")
+            s = T.alloc_shared((N,), "float32")
+            u = T.alloc_shared((N,), "float32")
+            for i in T.Parallel(N):
+                if a[0] > 0.0:
+                    s[i] = a[i] * 2.0
+                    u[i] = b[i] + 1.0
+
+    program = _plan(k)
+    assert len(program.segments) == 1
+    segment = program.segments[0]
+    assert len(segment.stores) == 2
+    assert segment.stores[0].mask.same_as(segment.stores[1].mask)
+    ops = _emitted_ops(emit_plan(program))
+    assert ops.count("tl.simd.vcmps") == 1
+    assert ops.count("tl.simd.vsts") == 2
