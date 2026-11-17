@@ -1885,16 +1885,6 @@ PrimExpr StoreMask(const StorePlan &store, Emitter *emitter, int bits) {
   return mask;
 }
 
-/*! \brief Whether a store needs a read-modify-write merge (predicate / tail).
- */
-bool StoreNeedsMerge(const StorePlan &store, Emitter *emitter, int bits) {
-  bool predicate =
-      store->mask.has_value() &&
-      !emitter->GuardFree(store->mask_free_until, store->mask_free_from);
-  bool tail = emitter->TailMask(bits).defined();
-  return predicate || tail;
-}
-
 void EmitVectorWrite(const StorePlan &store, Emitter *emitter, int bits,
                      const PrimExpr &mask) {
   PrimExpr value = emitter->VectorOperand(store->value);
@@ -2617,25 +2607,56 @@ std::vector<Axis> InnerAxes(const VectorPlan &plan,
   return inner;
 }
 
+/*! \brief Per-segment axis counters that must be rebound with a fresh Var. */
+using AxisRenames = std::map<const tirx::VarNode *, tirx::Var>;
+
+/*!
+ * \brief Wrap ``body`` in a serial loop over ``axis``.
+ *
+ * When ``renames`` maps the axis counter, the loop binds a fresh Var and the
+ * body's uses are renamed with it: a program emits several segment bodies
+ * sequentially, and one Var may only be bound once per statement.
+ */
+Stmt WrapSerialAxis(const Axis &axis, const AxisRenames &renames, Stmt body) {
+  auto it = renames.find(axis->var.get());
+  if (it == renames.end()) {
+    return tirx::For(axis->var, IntImm32(0), axis->extent, ForKind::kSerial,
+                     std::move(body));
+  }
+  const tirx::Var &fresh = it->second;
+  if (body.defined()) {
+    body = tirx::Substitute(
+        body, [&](const tirx::Var &var) -> ffi::Optional<PrimExpr> {
+          if (var.same_as(axis->var))
+            return ffi::Optional<PrimExpr>(fresh);
+          return ffi::Optional<PrimExpr>();
+        });
+  }
+  return tirx::For(fresh, IntImm32(0), axis->extent, ForKind::kSerial,
+                   std::move(body));
+}
+
 std::pair<std::vector<Stmt>, Stmt>
 EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
                  const tirx::Var &chunk, const std::vector<Axis> &hoisted,
                  const std::string &prefix, bool single,
                  ProgramPrologue *shared,
-                 std::map<std::string, CarryEntry> *carry, bool allow_carry);
+                 std::map<std::string, CarryEntry> *carry, bool allow_carry,
+                 const AxisRenames &renames);
 
 std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     const VectorPlan &plan, arith::Analyzer *analyzer, const tirx::Var &chunk,
     const std::string &prefix, const std::vector<Axis> &hoisted, bool single,
     ProgramPrologue *shared, std::map<std::string, CarryEntry> *carry,
-    bool allow_carry);
+    bool allow_carry, const AxisRenames &renames);
 
 std::pair<std::vector<Stmt>, Stmt>
 EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
                  const tirx::Var &chunk, const std::vector<Axis> &hoisted,
                  const std::string &prefix, bool single,
                  ProgramPrologue *shared,
-                 std::map<std::string, CarryEntry> *carry, bool allow_carry) {
+                 std::map<std::string, CarryEntry> *carry, bool allow_carry,
+                 const AxisRenames &renames) {
   // A parallel vector axis with inner axes uses the hand-written three-part
   // structure (pre -> for inner: main -> post) so pre/post run once per chunk.
   std::vector<Axis> inner = InnerAxes(plan, hoisted);
@@ -2647,7 +2668,7 @@ EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
     }
     std::pair<std::vector<Stmt>, Stmt> parts =
         EmitParallelAxisParts(plan, analyzer, chunk, prefix, hoisted, single,
-                              shared, carry, allow_carry);
+                              shared, carry, allow_carry, renames);
     // The three-part structure only loops the axes inside the vector axis; an
     // outer axis that the program does not hoist still needs its serial loop,
     // otherwise the emitted body references its variable unbound (a multi-
@@ -2659,8 +2680,7 @@ EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
         continue;
       if (HasHoisted(hoisted, axis))
         continue;
-      body = tirx::For(axis->var, IntImm32(0), axis->extent, ForKind::kSerial,
-                       body);
+      body = WrapSerialAxis(axis, renames, std::move(body));
     }
     return {parts.first, body};
   }
@@ -2718,6 +2738,8 @@ EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
       all_bind_or_eval = false;
     }
   }
+  // A scalar shell is emitted inside the parallel axes but outside the chunk
+  // program, so a value that reads its counter must not be hoisted out of it.
   const bool has_shells = !plan->shells.empty();
   if (single && !has_shells && (!wrap_axes.empty() || !hoisted.empty()) &&
       all_bind_or_eval) {
@@ -2758,8 +2780,7 @@ EmitSegmentStmts(const VectorPlan &plan, arith::Analyzer *analyzer,
       continue;
     if (HasHoisted(hoisted, axis))
       continue;
-    body =
-        tirx::For(axis->var, IntImm32(0), axis->extent, ForKind::kSerial, body);
+    body = WrapSerialAxis(axis, renames, std::move(body));
   }
 
   HoistedPre hoisted_pre = EmitHoistedPreStores(plan, analyzer, pre.invariant,
@@ -2989,7 +3010,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
     const VectorPlan &plan, arith::Analyzer *analyzer, const tirx::Var &chunk,
     const std::string &prefix, const std::vector<Axis> &hoisted, bool single,
     ProgramPrologue *shared, std::map<std::string, CarryEntry> *carry,
-    bool allow_carry) {
+    bool allow_carry, const AxisRenames &renames) {
   TVM_FFI_ICHECK(!ReduceOf(plan).defined())
       << "a parallel vector axis with pre/post must go through the elementwise "
          "path";
@@ -3191,8 +3212,7 @@ std::pair<std::vector<Stmt>, Stmt> EmitParallelAxisParts(
                             ForKind::kSerial, main_stmt);
     }
     for (auto it = inner.rbegin(); it != inner.rend(); ++it) {
-      main_stmt = tirx::For((*it)->var, IntImm32(0), (*it)->extent,
-                            ForKind::kSerial, main_stmt);
+      main_stmt = WrapSerialAxis(*it, renames, std::move(main_stmt));
     }
     std::vector<Stmt> out = prefix_stmts;
     out.push_back(main_stmt);
@@ -3226,50 +3246,256 @@ bool SegmentConsumesCarry(const VectorPlan &segment,
   return true;
 }
 
-Stmt EmitProgram(const VectorProgram &program) {
-  for (const Axis &axis : program->axes) {
-    TVM_FFI_ICHECK(axis->is_parallel)
-        << "program.axes may only hold hoisted T.Parallel axes";
-  }
+/* ------------------------------------------------------------------------- */
+/* structural tree emission (design A)                                       */
+/* ------------------------------------------------------------------------- */
+
+/*! \brief One chunk's emission result: prologue + vector program body. */
+struct TreeEmitResult {
+  std::vector<Stmt> prologue;
+  Stmt body;
+};
+
+struct TreeEmitState {
   ProgramPrologue shared;
   std::map<std::string, CarryEntry> carry;
-  // One Analyzer for the whole program: every chunk / segment emitter shares
-  // it, so a multi-chunk segment no longer builds one analyzer per chunk.
+  std::map<const tirx::VarNode *, int> wrap_count;
+  std::set<const tirx::VarNode *> bound_axes;
+  std::vector<Axis> hoisted; // materialized ancestor loop axes
+  bool single{false};
+  int64_t chunk_count{0};
+  int64_t chunk_index{0};
   arith::Analyzer analyzer;
-  std::vector<Stmt> prologue;
-  std::vector<Stmt> bodies;
-  for (size_t index = 0; index < program->segments.size(); ++index) {
-    tirx::Var seg_chunk("chunk_s" + std::to_string(index), DataType::Int(32));
-    std::vector<Axis> hoisted(program->axes.begin(), program->axes.end());
+};
+
+/*!
+ * \brief Pre-walk the tree: chunk count + how often each non-vector axis is
+ * wrapped.
+ *
+ * A non-hoisted axis may be wrapped by several chunk bodies sequentially; one
+ * ``Var`` can only be bound once per statement, so every repetition after the
+ * first gets a fresh Var (same name, own identity). Axes bound by an ancestor
+ * ``Loop`` node are skipped here, matching the legacy ``wrap_count`` that
+ * ignored program-level hoisted axes.
+ */
+void CollectChunkStats(const PlanNode &node,
+                       std::set<const tirx::VarNode *> *ancestor_loops,
+                       int64_t *count,
+                       std::map<const tirx::VarNode *, int> *wrap_count) {
+  if (!node.defined())
+    return;
+  switch (node->kind) {
+  case PlanKind::kChunk:
+    ++*count;
+    for (const Axis &axis : node->chunk->axes) {
+      if (axis->var.same_as(node->chunk->vector_axis->var))
+        continue;
+      if (ancestor_loops->count(axis->var.get()) != 0)
+        continue;
+      ++(*wrap_count)[axis->var.get()];
+    }
+    return;
+  case PlanKind::kSeq:
+    for (const ffi::ObjectRef &child : node->children)
+      CollectChunkStats(Downcast<PlanNode>(child), ancestor_loops, count,
+                        wrap_count);
+    return;
+  case PlanKind::kLoop:
+    ancestor_loops->insert(node->loop_var.get());
+    if (node->body.defined())
+      CollectChunkStats(Downcast<PlanNode>(node->body), ancestor_loops, count,
+                        wrap_count);
+    ancestor_loops->erase(node->loop_var.get());
+    return;
+  }
+}
+
+TreeEmitResult EmitTreeNode(const PlanNode &node, TreeEmitState *state,
+                            const std::string &prefix) {
+  if (!node.defined())
+    return {{}, Stmt()};
+  switch (node->kind) {
+  case PlanKind::kChunk: {
+    const VectorPlan &plan = node->chunk;
+    tirx::Var chunk("chunk_s" + std::to_string(state->chunk_index),
+                    DataType::Int(32));
+    AxisRenames renames;
+    for (const Axis &axis : plan->axes) {
+      if (axis->var.same_as(plan->vector_axis->var))
+        continue;
+      if (HasHoisted(state->hoisted, axis))
+        continue;
+      if (state->wrap_count[axis->var.get()] <= 1)
+        continue;
+      if (state->bound_axes.insert(axis->var.get()).second)
+        continue; // first binding keeps the original counter
+      renames[axis->var.get()] =
+          tirx::Var(axis->var->name_hint, axis->var->dtype);
+    }
     auto emitted = EmitSegmentStmts(
-        program->segments[index], &analyzer, seg_chunk, hoisted,
-        "s" + std::to_string(index) + "_", program->segments.size() == 1,
-        &shared, &carry,
-        SegmentConsumesCarry(program->segments[index], hoisted));
-    for (Stmt &stmt : emitted.first)
-      prologue.push_back(std::move(stmt));
-    bodies.push_back(emitted.second);
+        plan, &state->analyzer, chunk, state->hoisted,
+        prefix + "s" + std::to_string(state->chunk_index) + "_", state->single,
+        &state->shared, &state->carry,
+        SegmentConsumesCarry(plan, state->hoisted), renames);
+    ++state->chunk_index;
+    return {std::move(emitted.first), std::move(emitted.second)};
   }
-  Stmt body = SeqOfVec(bodies)[0];
-  for (auto it = program->axes.rbegin(); it != program->axes.rend(); ++it) {
-    body = tirx::For((*it)->var, IntImm32(0), (*it)->extent, ForKind::kSerial,
-                     body);
+  case PlanKind::kLoop: {
+    Axis axis = MakeAxis(node->loop_var, node->extent, 0,
+                         static_cast<ForKind>(node->for_kind));
+    state->hoisted.push_back(axis);
+    TreeEmitResult inner =
+        node->body.defined()
+            ? EmitTreeNode(Downcast<PlanNode>(node->body), state, prefix)
+            : TreeEmitResult{};
+    state->hoisted.pop_back();
+
+    std::vector<Stmt> body_stmts;
+    for (Stmt &stmt : inner.prologue)
+      body_stmts.push_back(std::move(stmt));
+    if (inner.body.defined())
+      body_stmts.push_back(std::move(inner.body));
+    if (node->barrier_at_end)
+      body_stmts.push_back(VstVldBarrier());
+    Stmt body = body_stmts.empty() ? Stmt() : SeqOfVec(body_stmts)[0];
+    Stmt loop = tirx::For(node->loop_var, node->min, node->extent,
+                          ForKind::kSerial, body);
+    return {{}, loop}; // the prologue stays inside the loop (I7)
   }
+  case PlanKind::kSeq: {
+    std::vector<Stmt> prologue;
+    std::vector<Stmt> bodies;
+    for (const ffi::ObjectRef &child_ref : node->children) {
+      PlanNode child = Downcast<PlanNode>(child_ref);
+      TreeEmitResult part = EmitTreeNode(child, state, prefix);
+      for (Stmt &stmt : part.prologue)
+        prologue.push_back(std::move(stmt));
+      if (part.body.defined())
+        bodies.push_back(std::move(part.body));
+    }
+    Stmt body = bodies.empty() ? Stmt() : SeqOfVec(bodies)[0];
+    return {std::move(prologue), body};
+  }
+  }
+  return {{}, Stmt()};
+}
+
+Stmt EmitTreeProgram(const PlanNode &root) {
+  TreeEmitState state;
+  std::set<const tirx::VarNode *> ancestor_loops;
+  CollectChunkStats(root, &ancestor_loops, &state.chunk_count,
+                    &state.wrap_count);
+  state.single = state.chunk_count == 1;
+  TreeEmitResult emitted = EmitTreeNode(root, &state, "");
   std::vector<Stmt> all;
-  for (Stmt &stmt : shared.statements)
+  for (Stmt &stmt : state.shared.statements)
     all.push_back(std::move(stmt));
-  for (Stmt &stmt : prologue)
+  for (Stmt &stmt : emitted.prologue)
     all.push_back(std::move(stmt));
-  all.push_back(body);
+  if (emitted.body.defined())
+    all.push_back(std::move(emitted.body));
+  if (all.empty())
+    return Stmt();
   return SeqOfVec(all)[0];
 }
 
+/* ------------------------------------------------------------------------- */
+/* invariant I5: no scalar data instructions                                 */
+/* ------------------------------------------------------------------------- */
+
+namespace {
+
+/*!
+ * \brief Collects scalar data instructions in an emitted region.
+ *
+ * Allowed scalar uses (I5): loop bounds, branch conditions, ``tl.access_ptr``
+ * addresses, chunk indices and ``Bind`` values. Everything else that reads or
+ * writes a tensor element lane-by-lane is a violation.
+ */
+class ScalarDataOpVisitor : public tirx::StmtExprVisitor {
+public:
+  std::vector<std::string> violations;
+
+  void Run(const tirx::Stmt &stmt) { VisitStmt(stmt); }
+
+protected:
+  void VisitStmt_(const tirx::BufferStoreNode *op) final {
+    violations.push_back("scalar BufferStore to '" +
+                         op->buffer->name.operator std::string() + "'");
+  }
+
+  void VisitStmt_(const tirx::ForNode *op) final {
+    ++allowed_;
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    --allowed_;
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const tirx::IfThenElseNode *op) final {
+    ++allowed_;
+    VisitExpr(op->condition);
+    --allowed_;
+    VisitStmt(op->then_case);
+    if (op->else_case.has_value())
+      VisitStmt(*op->else_case);
+  }
+
+  void VisitStmt_(const tirx::BindNode *op) final {
+    ++allowed_;
+    VisitExpr(op->value);
+    --allowed_;
+  }
+
+  void VisitExpr_(const tirx::BufferLoadNode *op) final {
+    if (in_simd_ == 0 && allowed_ == 0) {
+      violations.push_back("scalar BufferLoad from '" +
+                           op->buffer->name.operator std::string() + "'");
+    }
+    for (const PrimExpr &index : op->indices)
+      VisitExpr(index);
+  }
+
+  void VisitExpr_(const tirx::CallNode *op) final {
+    std::string name;
+    if (const auto *fn = op->op.as<OpNode>())
+      name = fn->name;
+    const bool vector_channel =
+        name.rfind("tl.simd", 0) == 0 || name == "tl.access_ptr";
+    if (vector_channel)
+      ++in_simd_;
+    for (const PrimExpr &arg : op->args)
+      VisitExpr(arg);
+    if (vector_channel)
+      --in_simd_;
+  }
+
+private:
+  int allowed_{0};
+  int in_simd_{0};
+};
+
 } // namespace
+
+} // namespace
+
+bool VerifyNoScalarDataOps(const tirx::Stmt &stmt,
+                           std::vector<std::string> *violations) {
+  ScalarDataOpVisitor visitor;
+  if (stmt.defined())
+    visitor.Run(stmt);
+  if (violations != nullptr)
+    *violations = visitor.violations;
+  return visitor.violations.empty();
+}
 
 tirx::Stmt EmitPlan(const ffi::ObjectRef &plan) {
   ResetBufferKeyCache();
   if (const auto *program = plan.as<VectorProgramNode>()) {
-    return EmitProgram(ffi::GetRef<VectorProgram>(program));
+    VectorProgram node = ffi::GetRef<VectorProgram>(program);
+    TVM_FFI_ICHECK(node->root.defined())
+        << "the program has no structural plan tree";
+    return EmitTreeProgram(Downcast<PlanNode>(node->root));
   }
   const auto *single = plan.as<VectorPlanNode>();
   TVM_FFI_ICHECK(single != nullptr)
@@ -3278,7 +3504,8 @@ tirx::Stmt EmitPlan(const ffi::ObjectRef &plan) {
   tirx::Var chunk("chunk", DataType::Int(32));
   arith::Analyzer analyzer;
   auto emitted = EmitSegmentStmts(node, &analyzer, chunk, {}, "",
-                                  /*single=*/true, nullptr, nullptr, false);
+                                  /*single=*/true, nullptr, nullptr, false,
+                                  AxisRenames{});
   std::vector<Stmt> all;
   for (Stmt &stmt : emitted.first)
     all.push_back(std::move(stmt));

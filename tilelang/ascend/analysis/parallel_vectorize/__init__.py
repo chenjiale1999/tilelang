@@ -27,6 +27,7 @@ from ._ffi import (
     AccessClass,
     AccessInfo,
     Axis,
+    PlanNode,
     ReduceInfo,
     StorePlan,
     StoreSpec,
@@ -39,12 +40,14 @@ from ._ffi import (
     emit_plan,
     finite_difference,
     render_plan,
+    verify_no_scalar_data_ops,
 )
 
 __all__ = [
     "Axis",
     "AccessClass",
     "AccessInfo",
+    "PlanNode",
     "StoreSpec",
     "ValueNode",
     "StorePlan",
@@ -57,4 +60,5 @@ __all__ = [
     "build_plan",
     "emit_plan",
     "render_plan",
+    "verify_no_scalar_data_ops",
 ]

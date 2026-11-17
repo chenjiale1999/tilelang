@@ -1129,6 +1129,13 @@ def test_atomic_rejected():
 
 
 def test_nested_loop_rejected():
+    """A lane-varying predicate on a shared scalar accumulator has no vector form.
+
+    ``if a[tm, g_i] != 0: cnt[0] += 1`` increments ``cnt[0]`` once per satisfying
+    ``(tm, g_i)``; vectorizing ``tm`` would make several lanes race on the same
+    scalar. The tree planner rejects it at the leaf instead of emitting a single
+    masked broadcast of ``cnt[0] + 1``.
+    """
     S, KD = 16, 16
 
     @T.prim_func
@@ -1144,7 +1151,7 @@ def test_nested_loop_rejected():
                         cnt[0] += 1
                         c[tm, g_i] = a[tm, g_i]
 
-    with _rejects("body.nested_loop"):
+    with _rejects("plan.lane_varying_uniform_store"):
         _plan(k)
 
 
@@ -1304,9 +1311,12 @@ def test_direct_serial_private_scalar_absorbed():
 
 
 def test_serial_shared_scalar_rejected():
-    """S4 boundary: reduction into a **shared scalar** ``cnt[0] += 1``. The destination
-    address is invariant along the serial axis and the value does not vary with the
-    axis (not a legal reduction) -> absorption is rejected."""
+    """S4 boundary: a lane-varying predicate on a **shared scalar** accumulator.
+
+    ``if a[i, j] != 0: cnt[0] += 1`` increments ``cnt[0]`` once per satisfying
+    lane; the per-lane condition has no vector form (a cross-lane count is not a
+    mask), so the leaf is rejected.
+    """
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1321,7 +1331,7 @@ def test_serial_shared_scalar_rejected():
                         cnt[0] += 1
                         c[i, j] = a[i, j]
 
-    with _rejects("body.nested_loop"):
+    with _rejects("plan.lane_varying_uniform_store"):
         _plan(k)
 
 
@@ -1579,9 +1589,14 @@ def test_multi_serial_compose_keeps_source_order():
     assert ops.index("tl.simd.vmuls") < ops.index("tl.simd.vadds")
 
 
-def test_multi_serial_leading_statement_is_first_segment_pre():
-    """A statement group before the first segment belongs to that segment's ``pre`` (it runs
-    once per parallel iteration, outside the chunk loop)."""
+def test_multi_serial_leading_statement_is_a_source_order_chunk():
+    """A statement group before the first loop chain becomes its own chunk.
+
+    Design A §7: the plan mirrors the IR, so ``s[i] = 0`` is ``Chunk[s]`` and the
+    two loop chains are the following chunks, emitted in source order. (The
+    single-chain case still folds an identity initializer into the reduction's
+    ``pre`` through the whole-body fast path.)
+    """
     MS, KS = 64, 8
 
     @T.prim_func
@@ -1599,8 +1614,9 @@ def test_multi_serial_leading_statement_is_first_segment_pre():
 
     program = _plan(k)
     assert isinstance(program, VectorProgram)
-    assert [store.spec.buffer.name for store in program.segments[0].pre_stores] == ["s"]
-    assert program.segments[1].pre_stores == []
+    assert [seg.stores[0].spec.buffer.name for seg in program.segments] == ["s", "s", "c"]
+    assert program.segments[0].stores[0].value.recipe == "imm"
+    assert [store.spec.buffer.name for store in program.segments[1].pre_stores] == []
 
 
 def test_multi_serial_one_unclean_is_rejected():
@@ -1795,5 +1811,5 @@ def test_multi_segment_failure_reason_is_preserved():
     with _rejects("unsupported") as excinfo:
         _plan(k)
     notes = excinfo.value.diagnostics
-    assert any(note.startswith("segment 1") for note in notes)
-    assert any("not supported" in note for note in notes)
+    assert any(note.startswith("at ") for note in notes), notes
+    assert "not supported" in str(excinfo.value), str(excinfo.value)

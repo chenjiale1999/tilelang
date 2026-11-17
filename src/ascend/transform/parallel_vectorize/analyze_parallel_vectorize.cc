@@ -103,6 +103,8 @@ std::string OptionalIntText(const ffi::Optional<int64_t> &value) {
   return value.has_value() ? std::to_string(*value) : "None";
 }
 
+std::string RenderTree(const PlanNode &root);
+
 /*! \brief Python ``f"{buffer.name}{list(indices)}"``. */
 std::string SinkText(const StoreSpec &spec) {
   std::string out = spec->buffer->name.operator std::string() + "[";
@@ -214,14 +216,29 @@ std::string RenderPlanText(const ffi::ObjectRef &plan) {
   for (const Axis &axis : node->axes)
     names.push_back(axis->name.operator std::string());
   std::vector<std::string> lines;
-  lines.push_back("program: axes=" + PyStrList(names) +
-                  " segments=" + std::to_string(node->segments.size()));
-  for (size_t index = 0; index < node->segments.size(); ++index) {
-    lines.push_back("-- segment " + std::to_string(index) + " --");
-    for (const std::string &line :
-         RenderSinglePlan(node->segments[index], {})) {
-      lines.push_back(line);
-    }
+  std::string header = "program: axes=" + PyStrList(names);
+  if (!node->shared_shells.empty()) {
+    std::vector<std::string> shells;
+    for (const Axis &shell : node->shared_shells)
+      shells.push_back(shell->name.operator std::string());
+    header += " shells=" + PyStrList(shells);
+  }
+  header += " segments=" + std::to_string(node->segments.size());
+  lines.push_back(header);
+  // The plan tree is the single emission source and ``build_plan`` always sets
+  // it; a rootless program would be a construction bug, not a fallback shape.
+  TVM_FFI_ICHECK(node->root.defined())
+      << "render_plan expects a VectorProgram with a plan tree";
+  // Structural tree (design A): the legacy header stays, every node is
+  // indented by its depth. Chunk nodes still print the full plan detail.
+  std::string tree = RenderTree(Downcast<PlanNode>(node->root));
+  size_t begin = 0;
+  while (begin < tree.size()) {
+    size_t end = tree.find('\n', begin);
+    if (end == std::string::npos)
+      break;
+    lines.push_back(tree.substr(begin, end - begin));
+    begin = end + 1;
   }
   if (!node->diagnostics.empty()) {
     lines.push_back("diagnostics:");
@@ -233,6 +250,51 @@ std::string RenderPlanText(const ffi::ObjectRef &plan) {
   for (size_t i = 0; i < lines.size(); ++i)
     out += (i == 0 ? "" : "\n") + lines[i];
   return out;
+}
+
+std::string RenderPlanNode(const PlanNode &node, int depth,
+                           int64_t *chunk_index) {
+  if (!node.defined())
+    return "";
+  const std::string pad(static_cast<size_t>(depth) * 2, ' ');
+  switch (node->kind) {
+  case PlanKind::kSeq: {
+    std::string out = pad + "seq\n";
+    for (const ffi::ObjectRef &child : node->children)
+      out += RenderPlanNode(Downcast<PlanNode>(child), depth + 1, chunk_index);
+    return out;
+  }
+  case PlanKind::kLoop: {
+    std::string out =
+        pad + "loop " + node->loop_var->name_hint.operator std::string() + " [" +
+        PrintExpr(node->min) + ", " + PrintExpr(node->extent) + ")" +
+        (node->barrier_at_end ? " barrier" : "") + "\n";
+    if (node->body.defined())
+      out += RenderPlanNode(Downcast<PlanNode>(node->body), depth + 1,
+                            chunk_index);
+    return out;
+  }
+  case PlanKind::kChunk: {
+    const VectorPlan &plan = node->chunk;
+    std::string out =
+        pad + "chunk #" + std::to_string(*chunk_index) +
+        ": vector_axis=" + plan->vector_axis->name.operator std::string() +
+        " lanes=" + std::to_string(plan->lanes) + " chunks=" +
+        OptionalIntText(plan->chunks) + " tail=" + OptionalIntText(plan->tail) +
+        "\n";
+    ++*chunk_index;
+    for (const std::string &line : RenderSinglePlan(plan, {}))
+      out += pad + "  " + line + "\n";
+    return out;
+  }
+  }
+  return "";
+}
+
+/*! \brief Indented structural tree (the legacy header is kept above it). */
+std::string RenderTree(const PlanNode &root) {
+  int64_t chunk_index = 0;
+  return RenderPlanNode(root, /*depth=*/0, &chunk_index);
 }
 
 } // namespace
@@ -255,6 +317,19 @@ ffi::Map<ffi::String, ffi::Any> AscendParallelVectorizeBuildPlan(
 ffi::Map<ffi::String, ffi::Any>
 AscendParallelVectorizeEmitPlan(const ffi::ObjectRef &plan) {
   return Guarded([&]() { return MakeOk("stmt", ffi::Any(EmitPlan(plan))); });
+}
+
+ffi::Map<ffi::String, ffi::Any> AscendParallelVectorizeVerifyNoScalarDataOps(
+    const tirx::Stmt &stmt) {
+  std::vector<std::string> violations;
+  VerifyNoScalarDataOps(stmt, &violations);
+  ffi::Array<ffi::String> notes;
+  for (const std::string &note : violations)
+    notes.push_back(note);
+  ffi::Map<ffi::String, ffi::Any> result;
+  result.Set("ok", ffi::Any(violations.empty()));
+  result.Set("violations", ffi::Any(notes));
+  return result;
 }
 
 ffi::Map<ffi::String, ffi::Any>
@@ -286,6 +361,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         AscendParallelVectorizeBuildPlan);
   refl::GlobalDef().def("tl.transform.AscendParallelVectorizeEmitPlan",
                         AscendParallelVectorizeEmitPlan);
+  refl::GlobalDef().def("tl.transform.AscendParallelVectorizeVerifyNoScalarDataOps",
+                        AscendParallelVectorizeVerifyNoScalarDataOps);
   refl::GlobalDef().def("tl.transform.AscendParallelVectorizeRenderPlan",
                         AscendParallelVectorizeRenderPlan);
   refl::GlobalDef().def("tl.transform.AscendParallelVectorizeFiniteDifference",

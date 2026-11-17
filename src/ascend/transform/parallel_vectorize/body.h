@@ -96,6 +96,10 @@ struct ShellLoop {
   PrimExpr extent;
 };
 
+/*! \brief Would :func:`NormalizeBody` keep this serial loop as a real scalar
+ * shell? */
+TVM_DLL bool IsScalarShell(const tirx::ForNode *loop);
+
 /*! \brief Normalize a body into an ordered list of store specs. */
 std::vector<StoreSpec> NormalizeBody(const tirx::Stmt &stmt,
                                      const AliasMap &aliases,

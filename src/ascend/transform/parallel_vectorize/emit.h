@@ -32,6 +32,18 @@ TVM_DLL tirx::Stmt EmitPlan(const ffi::ObjectRef &plan);
  */
 TVM_DLL tirx::Stmt VstVldBarrier();
 
+/*!
+ * \brief Invariant I5 check: no scalar data instruction in an emitted region.
+ *
+ * A ``BufferStore`` to a tensor element and a ``BufferLoad`` used as a scalar
+ * data operand are forbidden inside ``T.SimdVF`` (bisheng refuses them). Scalar
+ * values are only allowed in loop bounds, branch conditions, ``tl.access_ptr``
+ * addresses, chunk indices and ``Bind`` values. Returns true when clean; fills
+ * ``violations`` with one line per offending statement otherwise.
+ */
+TVM_DLL bool VerifyNoScalarDataOps(const tirx::Stmt &stmt,
+                                   std::vector<std::string> *violations);
+
 } // namespace parallel_vectorize
 } // namespace tl
 } // namespace tvm

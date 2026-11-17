@@ -353,3 +353,69 @@ def test_parallel_same_buffer_disjoint_arm_addresses():
     expected[0::2][positive] = 1.0
     expected[1::2][~positive] = 2.0
     _assert_close(c_npu, expected)
+
+
+# ---------------------------------------------------------------------------
+# structural plan (design A): a lane-uniform branch with sibling shells
+# ---------------------------------------------------------------------------
+
+
+@tilelang.testing.requires_ascend
+def test_parallel_lane_uniform_branch_with_sibling_shells():
+    """``if flag[0] > 0 { for m; for n }``: predicated, no scalar branch.
+
+    The condition is lane-uniform, but a real ``if`` inside ``__simd_vf__`` is
+    scalar control flow, which bisheng/AIV does not support (and InsertSync only
+    tracks ``PIPE_V``). The planner therefore pushes the guard down as a store
+    mask: both chunks run with ``mask = flag[0] > 0``. The test runs the flag
+    both set and clear, so the masked-off arm is checked too.
+    """
+    rows, k = 8, 64
+
+    @T.prim_func
+    def main(FLAG: T.Tensor((1,), F32), A: T.Tensor((rows, k), F32),
+             B: T.Tensor((rows, k), F32), S: T.Tensor((rows,), F32),
+             U: T.Tensor((rows,), F32)):
+        with T.Kernel(1):
+            flag_ub = T.alloc_shared((1,), F32)
+            a_ub = T.alloc_shared((rows, k), F32)
+            b_ub = T.alloc_shared((rows, k), F32)
+            s_ub = T.alloc_shared((rows,), F32)
+            u_ub = T.alloc_shared((rows,), F32)
+            T.copy(FLAG, flag_ub)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            T.fill(s_ub, -1.0)
+            T.fill(u_ub, -2.0)
+            with T.SimdVF():
+                for i in T.Parallel(rows):
+                    if flag_ub[0] > 0.0:
+                        for m in T.serial(k):
+                            s_ub[i] = a_ub[i, m] * 2.0
+                        for n in T.serial(k):
+                            u_ub[i] = b_ub[i, n] + 1.0
+            T.copy(s_ub, S)
+            T.copy(u_ub, U)
+
+    kernel, source = _compile(main, out_idx=None)
+    assert "if (" not in source, "the VF contract has no scalar control flow"
+    assert "simd_inst::vcmps" in source, "the guard becomes a vector store mask"
+    assert source.count("for (int32_t m") == 1
+    assert source.count("for (int32_t n") == 1
+    assert source.count("simd_inst::vsts_norm(") == 2, "one store per arm chunk"
+
+    a = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 7).to(torch.float32)
+    b = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 5).to(torch.float32)
+
+    s_on = torch.full((rows,), -1.0).npu()
+    u_on = torch.full((rows,), -2.0).npu()
+    kernel(torch.tensor([1.0]).npu(), a.npu(), b.npu(), s_on, u_on)
+    _assert_close(s_on, a[:, -1] * 2.0)
+    _assert_close(u_on, b[:, -1] + 1.0)
+
+    # The dead arm must leave both destinations untouched.
+    s_off = torch.full((rows,), -1.0).npu()
+    u_off = torch.full((rows,), -2.0).npu()
+    kernel(torch.tensor([-1.0]).npu(), a.npu(), b.npu(), s_off, u_off)
+    _assert_close(s_off, torch.full((rows,), -1.0))
+    _assert_close(u_off, torch.full((rows,), -2.0))

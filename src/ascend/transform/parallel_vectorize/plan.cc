@@ -217,19 +217,6 @@ AbsorbParallelChain(const Stmt &stmt, arith::Analyzer *analyzer) {
   return {axes, current};
 }
 
-void RecordSerialReason(std::vector<std::string> *notes, const tirx::For &loop,
-                        const std::string &reason) {
-  if (notes == nullptr)
-    return;
-  std::string note =
-      "serial loop '" + loop->loop_var->name_hint.operator std::string() +
-      "': " +
-      (reason.empty() ? std::string("loop-carried dependence") : reason);
-  if (std::find(notes->begin(), notes->end(), note) == notes->end()) {
-    notes->push_back(note);
-  }
-}
-
 bool IsCumulativeWrite(const tirx::BufferStoreNode *store) {
   bool found = false;
   tirx::PostOrderVisit(store->value, [&](const ffi::ObjectRef &node) {
@@ -330,10 +317,10 @@ std::pair<bool, std::string> SerialIsClean(const tirx::For &loop,
 }
 
 /*!
- * \brief One segment before planning: axes + (pre, main, post) statements.
+ * \brief One chunk source: axes + (pre, main, post) statements.
  *
- * A segment is the unit handed to :func:`PlanSegment`; the segmenter below is
- * the only place that decides how a VF body is cut into these.
+ * The unit handed to :func:`PlanSegment`; the tree planner builds it from the
+ * context scope plus the loop chain it can absorb.
  */
 struct SegmentSource {
   std::vector<Axis> axes;
@@ -349,151 +336,34 @@ struct SegmentSource {
 };
 
 /*!
- * \brief The single-segment shape of a body (the former ``SplitNest``).
+ * \brief Whether a statement keeps two sibling scalar shells at one level.
  *
- * Absorbs the parallel chain plus every following parallel / clean serial loop,
- * then splits a ``SeqStmt`` holding exactly one clean serial loop into
- * pre/main/post, so loop-carried siblings stay in the same segment.
+ * Such a body cannot be one chunk (a plan carries a single shell chain). The
+ * planner keeps its structure (one ``Loop``/chunk per chain) instead of nesting
+ * the shells; the recursion into ``if`` arms is deliberate, because a sibling
+ * pair inside a branch must become a structural ``If`` or a hard error.
  */
-SegmentSource SingleSegmentSource(const Stmt &stmt, arith::Analyzer *analyzer,
-                                  std::vector<std::string> *notes,
-                                  bool allow_flatten) {
-  SegmentSource source;
-  auto absorbed = AbsorbParallelChain(stmt, analyzer);
-  source.axes = std::move(absorbed.first);
-  Stmt current = absorbed.second;
-  std::optional<Axis> serial_axis;
-
-  while (const auto *loop_ptr = current.as<tirx::ForNode>()) {
-    tirx::For loop = ffi::GetRef<tirx::For>(loop_ptr);
-    ForKind kind = loop->kind;
-    RequireZeroMin(loop, analyzer);
-    if (kind == ForKind::kSerial) {
-      auto clean = SerialIsClean(loop, analyzer);
-      if (!clean.first) {
-        RecordSerialReason(notes, loop, clean.second);
-        break;
-      }
-    } else if (kind != ForKind::kParallel) {
-      break;
+bool HasSiblingShell(const Stmt &stmt) {
+  if (const auto *seq = stmt.as<tirx::SeqStmtNode>()) {
+    int shells = 0;
+    for (const Stmt &child : seq->seq)
+      shells += IsScalarShell(child.as<tirx::ForNode>()) ? 1 : 0;
+    if (shells >= 2)
+      return true;
+    for (const Stmt &child : seq->seq) {
+      if (HasSiblingShell(child))
+        return true;
     }
-    Axis axis = MakeAxis(loop->loop_var, loop->extent,
-                         static_cast<int64_t>(source.axes.size()), kind);
-    source.axes.push_back(axis);
-    if (kind == ForKind::kSerial)
-      serial_axis = axis;
-    current = loop->body;
+    return false;
   }
-
-  if (const auto *seq = current.as<tirx::SeqStmtNode>()) {
-    std::vector<size_t> loop_positions;
-    for (size_t i = 0; i < seq->seq.size(); ++i) {
-      if (seq->seq[i].as<tirx::ForNode>() != nullptr)
-        loop_positions.push_back(i);
-    }
-    // Only an exactly-one clean serial loop splits the body into
-    // pre/serial/post; anything else keeps the existing "nested serial loop"
-    // rejection.
-    if (loop_positions.size() == 1) {
-      size_t pos = loop_positions[0];
-      tirx::For loop = Downcast<tirx::For>(seq->seq[pos]);
-      if (loop->kind == ForKind::kSerial) {
-        auto clean = SerialIsClean(loop, analyzer);
-        if (clean.first) {
-          serial_axis = MakeAxis(loop->loop_var, loop->extent,
-                                 static_cast<int64_t>(source.axes.size()),
-                                 ForKind::kSerial);
-          source.axes.push_back(*serial_axis);
-          for (size_t i = 0; i < pos; ++i)
-            source.pre.push_back(seq->seq[i]);
-          for (size_t i = pos + 1; i < seq->seq.size(); ++i)
-            source.post.push_back(seq->seq[i]);
-          current = loop->body;
-        } else {
-          RecordSerialReason(notes, loop, clean.second);
-        }
-      }
-    }
+  if (const auto *loop = stmt.as<tirx::ForNode>())
+    return HasSiblingShell(loop->body);
+  if (const auto *branch = stmt.as<tirx::IfThenElseNode>()) {
+    if (HasSiblingShell(branch->then_case))
+      return true;
+    return branch->else_case.defined() && HasSiblingShell(*branch->else_case);
   }
-
-  bool has_parallel = false;
-  for (const Axis &axis : source.axes)
-    has_parallel = has_parallel || axis->is_parallel;
-  if (!has_parallel)
-    throw Unsupported("no T.Parallel axis found");
-
-  std::vector<Stmt> pieces = source.pre;
-  pieces.push_back(current);
-  pieces.insert(pieces.end(), source.post.begin(), source.post.end());
-  source.aliases = CollectAliases(SeqStmts(pieces));
-  source.serial_axis = serial_axis;
-  source.main = current;
-  source.allow_flatten = allow_flatten;
-  return source;
-}
-
-/*! \brief Absorb a pure serial chain into axes; nullopt keeps existing
- * behavior. */
-std::optional<std::pair<std::vector<Axis>, Stmt>>
-AbsorbSerialChain(const Stmt &stmt, arith::Analyzer *analyzer,
-                  int64_t base_index) {
-  const auto *loop_ptr = stmt.as<tirx::ForNode>();
-  if (loop_ptr == nullptr || loop_ptr->kind != ForKind::kSerial)
-    return std::nullopt;
-  std::vector<Axis> axes;
-  Stmt current = stmt;
-  while (const auto *current_loop = current.as<tirx::ForNode>()) {
-    if (current_loop->kind != ForKind::kSerial)
-      break;
-    std::optional<int64_t> min = ConstInt(current_loop->min, analyzer);
-    if (!min.has_value() || *min != 0)
-      return std::nullopt;
-    if (!SerialIsClean(ffi::GetRef<tirx::For>(current_loop), analyzer).first) {
-      return std::nullopt;
-    }
-    axes.push_back(MakeAxis(current_loop->loop_var, current_loop->extent,
-                            base_index + static_cast<int64_t>(axes.size()),
-                            ForKind::kSerial));
-    current = current_loop->body;
-  }
-  if (current.as<tirx::ForNode>() != nullptr)
-    return std::nullopt;
-  return std::make_pair(std::move(axes), current);
-}
-
-/*!
- * \brief Absorb a consecutive loop chain of parallel and clean serial loops.
- *
- * Used by the expanded tile-op multi-segment path: a body statement may be a
- * parallel copy/reduce nest whose reduced dimension is serial. A parallel axis
- * needs no dependence proof; a serial axis keeps the :func:`SerialIsClean`
- * requirement. Returns ``nullopt`` when the chain cannot be absorbed.
- */
-std::optional<std::pair<std::vector<Axis>, Stmt>>
-AbsorbLoopChain(const Stmt &stmt, arith::Analyzer *analyzer,
-                int64_t base_index) {
-  const auto *loop_ptr = stmt.as<tirx::ForNode>();
-  if (loop_ptr == nullptr)
-    return std::nullopt;
-  std::vector<Axis> axes;
-  Stmt current = stmt;
-  while (const auto *current_loop = current.as<tirx::ForNode>()) {
-    const ForKind kind = current_loop->kind;
-    if (kind != ForKind::kParallel && kind != ForKind::kSerial)
-      return std::nullopt;
-    RequireZeroMin(ffi::GetRef<tirx::For>(current_loop), analyzer);
-    if (kind == ForKind::kSerial &&
-        !SerialIsClean(ffi::GetRef<tirx::For>(current_loop), analyzer).first) {
-      return std::nullopt;
-    }
-    axes.push_back(MakeAxis(current_loop->loop_var, current_loop->extent,
-                            base_index + static_cast<int64_t>(axes.size()),
-                            kind));
-    current = current_loop->body;
-  }
-  if (axes.empty())
-    return std::nullopt;
-  return std::make_pair(std::move(axes), current);
+  return false;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1613,18 +1483,6 @@ std::vector<int64_t> GuardCuts(const VectorPlan &plan) {
   return interior;
 }
 
-/*! \brief Program-layer axes: the leading run of non-vector parallel axes. */
-std::vector<Axis> OuterAxes(const ffi::Array<Axis> &axes,
-                            const Axis &vector_axis) {
-  std::vector<Axis> outer;
-  for (const Axis &axis : axes) {
-    if (axis->var.same_as(vector_axis->var) || !axis->is_parallel)
-      break;
-    outer.push_back(axis);
-  }
-  return outer;
-}
-
 /*! \brief Whether the chunk is narrower than at least one store's register. */
 bool HasPartialLaneStore(const VectorPlan &plan) {
   for (const StorePlan &store : plan->stores) {
@@ -2520,6 +2378,22 @@ VectorPlan BuildPlanForAxis(const std::vector<Axis> &axes,
   MarkStoreRoles(plan);
   MarkLiveChunkRange(plan, ctx);
 
+  // A lane-varying predicate on a store to a lane-uniform address has no
+  // vector form: several lanes would race on one scalar, which is a cross-lane
+  // reduction the mask cannot express (e.g. ``if cond_lane: cnt[0] += 1``).
+  // Reject at the leaf, before any scalar instruction can be emitted.
+  for (const StorePlan &store : plan->stores) {
+    if (store->kind != AccessClass::kUniform || !store->mask.has_value())
+      continue;
+    if ((*store->mask)->is_uniform)
+      continue;
+    throw Unsupported(
+        "store to '" + store->spec->buffer->name.operator std::string() +
+            "' has a lane-varying predicate but a lane-uniform address: the "
+            "per-lane condition has no vector form (design note §2 Case II)",
+        {}, "plan.lane_varying_uniform_store");
+  }
+
   // Defect A0: a partial reduction on an absorbed serial axis has no vector
   // form.
   if (!reduce.defined()) {
@@ -2565,6 +2439,37 @@ void NoteGuardSplit(VectorPlan &plan) {
   plan.CopyOnWrite()->diagnostics = ToStringArray(diagnostics);
 }
 
+/*! \brief Combine an enclosing lane-uniform predicate with a new guard. */
+PrimExpr ConjoinPredicate(const ffi::Optional<PrimExpr> &outer,
+                          const PrimExpr &guard, bool negate,
+                          arith::Analyzer *analyzer) {
+  PrimExpr current = negate ? logical_not(guard) : guard;
+  if (outer.has_value())
+    current = logical_and(*outer, current);
+  return analyzer->Simplify(current);
+}
+
+/*!
+ * \brief AND a lane-uniform guard into every store mask of a segment.
+ *
+ * Applying the guard at the spec level (instead of wrapping the statement in
+ * an ``IfThenElse``) keeps axis absorption intact: a clean loop inside a
+ * uniform branch still becomes a vector axis, and only its stores are masked.
+ */
+void ApplyPredicateToSpecs(std::vector<StoreSpec> *specs,
+                           const ffi::Optional<PrimExpr> &predicate,
+                           arith::Analyzer *analyzer) {
+  if (!predicate.has_value())
+    return;
+  for (StoreSpec &spec : *specs) {
+    PrimExpr mask = spec->mask.defined()
+                        ? logical_and(*predicate, spec->mask.value())
+                        : *predicate;
+    spec = MakeStoreSpec(spec->buffer, spec->indices, spec->value,
+                         analyzer->Simplify(mask));
+  }
+}
+
 /*! \brief Plan one segment: flatten channel first, then ranked axis fallback.
  */
 std::pair<VectorPlan, bool>
@@ -2573,10 +2478,14 @@ PlanSegment(const std::vector<Axis> &axes, std::optional<Axis> serial_axis,
             const std::vector<Stmt> &post_stmts, const AliasMap &aliases,
             arith::Analyzer *analyzer, std::optional<int64_t> lanes,
             bool single, const std::vector<std::string> &base_notes,
-            const PlanOptions &options, bool allow_flatten = true) {
+            const PlanOptions &options, bool allow_flatten = true,
+            const ffi::Optional<PrimExpr> &predicate = std::nullopt) {
   std::string flatten_word = single ? "nest" : "segment";
   SegmentSpecs specs = PrepareSegment(axes, serial_axis, pre_stmts, main_stmt,
                                       post_stmts, aliases, analyzer, lanes);
+  ApplyPredicateToSpecs(&specs.pre_specs, predicate, analyzer);
+  ApplyPredicateToSpecs(&specs.main_specs, predicate, analyzer);
+  ApplyPredicateToSpecs(&specs.post_specs, predicate, analyzer);
   std::vector<AccessInfo> all_infos = specs.AllInfos();
   std::vector<AccessInfo> load_infos =
       LoadInfos(axes, specs.AllSpecs(), analyzer);
@@ -2593,7 +2502,10 @@ PlanSegment(const std::vector<Axis> &axes, std::optional<Axis> serial_axis,
   if (!flattened.second.empty())
     diagnostics.push_back(flattened.second);
   if (flattened.first.has_value()) {
-    const SegmentSpecs &flat_specs = *flattened.first;
+    SegmentSpecs flat_specs = *flattened.first;
+    ApplyPredicateToSpecs(&flat_specs.pre_specs, predicate, analyzer);
+    ApplyPredicateToSpecs(&flat_specs.main_specs, predicate, analyzer);
+    ApplyPredicateToSpecs(&flat_specs.post_specs, predicate, analyzer);
     Axis flat_axis = flat_specs.axes[0];
     bool ok = true;
     VectorPlan plan;
@@ -2674,524 +2586,631 @@ PlanSegment(const std::vector<Axis> &axes, std::optional<Axis> serial_axis,
   throw Unsupported("no vectorizable axis: " + joined, diagnostics, code);
 }
 
-/*! \brief A VF body cut into segments, plus the outer parallel prefix. */
-struct Segmentation {
-  std::vector<Axis> parallel_axes;
-  std::vector<SegmentSource> sources;
-};
+/* ------------------------------------------------------------------------- */
+/* recursive tree planner (design A, stages A2/A3)                           */
+/* ------------------------------------------------------------------------- */
 
 /*!
- * \brief Split at sibling clean serial chains (the classic multi-segment
- * shape).
+ * \brief Planner context: visible axes and where we are in the source tree.
  *
- * Returns an empty vector when the body is not that shape (no ``SeqStmt``,
- * fewer than two loop children, or a loop that is not a pure clean serial
- * chain); the caller then falls back to the single-segment shape.
+ * ``scope`` holds the *non-materialized* axes only. A materialized axis (a
+ * ``kLoop`` node) is replayed by the emitter and must not be visible to the
+ * chunk planner, which keeps every chunk's axis table exactly the set it may
+ * use for wrapping / vectorization (R4 without a hoisted-not-selectable rule).
  */
-std::vector<SegmentSource>
-ChainSegmentSources(const std::vector<Axis> &parallel_axes, const Stmt &current,
-                    arith::Analyzer *analyzer,
-                    std::vector<std::string> *notes) {
-  std::vector<SegmentSource> sources;
-  const auto *seq = current.as<tirx::SeqStmtNode>();
-  if (seq == nullptr)
-    return sources;
+struct PlanContext {
+  std::vector<Axis> scope;
+  AliasMap aliases;
+  std::optional<int64_t> lanes;
+  const PlanOptions *options{nullptr};
+  arith::Analyzer *analyzer{nullptr};
+  std::string path;
+  /*! \brief Lane-uniform guard inherited from an enclosing ``if``.
+   *
+   * The VF contract only allows vector work plus masks, so a lane-uniform
+   * branch is lowered by predicating every leaf store of its arms instead of
+   * emitting scalar control flow (design A, predicate push-down). */
+  ffi::Optional<PrimExpr> predicate;
+};
 
-  struct Item {
-    bool is_segment{false};
-    std::vector<Axis> chain_axes; // valid when is_segment
-    Stmt body;                    // valid when is_segment
-    Stmt stmt;                    // valid otherwise
-  };
-  std::vector<Item> items;
-  std::vector<size_t> seg_positions;
-  for (const Stmt &child : seq->seq) {
-    Item item;
-    if (child.as<tirx::ForNode>() != nullptr) {
-      auto chain = AbsorbSerialChain(
-          child, analyzer, static_cast<int64_t>(parallel_axes.size()));
-      if (!chain.has_value()) {
-        // Keep the concrete reason instead of the generic "nested serial loop".
-        RecordSerialReason(
-            notes, Downcast<tirx::For>(child),
-            SerialIsClean(Downcast<tirx::For>(child), analyzer).second);
-        return {};
-      }
-      item.is_segment = true;
-      item.chain_axes = std::move(chain->first);
-      item.body = chain->second;
-      seg_positions.push_back(items.size());
-    } else {
-      item.stmt = child;
-    }
-    items.push_back(std::move(item));
-  }
-  if (seg_positions.size() < 2)
-    return sources;
+/*! \brief Append a node to ``children`` unless it is undefined/empty. */
+void PushPlanNode(std::vector<PlanNode> *children, PlanNode node) {
+  if (node.defined())
+    children->push_back(std::move(node));
+}
 
-  AliasMap aliases = CollectAliases(current);
-  int64_t previous = -1;
-  for (size_t order = 0; order < seg_positions.size(); ++order) {
-    const size_t pos = seg_positions[order];
-    SegmentSource source;
-    source.axes = parallel_axes;
-    source.axes.insert(source.axes.end(), items[pos].chain_axes.begin(),
-                       items[pos].chain_axes.end());
-    source.serial_axis = items[pos].chain_axes.back();
-    source.main = items[pos].body;
-    for (int64_t k = previous + 1; k < static_cast<int64_t>(pos); ++k) {
-      source.pre.push_back(items[static_cast<size_t>(k)].stmt);
-    }
-    if (order + 1 == seg_positions.size()) {
-      for (size_t k = pos + 1; k < items.size(); ++k)
-        source.post.push_back(items[k].stmt);
-    }
-    source.aliases = aliases;
-    sources.push_back(std::move(source));
-    previous = static_cast<int64_t>(pos);
-  }
-  return sources;
+/*! \brief True for statements normalization drops (Bind / Evaluate(0)). */
+bool IsDroppableStmt(const Stmt &stmt) {
+  if (stmt.as<tirx::BindNode>() != nullptr)
+    return true;
+  const auto *evaluate = stmt.as<tirx::EvaluateNode>();
+  if (evaluate == nullptr)
+    return false;
+  if (const auto *imm = evaluate->value.as<tirx::IntImmNode>())
+    return imm->value == 0;
+  return false;
+}
+
+[[noreturn]] void RethrowWithPath(const Unsupported &error,
+                                  const std::string &path) {
+  std::vector<std::string> diagnostics = error.diagnostics();
+  diagnostics.push_back("at " + path);
+  throw Unsupported(error.message() + " [path: " + path + "]", diagnostics,
+                    error.code());
+}
+
+/*! \brief Throw a hard ``tree.*`` structural error annotated with its path. */
+[[noreturn]] void ThrowTreeError(const std::string &code,
+                                 const std::string &message,
+                                 const std::string &path) {
+  throw Unsupported(message + " [path: " + path + "]", {"at " + path}, code);
 }
 
 /*!
- * \brief Source-order segmentation of a Parallel body (one segment per
- *        statement group / loop chain).
+ * \brief Whether a statement keeps two or more sibling ``For`` children.
  *
- * Every statement group of the parallel body becomes one segment: consecutive
- * non-loop statements form a store segment (axes = outer parallel axes), each
- * loop chain (parallel copy / serial reduction dim) forms its own segment with
- * ``outer + chain`` axes. Statements before the single innermost serial loop
- * stay in that segment as ``pre``, so a reduction's identity initializer folds
- * into the accumulator register instead of becoming a shared-memory write.
- *
- * This is the planner's split fallback: a nest that mixes recipes with no
- * common vector axis (elementwise over one axis, row reduction over another)
- * cannot be a single segment, but each statement group plans on its own. The
- * segments are emitted in source order, so memory order is preserved.
- *
- * Returns an empty segmentation when the body is not a splittable ``SeqStmt``.
+ * Such a body is not one shell chain: each loop is an independent segment (or
+ * a materialized loop), so planning it as one chunk would either unroll the
+ * loops iteration by iteration or silently chain them (the old hole).
  */
-Segmentation SourceOrderSegments(const Stmt &stmt, arith::Analyzer *analyzer,
-                                 std::vector<std::string> *notes) {
-  auto absorbed = AbsorbParallelChain(stmt, analyzer);
-  Segmentation split;
-  split.parallel_axes = std::move(absorbed.first);
-  Stmt current = absorbed.second;
-  const auto *seq = current.as<tirx::SeqStmtNode>();
-  if (split.parallel_axes.empty() || seq == nullptr)
-    return Segmentation{};
-
-  AliasMap aliases = CollectAliases(current);
-
-  // A single clean serial loop at the end of a loop chain with siblings before
-  // it: the siblings become the segment's pre stores. That is how a reduction's
-  // identity initializer stays in the same segment as the reduction and folds
-  // into the accumulator register instead of a shared-memory write.
-  auto split_trailing_serial = [&](SegmentSource *source) {
-    const auto *body_seq = source->main.as<tirx::SeqStmtNode>();
-    if (body_seq == nullptr)
+bool HasMultipleSiblingLoops(const Stmt &stmt) {
+  bool found = false;
+  tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef &node) {
+    if (found)
       return;
+    const auto *seq = node.as<tirx::SeqStmtNode>();
+    if (seq == nullptr)
+      return;
+    int loops = 0;
+    for (const Stmt &child : seq->seq)
+      loops += child.as<tirx::ForNode>() != nullptr ? 1 : 0;
+    found = loops >= 2;
+  });
+  return found;
+}
+
+/*! \brief Build a segment source whose base axes are the context scope. */
+SegmentSource SourceFromScope(const PlanContext &ctx, const Stmt &stmt,
+                              bool allow_flatten) {
+  SegmentSource source;
+  source.axes = ctx.scope;
+  Stmt current = stmt;
+  std::optional<Axis> serial_axis;
+
+  while (const auto *loop_ptr = current.as<tirx::ForNode>()) {
+    tirx::For loop = ffi::GetRef<tirx::For>(loop_ptr);
+    ForKind kind = loop->kind;
+    RequireZeroMin(loop, ctx.analyzer);
+    if (kind == ForKind::kSerial) {
+      auto clean = SerialIsClean(loop, ctx.analyzer);
+      if (!clean.first)
+        break;
+    } else if (kind != ForKind::kParallel) {
+      break;
+    }
+    Axis axis = MakeAxis(loop->loop_var, loop->extent,
+                         static_cast<int64_t>(source.axes.size()), kind);
+    source.axes.push_back(axis);
+    if (kind == ForKind::kSerial)
+      serial_axis = axis;
+    current = loop->body;
+  }
+
+  if (const auto *seq = current.as<tirx::SeqStmtNode>()) {
     std::vector<size_t> loop_positions;
-    for (size_t pos = 0; pos < body_seq->seq.size(); ++pos) {
-      if (body_seq->seq[pos].as<tirx::ForNode>() != nullptr)
-        loop_positions.push_back(pos);
+    for (size_t i = 0; i < seq->seq.size(); ++i) {
+      if (seq->seq[i].as<tirx::ForNode>() != nullptr)
+        loop_positions.push_back(i);
     }
-    if (loop_positions.size() != 1)
-      return;
-    const size_t pos = loop_positions[0];
-    tirx::For loop = Downcast<tirx::For>(body_seq->seq[pos]);
-    std::optional<int64_t> min = ConstInt(loop->min, analyzer);
-    auto clean = loop->kind == ForKind::kSerial && min.has_value() && *min == 0
-                     ? SerialIsClean(loop, analyzer)
-                     : std::pair<bool, std::string>{false, ""};
-    if (!clean.first) {
-      if (!clean.second.empty())
-        RecordSerialReason(notes, loop, clean.second);
-      return;
-    }
-    Axis axis =
-        MakeAxis(loop->loop_var, loop->extent,
-                 static_cast<int64_t>(source->axes.size()), ForKind::kSerial);
-    source->axes.push_back(axis);
-    source->serial_axis = axis;
-    for (size_t i = 0; i < pos; ++i)
-      source->pre.push_back(body_seq->seq[i]);
-    for (size_t i = pos + 1; i < body_seq->seq.size(); ++i)
-      source->post.push_back(body_seq->seq[i]);
-    source->main = loop->body;
-  };
-
-  auto build_loop_source = [&](const Stmt &child) -> SegmentSource {
-    auto chain = AbsorbLoopChain(
-        child, analyzer, static_cast<int64_t>(split.parallel_axes.size()));
-    if (!chain.has_value()) {
-      const auto *loop = child.as<tirx::ForNode>();
-      if (loop != nullptr && loop->kind == ForKind::kSerial) {
-        RecordSerialReason(
-            notes, Downcast<tirx::For>(child),
-            SerialIsClean(Downcast<tirx::For>(child), analyzer).second);
+    // Exactly one clean serial loop splits the body into pre/serial/post; the
+    // pre/post stores stay in this chunk (a reduction's identity initializer
+    // folds into the accumulator instead of becoming a shared-memory write).
+    if (loop_positions.size() == 1) {
+      size_t pos = loop_positions[0];
+      tirx::For loop = Downcast<tirx::For>(seq->seq[pos]);
+      std::optional<int64_t> min = ConstInt(loop->min, ctx.analyzer);
+      auto clean = loop->kind == ForKind::kSerial && min.has_value() && *min == 0
+                       ? SerialIsClean(loop, ctx.analyzer)
+                       : std::pair<bool, std::string>{false, std::string()};
+      if (clean.first) {
+        serial_axis = MakeAxis(loop->loop_var, loop->extent,
+                               static_cast<int64_t>(source.axes.size()),
+                               ForKind::kSerial);
+        source.axes.push_back(*serial_axis);
+        for (size_t i = 0; i < pos; ++i)
+          source.pre.push_back(seq->seq[i]);
+        for (size_t i = pos + 1; i < seq->seq.size(); ++i)
+          source.post.push_back(seq->seq[i]);
+        current = loop->body;
       }
-      throw Unsupported("tile-op segment rejected: a child loop is not a clean "
-                        "parallel/serial chain",
-                        *notes);
-    }
-    SegmentSource source;
-    source.axes = split.parallel_axes;
-    source.axes.insert(source.axes.end(), chain->first.begin(),
-                       chain->first.end());
-    for (const Axis &axis : chain->first) {
-      if (!axis->is_parallel)
-        source.serial_axis = axis;
-    }
-    source.main = chain->second;
-    split_trailing_serial(&source);
-    return source;
-  };
-
-  // Identify the identity initializer pattern: every statement before the one
-  // loop chain is a uniform literal store to the same address as a store inside
-  // the chain. Such a body is one segment, so the initializer can be folded.
-  auto identity_init_of = [&](const Stmt &init, const Stmt &chain) -> bool {
-    const auto *store = init.as<tirx::BufferStoreNode>();
-    if (store == nullptr)
-      return false;
-    if (store->value.as<FloatImmNode>() == nullptr &&
-        store->value.as<IntImmNode>() == nullptr) {
-      return false;
-    }
-    ffi::Array<PrimExpr> indices;
-    for (const PrimExpr &index : store->indices)
-      indices.push_back(ApplyAliases(index, aliases));
-    bool matched = false;
-    tirx::PostOrderVisit(chain, [&](const ffi::ObjectRef &node) {
-      const auto *other = node.as<tirx::BufferStoreNode>();
-      if (other == nullptr || matched)
-        return;
-      if (!SameBuffer(other->buffer, store->buffer))
-        return;
-      if (other->indices.size() != indices.size())
-        return;
-      tirx::ExprDeepEqual equal;
-      for (size_t i = 0; i < indices.size(); ++i) {
-        if (!equal(ApplyAliases(other->indices[i], aliases), indices[i]))
-          return;
-      }
-      matched = true;
-    });
-    return matched;
-  };
-
-  std::vector<SegmentSource> sources;
-  std::vector<size_t> loop_children;
-  for (size_t i = 0; i < seq->seq.size(); ++i) {
-    if (seq->seq[i].as<tirx::ForNode>() != nullptr)
-      loop_children.push_back(i);
-  }
-  bool merged_init = false;
-  if (loop_children.size() == 1 && loop_children[0] + 1 == seq->seq.size() &&
-      loop_children[0] > 0) {
-    merged_init = true;
-    for (size_t i = 0; i < loop_children[0] && merged_init; ++i) {
-      merged_init = identity_init_of(seq->seq[i], seq->seq[loop_children[0]]);
-    }
-    if (merged_init) {
-      SegmentSource source = build_loop_source(seq->seq[loop_children[0]]);
-      for (size_t i = 0; i < loop_children[0]; ++i)
-        source.pre.push_back(seq->seq[i]);
-      sources.push_back(std::move(source));
     }
   }
 
-  if (!merged_init) {
-    std::vector<Stmt> pending;
-    auto flush_pending = [&]() {
-      if (pending.empty())
-        return;
-      SegmentSource source;
-      source.main = pending.size() == 1 ? pending.front() : SeqStmts(pending);
-      source.axes = split.parallel_axes;
-      sources.push_back(std::move(source));
-      pending.clear();
-    };
+  bool has_parallel = false;
+  for (const Axis &axis : source.axes)
+    has_parallel = has_parallel || axis->is_parallel;
+  if (!has_parallel)
+    throw Unsupported("no T.Parallel axis found");
 
-    // Two adjacent pure-parallel loop chains over the same domain and disjoint
-    // buffers become one nest: their chunk loops then interleave (one loop with
-    // both bodies) instead of running back to back, which gives the scheduler
-    // independent load/store pairs to overlap.
-    // One traversal per child collects everything the merge decision needs:
-    // the buffers it touches and whether it carries a serial loop.
-    struct ChildFacts {
-      std::set<const tirx::VarNode *> buffers;
-      bool has_serial{false};
-    };
-    auto collect_facts = [](const Stmt &stmt) {
-      ChildFacts facts;
-      tirx::PostOrderVisit(stmt, [&](const ffi::ObjectRef &node) {
-        if (const auto *load = node.as<tirx::BufferLoadNode>()) {
-          facts.buffers.insert(load->buffer->data.get());
-        } else if (const auto *store = node.as<tirx::BufferStoreNode>()) {
-          facts.buffers.insert(store->buffer->data.get());
-        } else if (const auto *loop = node.as<tirx::ForNode>()) {
-          if (loop->kind == ForKind::kSerial)
-            facts.has_serial = true;
-        }
-      });
-      return facts;
-    };
-    std::function<bool(const Stmt &, const Stmt &)> same_loop_shape =
-        [&](const Stmt &lhs, const Stmt &rhs) -> bool {
-      const auto *a = lhs.as<tirx::ForNode>();
-      const auto *b = rhs.as<tirx::ForNode>();
-      if (a == nullptr || b == nullptr)
-        return a == nullptr && b == nullptr;
-      tirx::ExprDeepEqual equal;
-      if (a->kind != b->kind || !equal(a->min, b->min) ||
-          !equal(a->extent, b->extent)) {
-        return false;
-      }
-      return same_loop_shape(a->body, b->body);
-    };
-    // Rebuild ``lhs`` with ``rhs`` appended to its innermost body; both chains
-    // have the same shape, so the recursion bottoms out together.
-    std::function<Stmt(const Stmt &, const Stmt &)> merge_chain_bodies =
-        [&](const Stmt &lhs, const Stmt &rhs) -> Stmt {
-      const auto *a = lhs.as<tirx::ForNode>();
-      const auto *b = rhs.as<tirx::ForNode>();
-      if (a == nullptr || b == nullptr)
-        return SeqStmts({lhs, rhs});
-      return tirx::For(a->loop_var, a->min, a->extent, a->kind,
-                       merge_chain_bodies(a->body, b->body));
-    };
-    auto zip_loop_vars = [&](const Stmt &lhs, const Stmt &rhs) {
-      std::map<const tirx::VarNode *, PrimExpr> mapping;
-      const tirx::ForNode *a = lhs.as<tirx::ForNode>();
-      const tirx::ForNode *b = rhs.as<tirx::ForNode>();
-      while (a != nullptr && b != nullptr) {
-        mapping[b->loop_var.get()] = a->loop_var;
-        a = a->body.as<tirx::ForNode>();
-        b = b->body.as<tirx::ForNode>();
-      }
-      return mapping;
-    };
-
-    std::optional<Stmt> previous_chain;
-    ChildFacts previous_facts;
-    for (const Stmt &child : seq->seq) {
-      if (child.as<tirx::ForNode>() == nullptr) {
-        pending.push_back(child);
-        previous_chain.reset();
-        continue;
-      }
-      ChildFacts facts = collect_facts(child);
-      if (previous_chain.has_value() && !facts.has_serial &&
-          !previous_facts.has_serial &&
-          same_loop_shape(*previous_chain, child)) {
-        bool disjoint = true;
-        for (const tirx::VarNode *buffer : facts.buffers) {
-          if (previous_facts.buffers.count(buffer) != 0) {
-            disjoint = false;
-            break;
-          }
-        }
-        if (disjoint) {
-          Stmt merged = merge_chain_bodies(
-              *previous_chain,
-              SubstituteVarsStmt(child, zip_loop_vars(*previous_chain, child)));
-          sources.back() = build_loop_source(merged);
-          previous_chain = merged;
-          previous_facts.buffers.insert(facts.buffers.begin(),
-                                        facts.buffers.end());
-          continue;
-        }
-      }
-      flush_pending();
-      sources.push_back(build_loop_source(child));
-      previous_chain = child;
-      previous_facts = std::move(facts);
-    }
-    flush_pending();
-  }
-
-  for (SegmentSource &source : sources) {
-    source.aliases = aliases;
-    // Flatten only loop-free parallel segments: a segment with a serial axis
-    // must keep its axis table intact (the serial dim is the accumulator's
-    // inner axis).
-    source.allow_flatten = !source.serial_axis.has_value();
-  }
-  split.sources = std::move(sources);
-  return split;
+  std::vector<Stmt> pieces = source.pre;
+  pieces.push_back(current);
+  pieces.insert(pieces.end(), source.post.begin(), source.post.end());
+  source.aliases = ctx.aliases.empty() ? CollectAliases(SeqStmts(pieces))
+                                       : ctx.aliases;
+  source.serial_axis = serial_axis;
+  source.main = current;
+  source.allow_flatten = allow_flatten;
+  return source;
 }
 
-/*!
- * \brief Cut a VF body into the segments the planner consumes.
- *
- * The body is split at its sibling clean serial chains; a body that is not of
- * that shape stays one segment. The source-order statement split is a fallback
- * the caller tries only when the single-segment plan is rejected.
- */
-Segmentation SegmentBody(const Stmt &stmt, arith::Analyzer *analyzer,
-                         std::vector<std::string> *notes) {
-  Segmentation split;
-  auto absorbed = AbsorbParallelChain(stmt, analyzer);
-  split.parallel_axes = std::move(absorbed.first);
-  split.sources = ChainSegmentSources(split.parallel_axes, absorbed.second,
-                                      analyzer, notes);
-  if (!split.sources.empty())
-    return split;
-  split.sources.push_back(
-      SingleSegmentSource(stmt, analyzer, notes, /*allow_flatten=*/true));
-  return split;
-}
-
-/*! \brief Planned segments plus the flatten fact of the whole program. */
-struct PlannedSegments {
-  std::vector<VectorPlan> segments;
-  bool flattened_any{false};
-};
-
-/*!
- * \brief Plan every segment in source order.
- *
- * A single segment is the "whole body" plan: its base notes are propagated and
- * its rejection is final. A multi-segment plan collects ``segment <i>: ...``
- * notes and rethrows so the caller can choose between the tile-op failure
- * message and the single-segment fallback.
- */
-PlannedSegments PlanSources(const std::vector<SegmentSource> &sources,
-                            arith::Analyzer *analyzer,
-                            std::optional<int64_t> lanes,
-                            const PlanOptions &options,
-                            std::vector<std::string> *notes) {
-  const bool single = sources.size() == 1;
-  PlannedSegments planned;
-  for (size_t i = 0; i < sources.size(); ++i) {
-    const SegmentSource &source = sources[i];
-    try {
-      std::pair<VectorPlan, bool> segment =
-          PlanSegment(source.axes, source.serial_axis, source.pre, source.main,
-                      source.post, source.aliases, analyzer, lanes, single,
-                      single ? *notes : std::vector<std::string>{}, options,
-                      source.allow_flatten);
-      planned.segments.push_back(segment.first);
-      planned.flattened_any = planned.flattened_any || segment.second;
-    } catch (const Unsupported &error) {
-      if (single)
-        throw;
-      notes->push_back("segment " + std::to_string(i) + ": " + error.message());
-      for (const std::string &note : error.diagnostics())
-        notes->push_back("  " + note);
-      throw;
-    }
-  }
-  return planned;
-}
-
-/*! \brief Assemble the planned segments into the program P2 hands to P3. */
-VectorProgram AssembleProgram(const Segmentation &split,
-                              const PlannedSegments &planned, bool single) {
-  const std::vector<VectorPlan> &segments = planned.segments;
-  ffi::Array<Axis> hoisted;
-  if (single) {
-    if (!planned.flattened_any) {
-      for (const Axis &axis :
-           OuterAxes(segments[0]->axes, segments[0]->vector_axis)) {
-        hoisted.push_back(axis);
-      }
-    }
-  } else {
-    // Only the outer parallel prefix in front of the first axis some segment
-    // consumes as its vector axis may be hoisted; a flattened segment consumes
-    // the whole parallel prefix (each segment still carries the full axis table
-    // and the emitter skips hoisted axes by identity).
-    std::vector<int64_t> consumed;
-    for (const VectorPlan &segment : segments) {
-      if (segment->vector_axis->is_parallel)
-        consumed.push_back(segment->vector_axis->index);
-    }
-    std::optional<int64_t> first_consumed;
-    for (int64_t index : consumed) {
-      first_consumed =
-          first_consumed.has_value() ? std::min(*first_consumed, index) : index;
-    }
-    if (!planned.flattened_any) {
-      for (const Axis &axis : split.parallel_axes) {
-        if (!first_consumed.has_value() || axis->index < *first_consumed)
-          hoisted.push_back(axis);
-      }
-    }
-  }
-
-  VectorProgram program = MakeVectorProgram(hoisted, ToArray(segments));
-  ffi::Array<ffi::String> diagnostics;
-  if (single) {
-    const VectorPlan &plan = segments[0];
-    std::string detail =
-        planned.flattened_any
-            ? "flattened axis '" +
-                  plan->vector_axis->name.operator std::string() + "'"
-            : "vector axis '" + plan->vector_axis->name.operator std::string() +
-                  "'";
-    diagnostics.push_back("single-segment program: 1 segment, " + detail);
-  } else {
-    diagnostics.push_back(
-        "multi-segment program: " + std::to_string(segments.size()) +
-        " segments, source order preserved" +
-        (hoisted.empty()
-             ? ", flattened/consumed parallel axes are wrapped by each segment"
-             : ""));
-  }
-  program.CopyOnWrite()->diagnostics = diagnostics;
-  return program;
-}
-
-/*!
- * \brief Fold the recorded segmenter notes into a rejection (defect B).
- *
- * The remark is only added when the error does not already carry exactly these
- * notes, so a plan that merged them itself is not annotated twice.
- */
-std::optional<Unsupported> MergeNotes(const Unsupported &error,
-                                      const std::vector<std::string> &notes) {
-  bool already_merged =
-      !error.diagnostics().empty() &&
-      notes.size() <= error.diagnostics().size() &&
-      std::equal(notes.begin(), notes.end(), error.diagnostics().begin());
-  if (notes.empty() || already_merged)
-    return std::nullopt;
-  std::string joined;
-  for (size_t i = 0; i < notes.size(); ++i)
-    joined += (i == 0 ? "" : "; ") + notes[i];
-  std::vector<std::string> merged = notes;
-  merged.insert(merged.end(), error.diagnostics().begin(),
-                error.diagnostics().end());
-  return Unsupported(error.message() + " [" + joined + "]", merged,
-                     error.code());
-}
-
-/*!
- * \brief Plan one segment per statement group (the split fallback).
- *
- * A nest whose statements need different vector axes cannot be planned as one
- * segment, but each group can be vectorized on its own and the emitter runs the
- * segments in source order, which is exactly the scalar order. Returns nullopt
- * when the body is not splittable or any group is still rejected (the caller
- * then reports the original single-segment rejection).
- */
-std::optional<VectorProgram>
-PlanStatementSplit(const Stmt &stmt, arith::Analyzer *analyzer,
-                   std::optional<int64_t> lanes, const PlanOptions &options,
-                   std::vector<std::string> *notes) {
+/*! \brief Plan one leaf statement group into a chunk (hard failure). */
+PlanNode PlanLeaf(const Stmt &stmt, const PlanContext &ctx, bool single) {
   try {
-    Segmentation split = SourceOrderSegments(stmt, analyzer, notes);
-    if (split.sources.size() < 2)
-      return std::nullopt;
-    PlannedSegments planned =
-        PlanSources(split.sources, analyzer, lanes, options, notes);
-    return AssembleProgram(split, planned, /*single=*/false);
+    SegmentSource source = SourceFromScope(ctx, stmt, /*allow_flatten=*/true);
+    std::pair<VectorPlan, bool> planned = PlanSegment(
+        source.axes, source.serial_axis, source.pre, source.main, source.post,
+        source.aliases, ctx.analyzer, ctx.lanes, single, {}, *ctx.options,
+        source.allow_flatten, ctx.predicate);
+    PlanNode chunk = MakePlanChunk(planned.first, planned.second);
+    return chunk;
+  } catch (const Unsupported &error) {
+    RethrowWithPath(error, ctx.path);
+  }
+  return PlanNode();
+}
+
+/*! \brief Try one statement / chain as a single chunk; nullopt when rejected. */
+std::optional<PlanNode> TryPlanChunk(const Stmt &stmt, const PlanContext &ctx,
+                                     bool single) {
+  try {
+    SegmentSource source = SourceFromScope(ctx, stmt, /*allow_flatten=*/true);
+    std::pair<VectorPlan, bool> planned = PlanSegment(
+        source.axes, source.serial_axis, source.pre, source.main, source.post,
+        source.aliases, ctx.analyzer, ctx.lanes, single, {}, *ctx.options,
+        source.allow_flatten, ctx.predicate);
+    return MakePlanChunk(planned.first, planned.second);
   } catch (const Unsupported &) {
     return std::nullopt;
   }
+}
+
+/*! \brief Chunks of a subtree (for barrier / shared-shell decisions). */
+int64_t CountChunks(const PlanNode &node) {
+  if (!node.defined())
+    return 0;
+  switch (node->kind) {
+  case PlanKind::kChunk:
+    return 1;
+  case PlanKind::kSeq: {
+    int64_t total = 0;
+    for (const ffi::ObjectRef &child : node->children)
+      total += CountChunks(Downcast<PlanNode>(child));
+    return total;
+  }
+  case PlanKind::kLoop:
+    return node->body.defined() ? CountChunks(Downcast<PlanNode>(node->body))
+                                : 0;
+  }
+  return 0;
+}
+
+bool SubtreeHasPlanShell(const PlanNode &node) {
+  if (!node.defined())
+    return false;
+  switch (node->kind) {
+  case PlanKind::kChunk:
+    return !node->chunk->shells.empty();
+  case PlanKind::kSeq:
+    for (const ffi::ObjectRef &child : node->children) {
+      if (SubtreeHasPlanShell(Downcast<PlanNode>(child)))
+        return true;
+    }
+    return false;
+  case PlanKind::kLoop:
+    return node->body.defined() &&
+           SubtreeHasPlanShell(Downcast<PlanNode>(node->body));
+  }
+  return false;
+}
+
+/*!
+ * \brief Whether a materialized loop iteration must close with VST->VLD.
+ *
+ * Conservative rule (design §5.4): two or more chunks may form a
+ * write-then-read pair, and a plan-level shell replays memory in order.
+ */
+bool NeedsIterationBarrier(const PlanNode &body) {
+  return CountChunks(body) >= 2 || SubtreeHasPlanShell(body);
+}
+
+/*! \brief Whether a condition consumes a parallel axis as a lane value. */
+bool ConditionTouchesLaneAxis(const PrimExpr &condition,
+                              const PlanContext &ctx) {
+  if (!condition.defined())
+    return false;
+  ffi::Array<tirx::Var> vars = tirx::UndefinedVars(condition);
+  for (const tirx::Var &var : vars) {
+    for (const Axis &axis : ctx.scope) {
+      if (axis->is_parallel && axis->var.same_as(var))
+        return true;
+    }
+  }
+  return false;
+}
+
+PlanNode PlanBody(const Stmt &stmt, const PlanContext &ctx, bool single);
+
+/*! \brief Plan an ``if`` by predicating its arms (no scalar branch). */
+PlanNode PlanIf(const tirx::IfThenElseNode *branch, const PlanContext &ctx,
+                bool single) {
+  Stmt stmt = ffi::GetRef<tirx::Stmt>(branch);
+  // Store-level if handling first: single-arm predication, same-address
+  // if/else merging and per-arm masks are all decided by the chunk planner.
+  if (!HasMultipleSiblingLoops(branch->then_case) &&
+      (!branch->else_case.defined() ||
+       !HasMultipleSiblingLoops(*branch->else_case))) {
+    if (auto chunk = TryPlanChunk(stmt, ctx, single))
+      return *chunk;
+  }
+
+  PrimExpr condition = ApplyAliases(branch->condition, ctx.aliases);
+  if (ConditionTouchesLaneAxis(condition, ctx)) {
+    // Lane-varying guard: the arms can only be represented as complementary
+    // masked chunks. A reduction inside an arm has no mask semantics.
+    PlanContext then_ctx = ctx;
+    then_ctx.path = ctx.path + " > if(then)";
+    PlanContext else_ctx = ctx;
+    else_ctx.path = ctx.path + " > if(else)";
+    auto plan_masked = [&](const Stmt &arm, const PrimExpr &guard,
+                           const PlanContext &arm_ctx) -> PlanNode {
+      Stmt masked = tirx::IfThenElse(guard, arm);
+      try {
+        return PlanLeaf(masked, arm_ctx, /*single=*/false);
+      } catch (const Unsupported &error) {
+        // A reduction has no mask semantics; a structural multi-chain shape has
+        // no single chunk form. Every other leaf rejection (store width, NZ
+        // predicate, ...) keeps its specific code.
+        std::string code = error.code();
+        if (code == "reduce.conditional")
+          code = "tree.predicated_reduce";
+        else if (code == "body.sibling_shells" ||
+                 code == "body.nested_loop")
+          code = "tree.mixed_chain";
+        std::vector<std::string> diagnostics = error.diagnostics();
+        diagnostics.push_back("at " + arm_ctx.path);
+        throw Unsupported(
+            "an if whose condition depends on a vector axis can only be "
+            "lowered to complementary masks; this arm is not maskable: " +
+                error.message() + " [path: " + arm_ctx.path + "]",
+            diagnostics, code);
+      }
+    };
+    std::vector<PlanNode> children;
+    children.push_back(plan_masked(branch->then_case, condition, then_ctx));
+    if (branch->else_case.defined() &&
+        !IsDroppableStmt(*branch->else_case)) {
+      children.push_back(plan_masked(*branch->else_case,
+                                     logical_not(condition), else_ctx));
+    }
+    if (children.size() == 1)
+      return children[0];
+    return MakePlanSeq(std::move(children));
+  }
+
+  // Lane-uniform guard: a real branch has no legal form inside the VF (bisheng
+  // only accepts vector work; the sync model tracks PIPE_V only). Push the
+  // guard down as a store predicate instead: then-stores get ``condition``,
+  // else-stores get ``!condition``. The masks are complementary, so exactly one
+  // arm writes and the result matches the scalar branch.
+  auto plan_arm = [&](const Stmt &arm, bool negate,
+                      const std::string &suffix) -> PlanNode {
+    PlanContext arm_ctx = ctx;
+    arm_ctx.predicate =
+        ConjoinPredicate(ctx.predicate, condition, negate, ctx.analyzer);
+    arm_ctx.path = ctx.path + suffix;
+    try {
+      return PlanBody(arm, arm_ctx, single);
+    } catch (const Unsupported &error) {
+      // A reduction has no mask semantics; a shape the recursive planner
+      // cannot split stays a structural error.
+      std::string code = error.code();
+      if (code == "reduce.conditional")
+        code = "tree.predicated_reduce";
+      else if (code == "body.sibling_shells" || code == "body.nested_loop")
+        code = "tree.mixed_chain";
+      std::vector<std::string> diagnostics = error.diagnostics();
+      diagnostics.push_back("at " + arm_ctx.path);
+      throw Unsupported(
+          "a lane-uniform if is lowered by predicating every leaf store; "
+          "this arm is not predicable: " +
+              error.message() + " [path: " + arm_ctx.path + "]",
+          diagnostics, code);
+    }
+  };
+
+  std::vector<PlanNode> children;
+  PushPlanNode(&children, plan_arm(branch->then_case, /*negate=*/false,
+                                   " > if(then)"));
+  if (branch->else_case.defined() &&
+      !IsDroppableStmt(*branch->else_case)) {
+    PushPlanNode(&children,
+                 plan_arm(*branch->else_case, /*negate=*/true, " > if(else)"));
+  }
+  if (children.empty())
+    return PlanNode();
+  if (children.size() == 1)
+    return children[0];
+  return MakePlanSeq(std::move(children));
+}
+
+PlanNode PlanBody(const Stmt &stmt, const PlanContext &ctx, bool single);
+
+/*! \brief Plan one loop: chunk chain if possible, otherwise a Loop node. */
+PlanNode PlanFor(const tirx::ForNode *loop, const PlanContext &ctx,
+                 bool single) {
+  ForKind kind = loop->kind;
+  if (kind != ForKind::kSerial && kind != ForKind::kParallel) {
+    ThrowTreeError("tree.opaque",
+                   "unsupported loop kind in a planned nest: " +
+                       ForKindName(kind),
+                   ctx.path);
+  }
+  RequireZeroMin(ffi::GetRef<tirx::For>(loop), ctx.analyzer);
+  if (loop->step.has_value()) {
+    std::optional<int64_t> step = ConstInt(loop->step.value(), ctx.analyzer);
+    if (!step.has_value() || *step != 1) {
+      ThrowTreeError("tree.opaque", "a planned loop needs unit stride",
+                     ctx.path);
+    }
+  }
+  if (auto chunk = TryPlanChunk(ffi::GetRef<tirx::Stmt>(loop), ctx, single))
+    return *chunk;
+
+  // The chunk chain could not absorb this loop. A serial loop is materialized
+  // (source structure kept); a parallel loop is not: parallel semantics allow
+  // each descendant chunk to wrap it, which is what the old program-level
+  // "hoisted prefix" did. Bounds may not depend on a parallel lane axis.
+  ffi::Array<tirx::Var> bound_var_array = tirx::UndefinedVars(loop->min);
+  std::vector<tirx::Var> bound_vars(bound_var_array.begin(),
+                                     bound_var_array.end());
+  ffi::Array<tirx::Var> extent_var_array = tirx::UndefinedVars(loop->extent);
+  std::vector<tirx::Var> extent_vars(extent_var_array.begin(),
+                                     extent_var_array.end());
+  for (const Axis &axis : ctx.scope) {
+    if (!axis->is_parallel)
+      continue;
+    for (const tirx::Var &var : bound_vars) {
+      if (axis->var.same_as(var))
+        throw Unsupported(
+            "a loop bound depends on the parallel axis '" +
+                axis->name.operator std::string() +
+                "', which would become a scalar inside the lanes [path: " +
+                ctx.path + "]",
+            {}, "tree.scalar_bound");
+    }
+    for (const tirx::Var &var : extent_vars) {
+      if (axis->var.same_as(var))
+        throw Unsupported(
+            "a loop bound depends on the parallel axis '" +
+                axis->name.operator std::string() +
+                "', which would become a scalar inside the lanes [path: " +
+                ctx.path + "]",
+            {}, "tree.scalar_bound");
+    }
+  }
+
+  PlanContext inner = ctx;
+  if (kind == ForKind::kParallel) {
+    inner.scope.push_back(MakeAxis(
+        loop->loop_var, loop->extent, static_cast<int64_t>(ctx.scope.size()),
+        ForKind::kParallel));
+    inner.path = ctx.path + " > for " +
+                 loop->loop_var->name_hint.operator std::string();
+    return PlanBody(loop->body, inner, single);
+  }
+
+  inner.path =
+      ctx.path + " > for " + loop->loop_var->name_hint.operator std::string();
+  PlanNode body = PlanBody(loop->body, inner, single);
+  return MakePlanLoop(loop->loop_var, loop->min, loop->extent,
+                      static_cast<int64_t>(ForKind::kSerial), body,
+                      NeedsIterationBarrier(body));
+}
+
+PlanNode PlanBody(const Stmt &stmt, const PlanContext &ctx, bool single) {
+  if (!stmt.defined())
+    return PlanNode();
+
+  if (const auto *seq = stmt.as<tirx::SeqStmtNode>()) {
+    std::vector<PlanNode> children;
+    std::vector<Stmt> pending;
+    auto flush = [&]() {
+      if (pending.empty())
+        return;
+      Stmt group = pending.size() == 1 ? pending.front() : SeqStmts(pending);
+      pending.clear();
+      std::vector<Stmt> parts;
+      if (const auto *group_seq = group.as<tirx::SeqStmtNode>()) {
+        for (const Stmt &child : group_seq->seq)
+          parts.push_back(child);
+      } else {
+        parts.push_back(group);
+      }
+      bool only_droppable = true;
+      for (const Stmt &child : parts)
+        only_droppable = only_droppable && IsDroppableStmt(child);
+      if (only_droppable)
+        return;
+      PushPlanNode(&children, PlanLeaf(group, ctx, single));
+    };
+    for (const Stmt &child : seq->seq) {
+      if (child.as<tirx::ForNode>() != nullptr ||
+          child.as<tirx::IfThenElseNode>() != nullptr) {
+        flush();
+        PlanContext child_ctx = ctx;
+        if (child.as<tirx::ForNode>() != nullptr) {
+          PushPlanNode(&children,
+                       PlanFor(child.as<tirx::ForNode>(), child_ctx, single));
+        } else {
+          PushPlanNode(
+              &children,
+              PlanIf(child.as<tirx::IfThenElseNode>(), child_ctx, single));
+        }
+        continue;
+      }
+      pending.push_back(child);
+    }
+    flush();
+    if (children.size() == 1)
+      return children[0];
+    return MakePlanSeq(std::move(children));
+  }
+
+  if (const auto *branch = stmt.as<tirx::IfThenElseNode>())
+    return PlanIf(branch, ctx, single);
+  if (const auto *loop = stmt.as<tirx::ForNode>())
+    return PlanFor(loop, ctx, single);
+  if (stmt.as<tirx::WhileNode>() != nullptr) {
+    ThrowTreeError("tree.while",
+                   "while loops are not supported by the tree planner yet",
+                   ctx.path);
+  }
+  if (stmt.as<tirx::AllocBufferNode>() != nullptr) {
+    ThrowTreeError("tree.alloc",
+                   "allocate inside a planned nest is not supported", ctx.path);
+  }
+  if (stmt.as<tirx::AttrStmtNode>() != nullptr) {
+    ThrowTreeError("tree.opaque",
+                   "a non-transparent attr statement is not supported",
+                   ctx.path);
+  }
+  if (IsDroppableStmt(stmt))
+    return PlanNode();
+  return PlanLeaf(stmt, ctx, single);
+}
+
+/*! \brief Serial loops that wrap several chunks (the old shared shells). */
+void CollectMaterializedLoops(const PlanNode &node, int64_t depth,
+                              int64_t prefix_depth,
+                              ffi::Array<Axis> *shared_shells) {
+  if (!node.defined())
+    return;
+  switch (node->kind) {
+  case PlanKind::kLoop: {
+    if (depth >= prefix_depth && CountChunks(node) >= 2) {
+      shared_shells->push_back(MakeAxis(
+          node->loop_var, node->extent, 0, static_cast<ForKind>(node->for_kind)));
+    }
+    if (node->body.defined())
+      CollectMaterializedLoops(Downcast<PlanNode>(node->body), depth + 1,
+                               prefix_depth, shared_shells);
+    return;
+  }
+  case PlanKind::kSeq:
+    for (const ffi::ObjectRef &child : node->children)
+      CollectMaterializedLoops(Downcast<PlanNode>(child), depth, prefix_depth,
+                               shared_shells);
+    return;
+  case PlanKind::kChunk:
+    return;
+  }
+}
+
+/*! \brief Minimum ``vector_axis`` index consumed by any chunk (flattened = 0).
+ */
+int64_t FirstConsumedAxis(const PlanNode &node, int64_t current) {
+  if (!node.defined())
+    return current;
+  switch (node->kind) {
+  case PlanKind::kChunk:
+    return std::min<int64_t>(current, node->chunk->vector_axis->index);
+  case PlanKind::kSeq:
+    for (const ffi::ObjectRef &child : node->children)
+      current = FirstConsumedAxis(Downcast<PlanNode>(child), current);
+    return current;
+  case PlanKind::kLoop:
+    return node->body.defined()
+               ? FirstConsumedAxis(Downcast<PlanNode>(node->body), current)
+               : current;
+  }
+  return current;
+}
+
+/*!
+ * \brief Wrap the leading parallel prefix that no chunk consumes as an axis.
+ *
+ * This is the old program-level hoist rule expressed in the tree: only the
+ * leading run of parallel axes before the first consumed vector axis may be
+ * hoisted; a flattened chunk consumes index 0, so nothing is hoisted.
+ */
+PlanNode HoistParallelPrefix(PlanNode root,
+                             const std::vector<Axis> &parallel_axes,
+                             ffi::Array<Axis> *hoisted) {
+  int64_t first = FirstConsumedAxis(root, std::numeric_limits<int64_t>::max());
+  std::vector<Axis> prefix;
+  if (first != std::numeric_limits<int64_t>::max()) {
+    for (const Axis &axis : parallel_axes) {
+      if (!axis->is_parallel || axis->index >= first)
+        break;
+      prefix.push_back(axis);
+    }
+  }
+  for (const Axis &axis : prefix)
+    hoisted->push_back(axis);
+  for (auto it = prefix.rbegin(); it != prefix.rend(); ++it) {
+    root = MakePlanLoop((*it)->var, IntImm32(0), (*it)->extent, (*it)->kind,
+                        root, /*barrier_at_end=*/false);
+  }
+  return root;
+}
+
+/*! \brief Assemble the tree plan into the program object P3 consumes. */
+VectorProgram AssembleTreeProgram(const PlanNode &root,
+                                  const ffi::Array<Axis> &hoisted,
+                                  ffi::Array<Axis> shared_shells) {
+  ffi::Array<VectorPlan> segments = TreeSegments(root);
+  VectorProgram program = MakeVectorProgram(hoisted, std::move(shared_shells),
+                                            std::move(segments));
+  program.CopyOnWrite()->root = root;
+
+  ffi::Array<ffi::String> diagnostics;
+  if (program->segments.size() == 1) {
+    const VectorPlan &plan = program->segments[0];
+    bool flattened = false;
+    std::function<void(const PlanNode &)> find_flat = [&](const PlanNode &node) {
+      if (!node.defined() || flattened)
+        return;
+      if (node->kind == PlanKind::kChunk) {
+        flattened = node->flattened;
+        return;
+      }
+      if (node->kind == PlanKind::kSeq) {
+        for (const ffi::ObjectRef &child : node->children)
+          find_flat(Downcast<PlanNode>(child));
+      } else if (node->kind == PlanKind::kLoop && node->body.defined()) {
+        find_flat(Downcast<PlanNode>(node->body));
+      }
+    };
+    find_flat(root);
+    std::string detail =
+        flattened ? "flattened axis '" +
+                        plan->vector_axis->name.operator std::string() + "'"
+                  : "vector axis '" +
+                        plan->vector_axis->name.operator std::string() + "'";
+    diagnostics.push_back("single-segment program: 1 segment, " + detail);
+  } else {
+    diagnostics.push_back(
+        "multi-segment program: " + std::to_string(program->segments.size()) +
+        " segments, source order preserved" +
+        (hoisted.empty()
+             ? ", flattened/consumed parallel axes are wrapped by each segment"
+             : "") +
+        (program->shared_shells.empty()
+             ? ""
+             : ", shared scalar shells wrap every segment"));
+  }
+  program.CopyOnWrite()->diagnostics = diagnostics;
+  return program;
 }
 
 } // namespace
@@ -3214,46 +3233,46 @@ VectorProgram BuildPlan(const tirx::Stmt &stmt, std::optional<int64_t> lanes,
       analyzer.Bind(binding.first, binding.second);
     }
   }
-  std::vector<std::string> notes;
-  Segmentation split = SegmentBody(stmt, &analyzer, &notes);
-  bool single = split.sources.size() == 1;
-  PlannedSegments planned;
-  try {
-    planned = PlanSources(split.sources, &analyzer, lanes, options, &notes);
-  } catch (const Unsupported &error) {
-    if (!single) {
-      // The sibling-chain segmentation is speculative: plan the whole body as
-      // one segment, so the composed rejection keeps every segment reason
-      // (defect B).
-      single = true;
-      split.sources = {
-          SingleSegmentSource(stmt, &analyzer, &notes, /*allow_flatten=*/true)};
-      try {
-        planned = PlanSources(split.sources, &analyzer, lanes, options, &notes);
-        return AssembleProgram(split, planned, single);
-      } catch (const Unsupported &fallback_error) {
-        if (auto merge_split =
-                PlanStatementSplit(stmt, &analyzer, lanes, options, &notes)) {
-          return *merge_split;
-        }
-        if (auto merged = MergeNotes(fallback_error, notes))
-          throw *merged;
-        throw;
-      }
+
+  auto absorbed = AbsorbParallelChain(stmt, &analyzer);
+  if (absorbed.first.empty())
+    throw Unsupported("no T.Parallel axis found");
+  const std::vector<Axis> &parallel_axes = absorbed.first;
+  const Stmt &body = absorbed.second;
+
+  PlanContext ctx;
+  ctx.scope = parallel_axes;
+  ctx.aliases = CollectAliases(body);
+  ctx.lanes = lanes;
+  ctx.options = &options;
+  ctx.analyzer = &analyzer;
+  ctx.path = "body";
+
+  // Fast path: the whole body is one chunk chain (single-segment quality is
+  // identical to the former ``SingleSegmentSource``).
+  if (!HasMultipleSiblingLoops(body) && !HasSiblingShell(body)) {
+    if (auto chunk = TryPlanChunk(body, ctx, /*single=*/true)) {
+      ffi::Array<Axis> hoisted;
+      ffi::Array<Axis> shared_shells;
+      PlanNode root =
+          HoistParallelPrefix(*chunk, parallel_axes, &hoisted);
+      return AssembleTreeProgram(root, hoisted, std::move(shared_shells));
     }
-    // A single nest can mix recipes that need different vector axes (e.g. an
-    // elementwise store along the innermost axis and a row reduction along an
-    // outer one); no common axis exists, but one segment per statement group
-    // plans on its own and the segments are emitted in source order.
-    if (auto merge_split =
-            PlanStatementSplit(stmt, &analyzer, lanes, options, &notes)) {
-      return *merge_split;
-    }
-    if (auto merged = MergeNotes(error, notes))
-      throw *merged;
-    throw;
   }
-  return AssembleProgram(split, planned, single);
+
+  // Structural path: plan the body as a tree, then hoist the leading parallel
+  // prefix every chunk leaves unconsumed.
+  PlanNode root = PlanBody(body, ctx, /*single=*/false);
+  ffi::Array<Axis> hoisted;
+  root = HoistParallelPrefix(root, parallel_axes, &hoisted);
+
+  // Compatibility view: serial loops that wrap several chunks used to be
+  // ``shared_shells``; report them from the tree.
+  ffi::Array<Axis> shared_shells;
+  CollectMaterializedLoops(root, /*depth=*/0,
+                           /*prefix_depth=*/static_cast<int64_t>(hoisted.size()),
+                           &shared_shells);
+  return AssembleTreeProgram(root, hoisted, std::move(shared_shells));
 }
 
 } // namespace parallel_vectorize
