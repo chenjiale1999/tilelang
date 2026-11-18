@@ -94,14 +94,11 @@ def test_plan_symbolic_extent():
     assert segment.chunks is None and segment.tail is None
 
 
-def test_p1_reduction_is_lifted_and_planned():
-    """Reduction store: P1 no longer rejects it as "non-injective"; P2 plans a cross-lane ``vcadd``.
+def test_p1_serial_reduction_is_lifted_and_planned():
+    """P1 proves distinct i instances independent while j remains serial.
 
-    The index of ``c_ub[i] += a_ub[i, j]`` is indeed non-injective, but this is an
-    **accumulating write** (read and write the same address), i.e. a reduction
-    rather than a conflicting write, so P1 must accept it. With ``n == lanes`` it
-    takes the short reduction form: one ``vld`` + ``vcadd`` + ``vadds`` + a
-    ``vsts`` that keeps lane 0 only.
+    P2 can then choose its existing short reduction lowering. RMW syntax alone
+    does not authorize replacing the serial j loop with a Parallel axis.
     """
     m, n = 8, 64
 
@@ -112,8 +109,9 @@ def test_p1_reduction_is_lifted_and_planned():
             c_ub = T.alloc_shared((m,), "float32")
             T.copy(A, a_ub)
             with T.SimdVF():
-                for i, j in T.Parallel(m, n):
-                    c_ub[i] += a_ub[i, j]
+                for i in T.Parallel(m):
+                    for j in T.serial(n):
+                        c_ub[i] += a_ub[i, j]
             T.copy(c_ub, C)
 
     assert _p1_items(main)[0].status == "LIFTED"

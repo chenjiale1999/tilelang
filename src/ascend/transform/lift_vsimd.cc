@@ -7,11 +7,12 @@
  * It records, per outer Parallel loop, the collapsed iteration space, the
  * ordered ops inside it, the captured context and a lift/opaque status, so P2
  * can plan without re-running scope analysis. Everything outside a top-level
- * Parallel loop is left untouched and stays with the legacy lowering.
+ * Parallel loop is left untouched. Retaining IR does not imply that a working
+ * fallback lowering exists.
  *
  * A nest that allocates or uses a ``local.fragment`` buffer
  * (``T.alloc_fragment``) is reported as not vectorizable: its region becomes
- * OPAQUE, so P2 leaves that nest to the legacy lowering. Nests that do not
+ * OPAQUE, so P2 does not plan that nest. Nests that do not
  * touch a fragment are unaffected and stay independent planning units.
  */
 #include <tvm/ffi/container/array.h>
@@ -246,52 +247,6 @@ FindCaptureInfo(const ModuleFacts &facts, int vf_index, const ForNode *root) {
   return nullptr;
 }
 
-/*!
- * \brief Whether a Parallel subtree allocates or touches a ``local.fragment``.
- *
- * ``T.alloc_fragment`` reaches P1 as an ``alloc_buffers`` entry of a block, and
- * a nest that reads or writes the tile shows up as a ``local.fragment`` buffer
- * access. Fragment vectorization is not supported on this branch, so P1 reports
- * every nest that touches one as OPAQUE and leaves it to the legacy lowering;
- * nests that do not touch a fragment are unaffected and stay independent
- * planning units.
- */
-static bool NestTouchesFragment(const ForNode *loop) {
-  class Collector final : public StmtExprVisitor {
-  public:
-    bool found{false};
-
-    void VisitStmt_(const SBlockNode *op) final {
-      for (const Buffer &buffer : op->alloc_buffers) {
-        if (buffer.scope() == "local.fragment") {
-          found = true;
-          return;
-        }
-      }
-      if (!found)
-        StmtExprVisitor::VisitStmt_(op);
-    }
-
-    void VisitExpr_(const BufferLoadNode *op) final {
-      if (op->buffer.scope() == "local.fragment") {
-        found = true;
-        return;
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-
-    void VisitStmt_(const BufferStoreNode *op) final {
-      if (op->buffer.scope() == "local.fragment") {
-        found = true;
-        return;
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-  } collector;
-  collector(ffi::GetRef<Stmt>(loop));
-  return collector.found;
-}
-
 static const VSimdMemoryRegionStatus *
 FindMemoryStatus(const ModuleFacts &facts, int vf_index, const ForNode *root) {
   for (const VSimdMemoryRegionStatus &status : facts.memory_regions) {
@@ -331,8 +286,10 @@ static const char *ReasonCodeFor(const std::string &memory_status,
 /*! \brief Walk a VF body, annotating every top-level T.Parallel loop. */
 class RegionBuilder {
 public:
-  RegionBuilder(const ModuleFacts &facts, VfState *state, bool verify_body)
-      : facts_(facts), state_(state), verify_body_(verify_body) {}
+  RegionBuilder(const ModuleFacts &facts, VfState *state, bool verify_body,
+                bool report_rejections)
+      : facts_(facts), state_(state), verify_body_(verify_body),
+        report_rejections_(report_rejections) {}
 
   Stmt Build(const Stmt &stmt) {
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
@@ -384,14 +341,14 @@ private:
     const VSimdMemoryRegionStatus *memory_status =
         FindMemoryStatus(facts_, state_->index, loop);
 
-    if (NestTouchesFragment(loop)) {
+    const std::string fragment_reason =
+        FragmentRejectionReason(ffi::GetRef<For>(loop));
+    if (!fragment_reason.empty()) {
       // Fragment vectorization is not supported on this branch: the nest is
-      // reported as not vectorizable and stays with the legacy lowering.
-      region = MakeOpaqueRegion(
-          loop, state_->index, region_index, reason_code::kUnsupported,
-          "nest touches a local.fragment buffer (T.alloc_fragment); fragment "
-          "vectorization is not supported",
-          nullptr);
+      // reported as unsupported, without promising a fallback lowering.
+      region =
+          MakeOpaqueRegion(loop, state_->index, region_index,
+                           reason_code::kUnsupported, fragment_reason, nullptr);
     } else if (info == nullptr) {
       std::string reason = VfMessage(facts_, state_->index);
       // The manual / unsupported verdict is VF-granular: say so, because the
@@ -403,7 +360,9 @@ private:
     } else {
       const std::string memory =
           memory_status == nullptr ? "MISSING" : memory_status->status;
-      VSimdRegionLift lift = BuildRegion(*info, memory, verify_body_);
+      VSimdRegionLift lift =
+          BuildRegion(*info, memory, verify_body_,
+                      memory_status == nullptr ? "" : memory_status->reason);
       if (lift.lifted) {
         region = lift.region;
         region->vf_index = state_->index;
@@ -415,6 +374,25 @@ private:
       }
     }
 
+    if (report_rejections_ && region->status == region_status::kOpaque) {
+      const char *summary = "automatic lifting is unsupported";
+      if (region->reason_code == reason_code::kIllegal)
+        summary = "parallel independence violation";
+      else if (region->reason_code == reason_code::kUnproven)
+        summary = "parallel independence could not be proven";
+      else if (region->reason_code == reason_code::kInternal)
+        summary = "internal compiler consistency check failed";
+      std::ostringstream location;
+      if (loop->span.defined() && loop->span->source_name.defined()) {
+        location << " at " << loop->span->source_name->name << ":"
+                 << loop->span->line << ":" << loop->span->column;
+      }
+      LOG(WARNING)
+          << "[vsimd][P1][" << region->reason_code << "] VF#" << state_->index
+          << " region#" << region_index << location.str() << ": " << summary
+          << "; " << region->reason
+          << "; original IR retained; no successful fallback is implied";
+    }
     state_->regions.push_back(region);
     For annotated = ffi::GetRef<For>(loop);
     annotated.CopyOnWrite()->annotations.Set(kRegionKey, Any(region));
@@ -424,6 +402,7 @@ private:
   const ModuleFacts &facts_;
   VfState *state_;
   bool verify_body_{true};
+  bool report_rejections_{true};
 };
 
 /*! \brief Outermost ``T.Parallel`` loops in a VF body (nest roots). */
@@ -446,133 +425,6 @@ private:
   int depth_{0};
 };
 
-/*!
- * \brief Distribute a Parallel body that holds several sibling serial shells.
- *
- * A region can keep at most one shell around its chunk program (either reduced
- * along it or emitted as one scalar loop), so a body mixing several shells is
- * split at the shell boundaries into one Parallel per group. Loop distribution
- * preserves source order, which is how the original body executes, and turns
- * every group into its own planning unit instead of rejecting the whole nest.
- */
-class NestFission : public StmtExprMutator {
-public:
-  Stmt VisitStmt_(const SBlockNode *op) final {
-    // Only SIMD_VF bodies are this pass' scope; everywhere else a Parallel is
-    // not lifted and must stay untouched.
-    if (op->name_hint != "SIMD_VF")
-      return StmtExprMutator::VisitStmt_(op);
-    SBlock block = ffi::GetRef<SBlock>(op);
-    Stmt body = SplitStmt(block->body);
-    if (!body.same_as(block->body))
-      block.CopyOnWrite()->body = body;
-    return block;
-  }
-
-private:
-  static bool IsSerialFor(const Stmt &stmt) {
-    const auto *loop = stmt.as<ForNode>();
-    return loop != nullptr && loop->kind == ForKind::kSerial;
-  }
-
-  /*! \brief The sole Parallel child of a chain body, if that is the shape. */
-  static const ForNode *SoleParallelChild(const Stmt &body) {
-    if (const auto *loop = body.as<ForNode>())
-      return loop->kind == ForKind::kParallel ? loop : nullptr;
-    if (const auto *seq = body.as<SeqStmtNode>()) {
-      if (seq->seq.size() == 1) {
-        const auto *only = seq->seq[0].as<ForNode>();
-        if (only != nullptr && only->kind == ForKind::kParallel)
-          return only;
-      }
-    }
-    return nullptr;
-  }
-
-  static Stmt Rebuild(const ForNode *op, const Stmt &body) {
-    auto node = ffi::make_object<ForNode>(*op);
-    node->body = body;
-    return For(node);
-  }
-
-  /*! \brief Rewrite every nest root reachable from *stmt*. */
-  Stmt SplitStmt(const Stmt &stmt) {
-    if (const auto *seq = stmt.as<SeqStmtNode>()) {
-      bool changed = false;
-      Array<Stmt> rewritten;
-      for (const Stmt &child : seq->seq) {
-        Stmt next = SplitStmt(child);
-        changed = changed || !next.same_as(child);
-        rewritten.push_back(next);
-      }
-      return changed ? SeqStmt(rewritten) : stmt;
-    }
-    if (const auto *attr = stmt.as<AttrStmtNode>()) {
-      if (!IsTransparentAttr(attr->attr_key))
-        return stmt;
-      Stmt inner = SplitStmt(attr->body);
-      if (inner.same_as(attr->body))
-        return stmt;
-      auto node = ffi::make_object<AttrStmtNode>(*attr);
-      node->body = inner;
-      return AttrStmt(node);
-    }
-    if (const auto *loop = stmt.as<ForNode>()) {
-      if (loop->kind != ForKind::kParallel) {
-        // A serial shell around nests keeps binding its counter; only its body
-        // is rewritten.
-        Stmt inner = SplitStmt(loop->body);
-        if (inner.same_as(loop->body))
-          return stmt;
-        return Rebuild(loop, inner);
-      }
-      return SplitNest(loop);
-    }
-    return stmt;
-  }
-
-  /*! \brief Fission one nest root (after descending its Parallel chain). */
-  Stmt SplitNest(const ForNode *root) {
-    if (const ForNode *inner = SoleParallelChild(root->body)) {
-      Stmt rewritten = SplitNest(inner);
-      if (rewritten.same_as(root->body))
-        return ffi::GetRef<Stmt>(root);
-      return Rebuild(root, rewritten);
-    }
-    const auto *seq = root->body.as<SeqStmtNode>();
-    if (seq == nullptr)
-      return ffi::GetRef<Stmt>(root);
-    int shells = 0;
-    for (const Stmt &child : seq->seq)
-      shells += IsSerialFor(child) ? 1 : 0;
-    if (shells < 2)
-      return ffi::GetRef<Stmt>(root);
-
-    // One group per shell: a group ends with its shell, and the statements
-    // between two shells start the next group (source order is preserved).
-    std::vector<Array<Stmt>> groups;
-    Array<Stmt> current;
-    for (const Stmt &child : seq->seq) {
-      current.push_back(child);
-      if (IsSerialFor(child)) {
-        groups.push_back(current);
-        current = Array<Stmt>();
-      }
-    }
-    if (!current.empty())
-      groups.push_back(current);
-    if (groups.size() < 2)
-      return ffi::GetRef<Stmt>(root);
-
-    Array<Stmt> distributed;
-    for (const Array<Stmt> &group : groups) {
-      distributed.push_back(
-          Rebuild(root, group.size() == 1 ? group[0] : SeqStmt(group)));
-    }
-    return SeqStmt(distributed);
-  }
-};
-
 class LiftMutator : public StmtExprMutator {
 public:
   LiftMutator(ModuleFacts facts, bool verify_body)
@@ -585,23 +437,25 @@ public:
     SBlock block = ffi::GetRef<SBlock>(op);
     VfState state;
     state.index = vf_index;
-    RegionBuilder builder(facts_, &state, verify_body_);
+    ManualDetector manual;
+    manual(block);
+    RegionBuilder builder(facts_, &state, verify_body_, !manual.manual);
     Stmt body = builder.Build(block->body);
     if (!body.same_as(block->body))
       block.CopyOnWrite()->body = body;
     // A Parallel under a branch or a ``while`` is not a nest P1 models; a nest
     // inside a serial loop *is* lifted (the loop becomes the scalar shell
     // around the emitted vector code), so only the control-flow wrappers here
-    // stay on the legacy path. Say so once per VF instead of leaving the loop
-    // silently unvectorized with no diagnostic at all.
+    // remain outside the P1 model. Report them without promising a fallback.
     ParallelCounter counter;
     counter(block->body);
     const int unlifted = counter.count - static_cast<int>(state.regions.size());
-    if (unlifted > 0) {
+    if (unlifted > 0 && !manual.manual) {
       LOG(WARNING)
-          << "[vsimd] VF#" << vf_index << ": " << unlifted
-          << " T.Parallel loop(s) stay on the legacy path (nested under "
-             "a branch or a while loop)";
+          << "[vsimd][P1][UNSUPPORTED] VF#" << vf_index << ": " << unlifted
+          << " T.Parallel loop(s) have no P1 region (nested under "
+             "a branch or a while loop); original IR retained; no successful "
+             "fallback is implied";
     }
     return block;
   }
@@ -640,15 +494,6 @@ tvm::transform::Pass AscendLiftVSimd() {
       return f;
 
     ModuleFacts facts;
-    // Distribute nests whose body mixes several sibling serial shells first:
-    // every group then carries at most one shell, which is what a plan (and the
-    // per-nest analysis) models. The analyses below run on the distributed IR,
-    // so their nest roots are the nodes the region builder attaches to.
-    {
-      NestFission fission;
-      PrimFuncNode *write_ptr = f.CopyOnWrite();
-      write_ptr->body = fission(std::move(write_ptr->body));
-    }
     facts.infos = AnalyzeVSimdCaptureInfo(f);
     facts.memory_regions = AnalyzeVSimdMemoryRegions(f);
 

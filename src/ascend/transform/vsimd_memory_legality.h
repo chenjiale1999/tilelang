@@ -25,13 +25,16 @@ namespace tl {
  */
 TVM_DLL ffi::String AnalyzeVSimdMemoryLegality(const tirx::PrimFunc &func);
 
-/*! \brief Per-VF/per-nest legality status for per-Region fallback. */
+/*! \brief Per-VF/per-nest legality verdict and diagnostic. */
 struct VSimdMemoryRegionStatus {
   int vf_index{-1};
   int nest_index{-1};
   std::string status;
   /*! \brief Outermost Parallel loop of the nest; identity for matching. */
   const tirx::ForNode *root{nullptr};
+  /*! \brief Explanation of the verdict, retained for annotation and reporting.
+   */
+  std::string reason;
 };
 
 /*! \brief One analysis run: the rendered report plus the per-nest statuses. */

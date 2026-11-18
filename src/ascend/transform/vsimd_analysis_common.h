@@ -59,8 +59,8 @@ struct LoopInfo {
  * ``polarity`` says whether the access sits in the then arm (true) or the else
  * arm (false). Mutual exclusion is decided by the dependence prover, not by
  * comparing literals: opposite polarities of the same condition are a
- * contradiction only when the condition does not depend on the lane, while a
- * lane-varying condition can hold for different lanes on the two arms.
+ * contradiction only when the condition is invariant across both executions;
+ * different lanes or serial times can take opposite arms.
  */
 struct GuardLiteral {
   PrimExpr condition;
@@ -78,23 +78,15 @@ struct AccessInfo {
   Array<PrimExpr> indices;
   PrimExpr value;
   bool is_write{false};
-  /*!
-   * \brief Innermost ``T.serial`` shell containing the access (null = lane
-   * body).
-   *
-   * A shell is emitted as a real scalar loop, so accesses in *different* shells
-   * are different statements in program order and cannot race across lanes.
-   * The dependence proof uses this scope to skip such ordered pairs.
-   */
-  const ForNode *shell_scope{nullptr};
+  // Ordered enclosing serial domains, internal to this parallel region.
+  // Each side of a dependence query gets independent copies of these counters.
+  std::vector<For> serial_loops;
   /*!
    * \brief Branch literals guarding this access (outermost first).
    *
-   * Two accesses under mutually exclusive branches cannot conflict for the
-   * same lane, and a lane-invariant condition makes one of the two arms dead
-   * for every lane. The legality prover adds both guards to its violation
-   * queries so those cases are proved safe instead of being reported as
-   * cross-iteration conflicts.
+   * The legality prover instantiates each path with that access's own
+   * parallel and serial coordinates. Opposite arms are mutually exclusive
+   * only if their conditions agree across both executions.
    */
   std::vector<GuardLiteral> guards;
 };
@@ -134,47 +126,6 @@ struct ParallelNest {
   bool unsupported{false};
   std::string reason; // why this nest is unsupported
 };
-
-/*! \brief Every variable a subtree mentions: bounds, guards, indices, values.
- */
-class VarUseCollector : public StmtExprVisitor {
-public:
-  VarSet vars;
-
-  void VisitExpr_(const VarNode *op) final {
-    vars.insert(ffi::GetRef<Var>(op));
-  }
-};
-
-/*!
- * \brief Whether a write combines the very location it writes (``c[i] +=
- * ...``).
- *
- * Only such a store may be non-injective over the nest domain legitimately: its
- * unused axes are the reduced ones. The nest collector reuses the predicate to
- * refuse a reduction that ignores a declared Parallel axis, because that axis
- * would replay the accumulation once per dead index.
- */
-inline bool IsCumulativeWrite(const AccessInfo &access) {
-  if (!access.value.defined())
-    return false;
-  bool found = false;
-  tirx::PostOrderVisit(access.value, [&](const ffi::ObjectRef &node) {
-    const auto *load = node.as<tirx::BufferLoadNode>();
-    if (load == nullptr || found)
-      return;
-    if (!load->buffer->data.same_as(access.buffer->data))
-      return;
-    if (load->indices.size() != access.indices.size())
-      return;
-    for (size_t i = 0; i < access.indices.size(); ++i) {
-      if (!tirx::ExprDeepEqual()(load->indices[i], access.indices[i]))
-        return;
-    }
-    found = true;
-  });
-  return found;
-}
 
 inline bool IsManualCall(const CallNode *call) {
   const auto *op = call->op.as<OpNode>();
@@ -263,80 +214,6 @@ public:
     cur_reason_ = reason;
   }
 
-  /*!
-   * \brief Reject a nest whose writes cannot honour every Parallel axis.
-   *
-   * Runs at publication time (``depth_`` is already back to 0), so it bypasses
-   * :meth:`MarkUnsupported` (which is a no-op outside a nest). Two shapes are
-   * refused, both of which P2 would turn into a redundant outer loop (the
-   * vector body runs once per dead index):
-   *
-   * * a Parallel axis that never appears in the nest body, and
-   * * an accumulating store (``d[i] += s[i, k]``) whose indices and value both
-   *   ignore a Parallel axis: the same accumulation is replayed once per dead
-   *   index, so ``d[i]`` ends up multiplied by that extent (device report D3).
-   *
-   * Both are user DSL mistakes — the scalar program has the same defect. The
-   * verdict is a hard error rather than a per-nest fallback: inside a
-   * ``T.SimdVF`` the legacy path would emit a scalar loop into the
-   * ``__simd_vf__`` helper, which bisheng refuses ("Unsupported scalar
-   * instruction in AIV loop"), so a fallback could never compile.
-   */
-  void RejectDeadParallelAxes() {
-    // An extent-1 Parallel axis carries no lane: ``Simplify`` folds the counter
-    // into the body before P1 runs (``i`` becomes 0), so the nest has no vector
-    // domain left and would degenerate into a scalar loop. Report that cause
-    // instead of the "dead axis" hint below — inside a ``T.SimdVF`` the scalar
-    // form is refused by bisheng ("Unsupported scalar instruction in AIV
-    // loop"), so the shape is unsupported rather than silently scalarized.
-    for (const LoopInfo &loop : loops_) {
-      if (!IsOneExtent(loop.extent))
-        continue;
-      LOG(FATAL) << "[vsimd] T.Parallel axis '"
-                 << loop.var->name_hint.operator std::string()
-                 << "' has extent 1: the nest has no lane to vectorize, so it "
-                    "degenerates to scalar code inside the __simd_vf__ helper, "
-                    "which the "
-                    "Ascend compiler refuses. Give the axis a vector-sized "
-                    "extent (at least "
-                    "one vector register) or drop the nest, then recompile.";
-    }
-    VarUseCollector body_uses;
-    body_uses(root_->body);
-    for (const LoopInfo &loop : loops_) {
-      if (body_uses.vars.count(loop.var))
-        continue;
-      LOG(FATAL)
-          << "[vsimd] T.Parallel axis '"
-          << loop.var->name_hint.operator std::string()
-          << "' is never used in the nest body: the nest would be emitted as a "
-             "redundant outer loop that repeats every store once per dead "
-             "index. "
-             "Drop the unused axis (or split the nest) and recompile.";
-    }
-    for (const AccessInfo &access : accesses_) {
-      if (!access.is_write || !IsCumulativeWrite(access))
-        continue;
-      VarSet store_uses;
-      for (const PrimExpr &index : access.indices)
-        AddUndefinedVars(index, &store_uses);
-      AddUndefinedVars(access.value, &store_uses);
-      for (const LoopInfo &loop : loops_) {
-        if (store_uses.count(loop.var))
-          continue;
-        LOG(FATAL)
-            << "[vsimd] the accumulating store to '"
-            << access.buffer->name.operator std::string()
-            << "' ignores T.Parallel axis '"
-            << loop.var->name_hint.operator std::string()
-            << "': the reduction would be replayed once per dead index and the "
-               "result multiplied by that extent. Drop the axis or make the "
-               "store "
-               "depend on it, then recompile.";
-      }
-    }
-  }
-
   void VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
       bool outer = depth_ == 0;
@@ -377,13 +254,6 @@ public:
       StmtExprVisitor::VisitStmt_(op);
       --depth_;
       if (outer) {
-        // A Parallel axis the body never mentions (or an accumulating store
-        // that ignores it) cannot shape the vector code: the region would still
-        // carry it, and P2 would hoist it into an outer serial loop, i.e. the
-        // whole vector body runs once per dead index. Reject the nest in P1 so
-        // it stays on the scalar path.
-        if (!cur_unsupported_)
-          RejectDeadParallelAxes();
         ParallelNest nest;
         nest.root = root_;
         nest.loops = loops_;
@@ -440,10 +310,9 @@ public:
           // Nest-scoped, not statement-scoped: the list is consumed when the
           // nest is published and cleared when the next nest starts.
           shell_vars_.push_back(op->loop_var);
-          const ForNode *saved_shell = cur_shell_;
-          cur_shell_ = op;
+          serial_loops_.push_back(ffi::GetRef<For>(op));
           StmtExprVisitor::VisitStmt_(op);
-          cur_shell_ = saved_shell;
+          serial_loops_.pop_back();
           return;
         }
       } else {
@@ -491,12 +360,6 @@ public:
     if (!step.has_value())
       return true; // unspecified means one
     const auto *imm = step.value().as<IntImmNode>();
-    return imm != nullptr && imm->value == 1;
-  }
-
-  /*! \brief An extent of exactly one leaves no lane to vectorize. */
-  static bool IsOneExtent(const PrimExpr &expr) {
-    const auto *imm = expr.as<IntImmNode>();
     return imm != nullptr && imm->value == 1;
   }
 
@@ -548,7 +411,7 @@ public:
       info.indices = op->indices;
       info.value = op->value;
       info.is_write = true;
-      info.shell_scope = cur_shell_;
+      info.serial_loops = serial_loops_;
       info.guards = guard_path_;
       accesses_.push_back(std::move(info));
     }
@@ -565,7 +428,7 @@ public:
       info.buffer = op->buffer;
       info.indices = op->indices;
       info.is_write = false;
-      info.shell_scope = cur_shell_;
+      info.serial_loops = serial_loops_;
       info.guards = guard_path_;
       accesses_.push_back(std::move(info));
     }
@@ -648,8 +511,8 @@ private:
   std::vector<tirx::Var> shell_vars_;
   /*! \brief Serial loops enclosing the nest currently being collected. */
   std::vector<LoopInfo> enclosing_serial_;
-  /*! \brief Innermost ``T.serial`` shell of the access being recorded. */
-  const ForNode *cur_shell_{nullptr};
+  /*! \brief Enclosing serial domains of the access being recorded. */
+  std::vector<For> serial_loops_;
   /*! \brief Branch literals of the statement currently being visited. */
   std::vector<GuardLiteral> guard_path_;
 };

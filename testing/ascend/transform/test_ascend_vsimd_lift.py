@@ -1,7 +1,5 @@
 """Phase 0 F3: the P1 pass attaches a region to every top-level T.Parallel loop."""
 
-import pytest
-
 import tilelang
 import tilelang.ascend.language as T
 import tvm
@@ -285,8 +283,8 @@ def test_lane_dependent_shell_bound_is_opaque():
     assert "lane index" in regions[0].reason
 
 
-def test_multi_shell_body_is_distributed():
-    """A nest body mixing two serial shells is distributed into one nest per shell."""
+def test_multi_shell_body_keeps_one_region():
+    """Sibling serial shells keep their tree and one original parallel domain."""
     n, m = 64, 32
 
     @T.prim_func
@@ -305,20 +303,11 @@ def test_multi_shell_body_is_distributed():
 
     mod = _lift(main)
     regions = _regions(mod)
-    assert len(regions) == 2
-    assert [region.status for region in regions] == ["LIFTED", "LIFTED"]
-    kinds = [[op.kind for op in region.ops] for region in regions]
-    assert kinds == [["serial"], ["serial"]]
-    # Both distributed nests keep the same domain and source order.
-    assert [[int(axis.extent) for axis in region.axes] for region in regions] == [[n], [n]]
-    parallels = []
-
-    def visit(node):
-        if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL:
-            parallels.append(node)
-
-    tirx.stmt_functor.post_order_visit(mod["main"].body, visit)
-    assert len(parallels) == 2
+    assert len(regions) == 1
+    assert regions[0].status == "LIFTED"
+    assert [op.kind for op in regions[0].ops] == ["serial", "serial"]
+    assert [int(axis.extent) for axis in regions[0].axes] == [n]
+    tvm.ir.assert_structural_equal(_strip_for_annotations(mod["main"].body), main.body)
 
 
 def test_region_annotation_survives_simplify():
@@ -493,14 +482,8 @@ def test_sibling_parallels_are_unsupported_not_internal():
         assert "not a single rectangular nest" in region.reason
 
 
-def test_unused_parallel_axis_is_rejected():
-    """A Parallel axis the body never mentions is a hard error in P1.
-
-    P2 would hoist the dead axis into an outer serial loop and replay the whole
-    vector body once per dead index. The nest is not left to the legacy path:
-    inside a ``T.SimdVF`` that path emits a scalar loop into the ``__simd_vf__``
-    helper, which bisheng refuses, so the DSL mistake is reported directly.
-    """
+def test_unused_parallel_axis_is_rejected(capfd):
+    """An unused parallel axis that duplicates stores is ILLEGAL by dependence."""
     m, n = 8, 64
 
     @T.prim_func
@@ -516,18 +499,26 @@ def test_unused_parallel_axis_is_rejected():
                         d_ub[i] = d_ub[i] + s_ub[i, k]
             T.copy(d_ub, D)
 
-    with pytest.raises(Exception, match="never used"):
-        _lift(main)
+    report = str(at.AscendAnalyzeVSimdRegionReport(main))
+    assert "not injective across parallel instances" in report
+    assert "write address does not reference parallel axis '_j'" in report
+    assert "[vsimd][P1]" not in capfd.readouterr().err
+    region = _regions(_lift(main))[0]
+    assert region.status == "OPAQUE"
+    assert region.reason_code == "ILLEGAL"
+    assert "W d_ub[i]" in region.reason
+    assert "write address does not reference parallel axis '_j'" in region.reason
+    assert "T.serial" in region.reason
+    assert "remove it after checking the intended semantics" in region.reason
+    warning = capfd.readouterr().err
+    assert warning.count("[vsimd][P1][ILLEGAL]") == 1
+    assert "VF#0 region#0" in warning
+    assert region.reason in warning
+    assert "no successful fallback is implied" in warning
 
 
-def test_unit_extent_parallel_axis_is_rejected():
-    """``T.Parallel(1)`` carries no lane, so the nest would be scalar.
-
-    ``Simplify`` folds the counter into the body before P1 (``i`` becomes 0), so
-    the nest has no vector domain and the ``__simd_vf__`` helper would hold a
-    scalar loop, which bisheng refuses ("Unsupported scalar instruction in AIV
-    loop"). P1 reports that cause directly (device report: ``rows, k = 1, 100``).
-    """
+def test_unit_extent_parallel_axis_is_legal(capfd):
+    """Extent one is semantically legal; hardware suitability belongs to P2/P3."""
     n = 100
 
     @T.prim_func
@@ -543,18 +534,12 @@ def test_unit_extent_parallel_axis_is_rejected():
                         c_ub[i] = c_ub[i] + a_ub[i, j]
             T.copy(c_ub, C)
 
-    with pytest.raises(Exception, match="extent 1"):
-        _lift(main)
+    assert _regions(_lift(main))[0].status == "LIFTED"
+    assert "[vsimd][P1]" not in capfd.readouterr().err
 
 
 def test_reduction_over_a_dead_parallel_axis_is_rejected():
-    """An accumulation that ignores a Parallel axis is a hard error in P1.
-
-    ``d_ub[i] += s_ub[i, k]`` never reads ``j``, so the ``T.Parallel(m, n)``
-    nest would replay the whole reduction once per ``j`` (device report D3,
-    ``mixed_recipe``'s D output). The scalar program has the same defect, so the
-    nest is not silently "fixed": P1 reports it and stops the compile.
-    """
+    """A sibling store using j does not legalize a reduction that races over j."""
     m, n = 8, 64
 
     @T.prim_func
@@ -580,12 +565,16 @@ def test_reduction_over_a_dead_parallel_axis_is_rejected():
             T.copy(c_ub, C)
             T.copy(d_ub, D)
 
-    with pytest.raises(Exception, match="ignores T.Parallel axis 'j'"):
-        _lift(main)
+    region = _regions(_lift(main))[0]
+    assert region.status == "OPAQUE"
+    assert region.reason_code == "ILLEGAL"
+    assert "W d_ub[i]" in region.reason
+    assert "write address does not reference parallel axis 'j'" in region.reason
+    assert "T.serial" in region.reason
 
 
-def test_reduction_along_the_vector_axis_is_still_lifted():
-    """A reduction that *does* read the axis (``d[i] += s[i, j]``) stays legal."""
+def test_parallel_reduction_without_contract_is_illegal():
+    """RMW syntax cannot permit multiple parallel instances to write d[i]."""
     m, n = 8, 64
 
     @T.prim_func
@@ -600,11 +589,14 @@ def test_reduction_along_the_vector_axis_is_still_lifted():
                     d_ub[i] = d_ub[i] + s_ub[i, j]
             T.copy(d_ub, D)
 
-    regions = _regions(_lift(main))
-    assert [region.status for region in regions] == ["LIFTED"]
+    region = _regions(_lift(main))[0]
+    assert region.status == "OPAQUE"
+    assert region.reason_code == "ILLEGAL"
+    assert "write address does not reference parallel axis 'j'" in region.reason
+    assert "using the axis only in the stored value does not resolve a write conflict" in region.reason
 
 
-def test_manual_vf_region_keeps_footprint():
+def test_manual_vf_region_keeps_footprint(capfd):
     """A manual VF rejects its regions, but they still record what they touch."""
 
     n = 64
@@ -630,6 +622,7 @@ def test_manual_vf_region_keeps_footprint():
     assert region.reason_code == "UNSUPPORTED"
     assert "manual" in region.reason
     assert "VF-level rejection" in region.reason
+    assert "[vsimd][P1]" not in capfd.readouterr().err
 
     captures = {capture.buffer.name: capture for capture in region.captures}
     assert {"a_ub", "c_ub"} <= set(captures)
@@ -638,6 +631,159 @@ def test_manual_vf_region_keeps_footprint():
     assert op.kind == "opaque"
     assert "c_ub" in [buffer.name for buffer in op.writes]
     assert "a_ub" in [buffer.name for buffer in op.reads]
+
+
+def test_rejection_diagnostics_are_per_region_and_keep_primary_reason(capfd):
+    @T.prim_func
+    def main(IDX: T.Tensor((8,), "int32"), C: T.Tensor((8,), "int32")):
+        with T.Kernel(1):
+            indices = T.alloc_shared((8,), "int32")
+            scatter = T.alloc_shared((8,), "int32")
+            shared_acc = T.alloc_shared((1,), "int32")
+            c = T.alloc_shared((8,), "int32")
+            frag = T.alloc_fragment((8,), "int32")
+            T.copy(IDX, indices)
+            with T.SimdVF():
+                for i in T.Parallel(8):
+                    scatter[indices[i]] = i
+                    shared_acc[0] = i
+                for j in T.Parallel(8):
+                    scatter[indices[j]] = j
+                for k in T.Parallel(8):
+                    frag[k] = k
+                for t in T.Parallel(8):
+                    c[t] = t
+            T.copy(c, C)
+
+    # Read-only analyses report their findings without printing pass warnings.
+    at.AscendAnalyzeSimdVFMemoryReport(main)
+    at.AscendAnalyzeSimdVFCaptureReport(main)
+    report = str(at.AscendAnalyzeVSimdRegionReport(main))
+    assert "[vsimd]" not in capfd.readouterr().err
+
+    mod = _lift(main)
+    regions = _regions(mod)
+    assert [r.reason_code for r in regions] == ["ILLEGAL", "UNPROVEN", "UNSUPPORTED", ""]
+    assert "W shared_acc[0]" in regions[0].reason
+    assert "data-dependent" not in regions[0].reason  # later proven conflict takes precedence
+    assert "data-dependent store map" in regions[1].reason
+    assert "fragment" in regions[2].reason
+    fragment_line = next(line for line in report.splitlines() if "VF#0 nest 2:" in line)
+    assert "status=OPAQUE" in fragment_line
+    assert fragment_line.count(regions[2].reason) == 1
+    warning = capfd.readouterr().err
+    assert warning.count("[vsimd][P1]") == 3
+    for index, region in enumerate(regions[:3]):
+        assert f"VF#0 region#{index}" in warning
+        assert region.reason in warning
+    assert "region#3" not in warning
+    assert "to legacy" not in warning
+    tvm.ir.assert_structural_equal(_strip_for_annotations(mod["main"].body), main.body)
+
+
+def test_unbound_guard_reports_capture_error(capfd):
+    missing_guard = T.dynamic("missing_guard")
+
+    @T.prim_func
+    def main(C: T.Tensor((8,), "int32")):
+        with T.Kernel(1):
+            c = T.alloc_shared((8,), "int32")
+            with T.SimdVF():
+                for i in T.Parallel(8):
+                    if missing_guard > 0:
+                        c[i] = missing_guard
+                        c[i] = c[i] + missing_guard
+                    else:
+                        c[i] = missing_guard + 1
+            T.copy(c, C)
+
+    capture = at.AscendAnalyzeSimdVFCaptureInfo(main)[0]
+    assert list(capture["errors"]) == ["unbound var missing_guard"]
+    report = str(at.AscendAnalyzeVSimdRegionReport(main))
+    assert report.count("unbound var missing_guard") == 1
+    region = _regions(_lift(main))[0]
+    assert region.reason_code == "UNSUPPORTED"
+    assert region.reason.count("unbound var missing_guard") == 1
+    warning = capfd.readouterr().err
+    assert warning.count("[vsimd][P1][UNSUPPORTED]") == 1
+    assert region.reason in warning
+    assert warning.count("unbound var missing_guard") == 1
+
+
+def _diagnostic_vf(body, output):
+    """Construct invalid scope deliberately, bypassing front-end declarations."""
+    block = tirx.SBlock([], [], [], "SIMD_VF", body)
+    return tirx.PrimFunc([output.data], tirx.SBlockRealize([], True, block), buffer_map={output.data: output})
+
+
+def test_unbound_diagnostics_deduplicate_by_identity(capfd):
+    i = tirx.Var("i", "int32")
+    first = tirx.Var("missing", "int32")
+    second = tirx.Var("missing", "int32")
+    output = tirx.decl_buffer((8,), "int32", name="output")
+    store = tirx.BufferStore(output, first + second, [i])
+    func = _diagnostic_vf(tirx.For(i, 0, 8, tirx.ForKind.PARALLEL, tirx.SeqStmt([store, store])), output)
+
+    # Repeated uses are deduplicated; distinct same-named variables are not.
+    capture = at.AscendAnalyzeSimdVFCaptureInfo(func)[0]
+    assert list(capture["errors"]) == ["unbound var missing", "unbound var missing"]
+    region = _regions(_lift(func))[0]
+    assert region.reason.count("unbound var missing") == 2
+    assert capfd.readouterr().err.count("unbound var missing") == 2
+
+
+def test_repeated_unbound_buffer_is_reported_once(capfd):
+    i = tirx.Var("i", "int32")
+    output = tirx.decl_buffer((8,), "int32", name="output")
+    missing = tirx.decl_buffer((8,), "int32", name="missing_buffer")
+    store = tirx.BufferStore(output, tirx.BufferLoad(missing, [i]), [i])
+    func = _diagnostic_vf(tirx.For(i, 0, 8, tirx.ForKind.PARALLEL, tirx.SeqStmt([store, store])), output)
+
+    capture = at.AscendAnalyzeSimdVFCaptureInfo(func)[0]
+    assert list(capture["errors"]).count("unbound buffer missing_buffer") == 1
+    report = str(at.AscendAnalyzeVSimdRegionReport(func))
+    assert report.count("unbound buffer missing_buffer") == 1
+    region = _regions(_lift(func))[0]
+    assert region.reason.count("unbound buffer missing_buffer") == 1
+    assert capfd.readouterr().err.count("unbound buffer missing_buffer") == 1
+
+
+def test_distinct_capture_and_memory_failures_are_both_retained(capfd):
+    missing = T.dynamic("missing_value")
+
+    @T.prim_func
+    def main(C: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            c = T.alloc_shared((1,), "int32")
+            with T.SimdVF():
+                for i in T.Parallel(8):
+                    c[0] = missing + i
+            T.copy(c, C)
+
+    region = _regions(_lift(main))[0]
+    assert region.reason_code == "ILLEGAL"
+    assert region.reason.count("unbound var missing_value") == 1
+    assert region.reason.count("memory legality is ILLEGAL") == 1
+    assert "W c[0]" in region.reason
+    assert region.reason in capfd.readouterr().err
+
+
+def test_modulo_conflict_does_not_suggest_removing_an_unused_axis(capfd):
+    @T.prim_func
+    def main(C: T.Tensor((2,), "int32")):
+        with T.Kernel(1):
+            c = T.alloc_shared((2,), "int32")
+            with T.SimdVF():
+                for i in T.Parallel(8):
+                    c[i % 2] = i
+            T.copy(c, C)
+
+    region = _regions(_lift(main))[0]
+    assert region.reason_code == "ILLEGAL"
+    assert "revise the output indices/guards" in region.reason
+    assert "redundant" not in region.reason
+    assert "write address does not reference" not in region.reason
+    assert region.reason in capfd.readouterr().err
 
 
 def test_view_and_base_share_one_capture():
@@ -773,7 +919,7 @@ def test_parallel_with_non_unit_step_is_opaque():
     assert "must have step 1" in regions[0].reason
 
 
-def test_serial_shell_with_non_unit_step_is_opaque():
+def test_serial_shell_with_non_unit_step_is_opaque(capfd):
     """The planner replicates a shell as ``min + iter``; a stride breaks that."""
     n, steps = 16, 4
 
@@ -791,12 +937,19 @@ def test_serial_shell_with_non_unit_step_is_opaque():
 
     assert _regions(_lift(main))[0].status == "LIFTED"
 
-    out = _lift(_rewrite_loop_bounds(main, tirx.ForKind.SERIAL, step=tirx.IntImm("int32", 2)))
+    unsupported = _rewrite_loop_bounds(main, tirx.ForKind.SERIAL, step=tirx.IntImm("int32", 2))
+    cause = "T.serial shell inside T.Parallel must have step 1"
+    report = str(at.AscendAnalyzeVSimdRegionReport(unsupported))
+    assert report.count(cause) == 1
+    out = _lift(unsupported)
     regions = _regions(out)
     assert len(regions) == 1
     assert regions[0].status == "OPAQUE"
     assert regions[0].reason_code == "UNSUPPORTED"
-    assert "T.serial shell inside T.Parallel must have step 1" in regions[0].reason
+    assert regions[0].reason == cause
+    warning = capfd.readouterr().err
+    assert warning.count(cause) == 1
+    assert warning.count("[vsimd][P1][UNSUPPORTED]") == 1
 
 
 if __name__ == "__main__":

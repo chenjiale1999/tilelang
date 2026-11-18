@@ -121,7 +121,7 @@ def test_2d_transpose_map():
     assert "verify: OK" in report
 
 
-def test_illegal_memory_falls_back():
+def test_illegal_memory_is_opaque():
     n = 256
 
     @T.prim_func
@@ -134,7 +134,7 @@ def test_illegal_memory_falls_back():
                     a_ub[i] = a_ub[i + 32]
 
     report = _report(main)
-    assert "status=FALLBACK" in report
+    assert "status=OPAQUE" in report
     assert "memory legality is ILLEGAL" in report
 
 
@@ -158,7 +158,7 @@ def test_alloc_var_opaque():
     assert "local.var" in report
 
 
-def test_opaque_evaluate_falls_back():
+def test_opaque_evaluate_is_opaque():
     n = 64
 
     @T.prim_func
@@ -171,7 +171,7 @@ def test_opaque_evaluate_falls_back():
                     T.evaluate(T.call_extern("float32", "opaque_side_effect", a_ub[i]))
 
     report = _report(main)
-    assert "status=FALLBACK" in report
+    assert "status=OPAQUE" in report
     assert "opaque Evaluate" in report
 
 
@@ -225,7 +225,7 @@ def test_tileop_region_is_opaque():
             T.copy(c_ub, C)
 
     report = _report(main)
-    assert "status=FALLBACK" in report
+    assert "status=OPAQUE" in report
     assert "tl.tileop.ascend_copy" in report
     pairs = _lifted_regions(main)
     assert [region.status for region, _ in pairs] == ["OPAQUE"]
@@ -370,7 +370,7 @@ def test_inner_bind_is_opaque():
             T.copy(c_ub, C)
 
     report = _report(main)
-    assert "status=FALLBACK" in report
+    assert "status=OPAQUE" in report
     assert "tirx.Bind" in report
 
 

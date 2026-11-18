@@ -172,6 +172,12 @@ public:
   void Run(const PrimFunc &func) {
     for (const auto &kv : func->buffer_map)
       AddBuffer(kv.second, "param");
+    // Scalar function parameters can occur only in a guard or serial bound;
+    // they are still bound captures, not unresolved free variables.
+    for (const Var &param : func->params) {
+      if (!param.dtype().is_handle())
+        vars_[param] = "param";
+    }
     VisitStmt(func->body);
   }
 
@@ -410,6 +416,12 @@ private:
     VarSet seen_outer;
     VarSet seen_shape;
     VarSet seen_layout;
+    VarSet unbound_vars;
+    using BufferSet =
+        std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+    BufferSet unbound_buffers;
+    BufferSet unbound_local_buffers;
+    BufferSet mismatched_views;
     std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         seen_views;
 
@@ -435,8 +447,9 @@ private:
           info.shape_syms.push_back(var);
         return;
       }
-      info.errors.push_back(std::string("unbound var ") +
-                            std::string(var->name_hint));
+      if (unbound_vars.insert(var).second)
+        info.errors.push_back(std::string("unbound var ") +
+                              std::string(var->name_hint));
     };
 
     for (const LoopInfo &loop : nest.loops) {
@@ -449,8 +462,9 @@ private:
     for (const AccessInfo &acc : nest.accesses) {
       Buffer base = Resolve(acc.buffer);
       if (!base.defined()) {
-        info.errors.push_back(std::string("unbound buffer ") +
-                              std::string(acc.buffer->name));
+        if (unbound_buffers.insert(acc.buffer).second)
+          info.errors.push_back(std::string("unbound buffer ") +
+                                std::string(acc.buffer->name));
         continue;
       }
       if (!acc.buffer.same_as(base) && seen_views.insert(acc.buffer).second)
@@ -472,6 +486,12 @@ private:
       std::vector<PrimExpr> exprs(acc.indices.begin(), acc.indices.end());
       if (acc.value.defined())
         exprs.push_back(acc.value);
+      for (const GuardLiteral &guard : acc.guards)
+        exprs.push_back(guard.condition);
+      for (const For &loop : acc.serial_loops) {
+        exprs.push_back(loop->min);
+        exprs.push_back(loop->extent);
+      }
       for (const PrimExpr &expr : exprs) {
         for (const Var &var : tirx::UndefinedVars(expr))
           classify_var(var);
@@ -481,16 +501,18 @@ private:
     for (const Buffer &view : nest.local_views) {
       Buffer base = Resolve(view);
       if (!base.defined()) {
-        info.errors.push_back(std::string("unbound local buffer ") +
-                              std::string(view->name));
+        if (unbound_local_buffers.insert(view).second)
+          info.errors.push_back(std::string("unbound local buffer ") +
+                                std::string(view->name));
         continue;
       }
       if (view.same_as(base))
         continue;
       if (!view->data.same_as(base->data)) {
-        info.errors.push_back(std::string("local view ") +
-                              std::string(view->name) +
-                              " resolves to a different data var");
+        if (mismatched_views.insert(view).second)
+          info.errors.push_back(std::string("local view ") +
+                                std::string(view->name) +
+                                " resolves to a different data var");
         continue;
       }
       bool duplicate = false;
