@@ -98,12 +98,15 @@ static MapClass MaxClass(MapClass a, MapClass b) {
 struct AccessInfo : vsimd::AccessInfo {
   MapClass map_class{MapClass::kAffine};
   bool layout_changing{false};
+  // Injective across parallel instances; serial times within one instance may
+  // intentionally revisit the same address (e.g. an ordered accumulator).
   bool injective{true};
   std::string injective_reason;
 };
 
 struct NestInfo {
   std::vector<LoopInfo> loops;
+  std::vector<LoopInfo> outer_shells;
   std::vector<AccessInfo> accesses;
   std::vector<std::pair<Buffer, Buffer>> local_views;
   Legality status{Legality::kLegal};
@@ -147,20 +150,23 @@ static bool SameGuards(const GuardPathKey &lhs, const GuardPathKey &rhs) {
 
 // Identity + structural key for deduplicating repeated loads/stores.
 struct AccessKey {
-  Var data;
+  Buffer buffer;
   Array<PrimExpr> indices;
   bool is_write{false};
-  // The shell scope keeps identical accesses from different statements apart:
-  // their ordering is what makes the cross-shell pair check unnecessary.
-  const ForNode *shell_scope{nullptr};
+  std::vector<For> serial_loops;
   // Different guards are different statements even over the same map.
   GuardPathKey guards;
 
   bool operator==(const AccessKey &other) const {
-    if (!data.same_as(other.data) || is_write != other.is_write ||
-        shell_scope != other.shell_scope || !SameGuards(guards, other.guards) ||
+    if (!buffer.same_as(other.buffer) || is_write != other.is_write ||
+        serial_loops.size() != other.serial_loops.size() ||
+        !SameGuards(guards, other.guards) ||
         indices.size() != other.indices.size())
       return false;
+    for (size_t i = 0; i < serial_loops.size(); ++i) {
+      if (!serial_loops[i].same_as(other.serial_loops[i]))
+        return false;
+    }
     for (size_t i = 0; i < indices.size(); ++i) {
       if (!tirx::ExprDeepEqual()(indices[i], other.indices[i]))
         return false;
@@ -171,26 +177,34 @@ struct AccessKey {
 
 struct AccessKeyHash {
   size_t operator()(const AccessKey &key) const {
-    size_t h = ffi::ObjectPtrHash()(key.data);
+    size_t h = ffi::ObjectPtrHash()(key.buffer);
     for (const PrimExpr &idx : key.indices)
       h = h * 31 + ffi::StructuralHash()(idx);
     h = h * 31 + (key.is_write ? 1 : 0);
-    h = h * 31 + std::hash<const void *>()(key.shell_scope);
+    for (const For &loop : key.serial_loops)
+      h = h * 31 + ffi::ObjectPtrHash()(loop);
     return HashGuards(h, key.guards);
   }
 };
 
-// Map-level key: injectivity is a property of (storage, map, guards),
+// Map-level key: independence is a property of (view, map, domains, guards),
 // independent of whether the access is a read or a write.
 struct MapKey {
-  Var data;
+  Buffer buffer;
   Array<PrimExpr> indices;
+  std::vector<For> serial_loops;
   GuardPathKey guards;
 
   bool operator==(const MapKey &other) const {
-    if (!data.same_as(other.data) || !SameGuards(guards, other.guards) ||
+    if (!buffer.same_as(other.buffer) ||
+        serial_loops.size() != other.serial_loops.size() ||
+        !SameGuards(guards, other.guards) ||
         indices.size() != other.indices.size())
       return false;
+    for (size_t i = 0; i < serial_loops.size(); ++i) {
+      if (!serial_loops[i].same_as(other.serial_loops[i]))
+        return false;
+    }
     for (size_t i = 0; i < indices.size(); ++i) {
       if (!tirx::ExprDeepEqual()(indices[i], other.indices[i]))
         return false;
@@ -201,9 +215,11 @@ struct MapKey {
 
 struct MapKeyHash {
   size_t operator()(const MapKey &key) const {
-    size_t h = ffi::ObjectPtrHash()(key.data);
+    size_t h = ffi::ObjectPtrHash()(key.buffer);
     for (const PrimExpr &idx : key.indices)
       h = h * 31 + ffi::StructuralHash()(idx);
+    for (const For &loop : key.serial_loops)
+      h = h * 31 + ffi::ObjectPtrHash()(loop);
     return HashGuards(h, key.guards);
   }
 };
@@ -230,24 +246,23 @@ struct RelationResult {
 
 constexpr size_t kMaxQueriesPerNest = 1024;
 
-static MapKey MakeMapKey(const Buffer &buffer, const Array<PrimExpr> &indices,
-                         const std::vector<GuardLiteral> &guards) {
-  return MapKey{buffer->data, indices, GuardSignature(guards)};
+static MapKey MakeMapKey(const AccessInfo &access) {
+  return MapKey{access.buffer, access.indices, access.serial_loops,
+                GuardSignature(access.guards)};
 }
 
 static AccessKey MakeAccessKey(const AccessInfo &access) {
-  return AccessKey{access.buffer->data, access.indices, access.is_write,
-                   access.shell_scope, GuardSignature(access.guards)};
+  return AccessKey{access.buffer, access.indices, access.is_write,
+                   access.serial_loops, GuardSignature(access.guards)};
 }
 
 /*!
  * \brief Conjunction of a guard path, optionally renamed for the other
  *        iteration of a dependence query.
  *
- * ``subs`` maps every nest loop variable to its primed copy, so the second
- * access of a pair is guarded by the condition it would take in the other
- * iteration. A lane-invariant condition is unchanged by the substitution, and
- * opposite polarities then contradict (one arm is dead for every lane).
+ * ``subs`` instantiates both parallel and internal serial coordinates for one
+ * side of the query. Only a condition invariant across both executions can
+ * make opposite polarities contradict.
  */
 static PrimExpr GuardConjunction(const std::vector<GuardLiteral> &guards,
                                  const Map<Var, PrimExpr> *subs) {
@@ -270,34 +285,6 @@ static bool HasLoopVar(const PrimExpr &expr, const VarSet &loop_vars) {
       return true;
   }
   return false;
-}
-
-/*!
- * \brief Whether a store reads the same location it writes (a reduction).
- *
- * Only such a store may be non-injective over the nest domain legitimately:
- * its unused axes are the reduced ones, and P2 turns it into a register
- * accumulator when it can pick a compatible vector axis.
- */
-static bool IsCumulativeStore_(const AccessInfo &acc) {
-  if (!acc.value.defined())
-    return false;
-  bool found = false;
-  tirx::PostOrderVisit(acc.value, [&](const ffi::ObjectRef &node) {
-    const auto *load = node.as<tirx::BufferLoadNode>();
-    if (load == nullptr || found)
-      return;
-    if (!load->buffer->data.same_as(acc.buffer->data))
-      return;
-    if (load->indices.size() != acc.indices.size())
-      return;
-    for (size_t i = 0; i < acc.indices.size(); ++i) {
-      if (!tirx::ExprDeepEqual()(load->indices[i], acc.indices[i]))
-        return;
-    }
-    found = true;
-  });
-  return found;
 }
 
 static bool IsConstantDivisor(const PrimExpr &expr) {
@@ -619,14 +606,17 @@ static std::string SanitizeModel(const std::string &model) {
 class LegalityAnalyzer {
 public:
   std::vector<std::string> nest_statuses;
+  std::vector<std::string> nest_reasons;
   /*! \brief Outermost Parallel loop per nest, parallel to `nest_statuses`. */
   std::vector<const ForNode *> nest_roots;
   LegalityAnalyzer(const FunctionCollector &facts, std::ostringstream *out,
                    const std::vector<PrimExpr> &assumptions,
                    const std::vector<std::pair<Var, PrimExpr>> &bindings,
-                   const std::vector<std::pair<Var, PrimExpr>> &thread_bounds)
+                   const std::vector<std::pair<Var, PrimExpr>> &thread_bounds,
+                   const std::vector<LoopInfo> &outer_serial)
       : facts_(facts), out_(out), assumptions_(assumptions),
-        bindings_(bindings), thread_bounds_(thread_bounds) {}
+        bindings_(bindings), thread_bounds_(thread_bounds),
+        outer_serial_(outer_serial) {}
 
   std::string AnalyzeVF(const SBlock &vf, int index) {
     ManualDetector manual;
@@ -653,6 +643,7 @@ public:
         // Unsupportable syntax is a per-nest verdict: it keeps this nest on the
         // scalar path without disabling the legality proof of its siblings.
         nest_statuses.push_back(StatusName(Legality::kUnsupported));
+        nest_reasons.push_back(parallel_nest.reason);
         nest_roots.push_back(parallel_nest.root);
         overall = std::max(overall, Legality::kUnsupported);
         body << "  nest " << nest_index++
@@ -662,13 +653,17 @@ public:
       }
       NestInfo nest;
       nest.loops = parallel_nest.loops;
+      nest.outer_shells = outer_serial_;
+      nest.outer_shells.insert(nest.outer_shells.end(),
+                               parallel_nest.outer_shells.begin(),
+                               parallel_nest.outer_shells.end());
       for (const vsimd::AccessInfo &src : parallel_nest.accesses) {
         AccessInfo acc;
         acc.buffer = src.buffer;
         acc.indices = src.indices;
         acc.value = src.value;
         acc.is_write = src.is_write;
-        acc.shell_scope = src.shell_scope;
+        acc.serial_loops = src.serial_loops;
         acc.guards = src.guards;
         nest.accesses.push_back(std::move(acc));
       }
@@ -710,6 +705,13 @@ public:
       }
       AnalyzeNest_(&nest);
       nest_statuses.push_back(StatusName(nest.status));
+      // An ILLEGAL witness takes precedence over earlier UNPROVEN messages.
+      // The full report retains all messages; annotations carry the primary
+      // reason so a rejection does not produce an unbounded warning.
+      nest_reasons.push_back(nest.messages.empty() ? ""
+                             : nest.status == Legality::kIllegal
+                                 ? nest.messages.back()
+                                 : nest.messages.front());
       nest_roots.push_back(parallel_nest.root);
       overall = std::max(overall, nest.status);
       body << "  nest " << nest_index++ << ": domain=";
@@ -772,7 +774,6 @@ private:
     nest->accesses = std::move(unique);
     nest->unique_accesses = nest->accesses.size();
 
-    injectivity_cache_.clear();
     pair_cache_.clear();
     queries_ = 0;
     cache_hits_ = 0;
@@ -783,7 +784,10 @@ private:
       loop_vars.insert(loop.var);
 
     for (AccessInfo &acc : nest->accesses) {
-      acc.map_class = ClassifyMap(acc.indices, loop_vars);
+      VarSet access_vars = loop_vars;
+      for (const For &loop : acc.serial_loops)
+        access_vars.insert(loop->loop_var);
+      acc.map_class = ClassifyMap(acc.indices, access_vars);
       // Only a store can change the physical layout the consumer must observe.
       acc.layout_changing =
           acc.is_write && facts_.layout_vars.count(acc.buffer->data) != 0;
@@ -796,7 +800,16 @@ private:
       AddUndefinedVars(loop.min, &relevant_vars);
       AddUndefinedVars(loop.extent, &relevant_vars);
     }
+    for (const LoopInfo &loop : nest->outer_shells) {
+      relevant_vars.insert(loop.var);
+      AddUndefinedVars(loop.min, &relevant_vars);
+      AddUndefinedVars(loop.extent, &relevant_vars);
+    }
     for (const AccessInfo &acc : nest->accesses) {
+      for (const For &loop : acc.serial_loops) {
+        AddUndefinedVars(loop->min, &relevant_vars);
+        AddUndefinedVars(loop->extent, &relevant_vars);
+      }
       for (const PrimExpr &idx : acc.indices)
         AddUndefinedVars(idx, &relevant_vars);
       for (const GuardLiteral &guard : acc.guards)
@@ -852,26 +865,14 @@ private:
                                  ": " + acc.injective_reason);
         continue;
       }
-      RelationResult result =
-          CheckMapInjectivity_(*nest, acc.buffer, acc.indices, acc.guards);
+      RelationResult result = CheckPair_(*nest, acc, acc);
       if (result.relation == Relation::kViolation) {
         acc.injective = false;
         acc.injective_reason = result.why;
-        // A non-injective store that combines the very location it writes is a
-        // *reduction* along the axes its index does not use. P2 can vectorize
-        // it whenever a compatible vector axis exists (register accumulator)
-        // and rejects the nest otherwise, so P1 must not pre-empt that choice.
-        // A non-cumulative non-injective store (a lane-invariant address with a
-        // lane-varying value) has no vector form at all and stays ILLEGAL.
-        if (IsCumulativeStore_(acc)) {
-          nest->messages.push_back("store " + std::string(acc.buffer->name) +
-                                   ": reduction along an unused axis (" +
-                                   result.why + ")");
-          continue;
-        }
         nest->status = std::max(nest->status, Legality::kIllegal);
-        nest->messages.push_back("store " + std::string(acc.buffer->name) +
-                                 ": not injective: " + result.why);
+        nest->messages.push_back(
+            AccessName_(acc) + ": not injective across parallel instances: " +
+            result.why + ConflictingStoreHint_(*nest, acc));
         sync_counters();
         return;
       }
@@ -895,13 +896,6 @@ private:
         const AccessInfo &b = nest->accesses[j];
         if (!a.is_write && !b.is_write)
           continue;
-        // Two accesses under different scalar shells (or one inside a shell and
-        // one outside) belong to different statements, which the emitted code
-        // runs in program order: they cannot race across lanes. Within one
-        // statement the shell counter is a shared uniform value, so the pair is
-        // still checked over the lane domain.
-        if (a.shell_scope != b.shell_scope)
-          continue;
         AliasKind alias = GetAlias_(a.buffer, b.buffer);
         if (alias.kind == AliasKind::kNoAlias)
           continue;
@@ -919,7 +913,10 @@ private:
         if (result.relation == Relation::kViolation) {
           nest->status = std::max(nest->status, Legality::kIllegal);
           nest->messages.push_back("pair " + AccessName_(a) + " / " +
-                                   AccessName_(b) + ": " + result.why);
+                                   AccessName_(b) + ": " + result.why +
+                                   "; review indices and guards to separate "
+                                   "parallel instances, or use T.serial for "
+                                   "intended sequential dependencies");
           sync_counters();
           return;
         }
@@ -948,6 +945,35 @@ private:
     }
     os << "]";
     return os.str();
+  }
+
+  // Explanation only, called after the dependence query proves a conflict.
+  // An absent axis is not itself an error: guards and domains may restrict
+  // ownership to a single parallel instance. No verdict depends on this hint.
+  static std::string ConflictingStoreHint_(const NestInfo &nest,
+                                           const AccessInfo &acc) {
+    VarSet address_vars;
+    AddUndefinedVars(LinearizeAccess(acc.buffer, acc.indices), &address_vars);
+    std::ostringstream hint;
+    bool missing_axis = false;
+    for (const LoopInfo &loop : nest.loops) {
+      const auto *extent = loop.extent.as<IntImmNode>();
+      if (address_vars.count(loop.var) || (extent && extent->value <= 1))
+        continue;
+      missing_axis = true;
+      hint << "; write address does not reference parallel axis '"
+           << loop.var->name_hint << "'";
+    }
+    if (!missing_axis)
+      return "; revise the output indices/guards to give parallel instances "
+             "independent locations, or use T.serial for intended sequential "
+             "dependencies";
+    hint << "; if an axis is redundant, remove it after checking the intended "
+            "semantics; if it represents sequential accumulation, use "
+            "T.serial; otherwise revise the output indices/guards to give "
+            "parallel instances independent locations (using the axis only "
+            "in the stored value does not resolve a write conflict)";
+    return hint.str();
   }
 
   bool TryFastMapInjectivity_(const NestInfo &nest,
@@ -1022,83 +1048,9 @@ private:
     return false;
   }
 
-  RelationResult CheckMapInjectivity_(const NestInfo &nest,
-                                      const Buffer &buffer,
-                                      const Array<PrimExpr> &indices,
-                                      const std::vector<GuardLiteral> &guards) {
-    MapKey key = MakeMapKey(buffer, indices, guards);
-    auto cached = injectivity_cache_.find(key);
-    if (cached != injectivity_cache_.end()) {
-      ++cache_hits_;
-      return cached->second;
-    }
-
-    RelationResult result;
-    PrimExpr off = LinearizeAccess(buffer, indices);
-    if (!off.defined()) {
-      result = {Relation::kUnknown, "index/rank mismatch"};
-      injectivity_cache_.emplace(key, result);
-      return result;
-    }
-    // The syntactic fast paths ignore the guards, so a "violation" they report
-    // may be a false positive for a guarded store (e.g. a constant address that
-    // only lane 0 writes). A "safe" verdict stays valid for any subset.
-    if (TryFastMapInjectivity_(nest, indices, &result) &&
-        (guards.empty() || result.relation == Relation::kSafe)) {
-      injectivity_cache_.emplace(key, result);
-      return result;
-    }
-    result = RelationResult();
-    if (budget_exceeded_ || queries_ >= kMaxQueriesPerNest) {
-      budget_exceeded_ = true;
-      result = {Relation::kUnknown, "query budget exceeded"};
-      injectivity_cache_.emplace(key, result);
-      return result;
-    }
-
-    arith::Analyzer analyzer;
-    VarSet loop_vars;
-    for (const LoopInfo &loop : nest.loops)
-      loop_vars.insert(loop.var);
-    MapClass map_class = ClassifyMap(indices, loop_vars);
-    if (map_class == MapClass::kQuasiAffine) {
-      analyzer.z3_prover.SetRLimit(20000);
-      analyzer.z3_prover.SetTimeoutMs(500);
-    } else {
-      analyzer.z3_prover.SetRLimit(50000);
-      analyzer.z3_prover.SetTimeoutMs(2000);
-    }
-    Map<Var, PrimExpr> subs;
-    AddDomainAndRename_(&analyzer, nest.loops, &subs);
-    PrimExpr off_other = Substitute(off, subs);
-    PrimExpr same_map = EQ(off, off_other);
-    PrimExpr same_iter = Bool(true);
-    for (const LoopInfo &loop : nest.loops) {
-      same_iter = And(same_iter, EQ(loop.var, subs.at(loop.var)));
-    }
-    PrimExpr violation = And(same_map, Not(same_iter));
-    if (!guards.empty()) {
-      // Only iterations where the store actually executes can collide.
-      violation = And(violation, GuardConjunction(guards, nullptr));
-      violation = And(violation, GuardConjunction(guards, &subs));
-    }
-    ++queries_;
-    RelationResult query = ProveNoViolation_(&analyzer, violation);
-    result.relation = query.relation;
-    if (query.relation == Relation::kViolation) {
-      std::string prefix = HasSymbolicExtent(nest) ? "symbolic extent; " : "";
-      result.why = prefix + "counterexample: " + SanitizeModel(query.why);
-    } else if (query.relation == Relation::kUnknown) {
-      result.why = "Z3 returned unknown";
-    }
-    injectivity_cache_.emplace(key, result);
-    return result;
-  }
-
   RelationResult CheckPair_(const NestInfo &nest, const AccessInfo &a,
                             const AccessInfo &b) {
-    PairKey key{MakeMapKey(a.buffer, a.indices, a.guards),
-                MakeMapKey(b.buffer, b.indices, b.guards)};
+    PairKey key{MakeMapKey(a), MakeMapKey(b)};
     auto cached = pair_cache_.find(key);
     if (cached != pair_cache_.end()) {
       ++cache_hits_;
@@ -1114,34 +1066,19 @@ private:
       return result;
     }
 
-    // Same storage + same linear map: the pair relation is exactly map
-    // injectivity. This avoids a second query for in-place updates. With guards
-    // the shortcut is not equivalent (each side must be restricted by its own
-    // guard), so the general query below is used instead.
-    if (a.guards.empty() && b.guards.empty() &&
-        a.buffer->data.same_as(b.buffer->data) &&
-        tirx::ExprDeepEqual()(off_a, off_b)) {
-      // The two accesses of a reduction's own read-modify-write share this map.
-      // The store-level rule already allows a cumulative, non-injective store
-      // (P2 decides whether a compatible vector axis exists), so the pair must
-      // not turn it back into a violation.
-      const AccessInfo &rmw_write = a.is_write ? a : b;
-      if (IsCumulativeStore_(rmw_write)) {
-        result = {
-            Relation::kSafe,
-            "reduction read-modify-write (non-injective by construction)"};
-        pair_cache_.emplace(key, result);
-        return result;
-      }
-      result = CheckMapInjectivity_(nest, a.buffer, a.indices, a.guards);
-      if (result.relation == Relation::kViolation) {
-        result.why = "cross-iteration RAW/WAR/WAW (same map is not injective)";
-      } else if (result.relation == Relation::kUnknown) {
-        result.why = "Z3 returned unknown";
-      }
+    // Retain the cheap proofs for the original pure-parallel case. A serial
+    // counter is not a shared parameter: even i+k must use the general query.
+    // Guarded domains may invalidate a syntactic counterexample, never a proof.
+    if (a.serial_loops.empty() && b.serial_loops.empty() &&
+        a.buffer.same_as(b.buffer) && a.buffer->strides.empty() &&
+        tirx::ExprDeepEqual()(off_a, off_b) &&
+        TryFastMapInjectivity_(nest, a.indices, &result) &&
+        (result.relation == Relation::kSafe ||
+         (a.guards.empty() && b.guards.empty() && nest.outer_shells.empty()))) {
       pair_cache_.emplace(key, result);
       return result;
     }
+    result = RelationResult();
 
     if (budget_exceeded_ || queries_ >= kMaxQueriesPerNest) {
       budget_exceeded_ = true;
@@ -1159,25 +1096,34 @@ private:
       analyzer.z3_prover.SetRLimit(50000);
       analyzer.z3_prover.SetTimeoutMs(2000);
     }
-    Map<Var, PrimExpr> subs;
-    AddDomainAndRename_(&analyzer, nest.loops, &subs);
-    PrimExpr off_b_other = Substitute(off_b, subs);
-    PrimExpr same_map = EQ(off_a, off_b_other);
+    EnterBindingsAndAssumptions_(&analyzer);
+    // Enclosing serial loops are common context, not internal serial time.
+    for (const LoopInfo &loop : nest.outer_shells) {
+      analyzer.EnterConstraint(loop.var >= loop.min);
+      analyzer.EnterConstraint(loop.var < loop.min + loop.extent);
+    }
+    Map<Var, PrimExpr> left, right;
+    AddAccessDomain_(&analyzer, nest.loops, a.serial_loops, "_vsimd_a", &left);
+    AddAccessDomain_(&analyzer, nest.loops, b.serial_loops, "_vsimd_b", &right);
+    PrimExpr same_map = EQ(Substitute(off_a, left), Substitute(off_b, right));
     PrimExpr same_iter = Bool(true);
     for (const LoopInfo &loop : nest.loops) {
-      same_iter = And(same_iter, EQ(loop.var, subs.at(loop.var)));
+      same_iter = And(same_iter, EQ(left.at(loop.var), right.at(loop.var)));
     }
     PrimExpr violation = And(same_map, Not(same_iter));
-    // Each side executes only where its own guard path holds. Opposite arms of
-    // a lane-invariant branch then contradict (one arm is dead for every lane);
-    // opposite arms of a lane-varying branch remain a real cross-lane hazard
-    // when the address maps overlap.
-    violation = And(violation, GuardConjunction(a.guards, nullptr));
-    violation = And(violation, GuardConjunction(b.guards, &subs));
+    bool abstracted_guard = false;
+    violation = And(violation, StableGuards_(nest, a, left, &abstracted_guard));
+    violation =
+        And(violation, StableGuards_(nest, b, right, &abstracted_guard));
     ++queries_;
     RelationResult query = ProveNoViolation_(&analyzer, violation);
     result.relation = query.relation;
-    if (query.relation == Relation::kViolation) {
+    if (query.relation == Relation::kViolation && abstracted_guard) {
+      // Dropping mutable predicates over-approximates execution. UNSAT is a
+      // proof, but SAT is not a concrete witness for the original program.
+      result = {Relation::kUnknown,
+                "guard reads storage written in the region"};
+    } else if (query.relation == Relation::kViolation) {
       std::string prefix = HasSymbolicExtent(nest) ? "symbolic extent; " : "";
       result.why = prefix + "cross-iteration RAW/WAR/WAW; " +
                    "counterexample: " + SanitizeModel(query.why);
@@ -1223,21 +1169,54 @@ private:
       analyzer->EnterConstraint(cond);
   }
 
-  void AddDomainAndRename_(arith::Analyzer *analyzer,
-                           const std::vector<LoopInfo> &loops,
-                           Map<Var, PrimExpr> *subs) {
-    EnterBindingsAndAssumptions_(analyzer);
+  // Instantiate the entire execution domain independently on each side.
+  // Only parallel counters participate in the different-instance predicate.
+  void AddAccessDomain_(arith::Analyzer *analyzer,
+                        const std::vector<LoopInfo> &loops,
+                        const std::vector<For> &serial_loops,
+                        const std::string &suffix, Map<Var, PrimExpr> *subs) {
     for (const LoopInfo &loop : loops) {
-      analyzer->EnterConstraint(loop.var >= loop.min);
-      analyzer->EnterConstraint(loop.var < loop.min + loop.extent);
-      Var other(loop.var->name_hint + "_vsimd_other", loop.var.dtype());
-      subs->Set(loop.var, other);
+      subs->Set(loop.var, Var(loop.var->name_hint + suffix, loop.var.dtype()));
     }
+    for (const For &loop : serial_loops)
+      subs->Set(loop->loop_var, Var(loop->loop_var->name_hint + suffix,
+                                    loop->loop_var.dtype()));
+    auto add_range = [&](const Var &var, const PrimExpr &min,
+                         const PrimExpr &extent) {
+      PrimExpr counter = subs->at(var);
+      PrimExpr begin = Substitute(min, *subs);
+      PrimExpr end = Substitute(min + extent, *subs);
+      analyzer->EnterConstraint(counter >= begin);
+      analyzer->EnterConstraint(counter < end);
+    };
     for (const LoopInfo &loop : loops) {
-      PrimExpr other = subs->at(loop.var);
-      analyzer->EnterConstraint(other >= loop.min);
-      analyzer->EnterConstraint(other < loop.min + loop.extent);
+      add_range(loop.var, loop.min, loop.extent);
     }
+    for (const For &loop : serial_loops)
+      add_range(loop->loop_var, loop->min, loop->extent);
+  }
+
+  PrimExpr StableGuards_(const NestInfo &nest, const AccessInfo &access,
+                         const Map<Var, PrimExpr> &subs, bool *abstracted) {
+    std::vector<GuardLiteral> stable;
+    for (const GuardLiteral &guard : access.guards) {
+      bool mutable_read = false;
+      PostOrderVisit(guard.condition, [&](const ffi::ObjectRef &node) {
+        const auto *load = node.as<BufferLoadNode>();
+        if (load == nullptr)
+          return;
+        for (const AccessInfo &other : nest.accesses) {
+          if (other.is_write &&
+              GetAlias_(load->buffer, other.buffer).kind != AliasKind::kNoAlias)
+            mutable_read = true;
+        }
+      });
+      if (mutable_read)
+        *abstracted = true;
+      else
+        stable.push_back(guard);
+    }
+    return GuardConjunction(stable, &subs);
   }
 
   AliasKind GetAlias_(const Buffer &a, const Buffer &b) {
@@ -1269,7 +1248,6 @@ private:
     return {AliasKind::kMayAlias};
   }
 
-  std::unordered_map<MapKey, RelationResult, MapKeyHash> injectivity_cache_;
   std::unordered_map<PairKey, RelationResult, PairKeyHash> pair_cache_;
   size_t queries_{0};
   size_t cache_hits_{0};
@@ -1280,6 +1258,7 @@ private:
   std::vector<std::pair<Var, PrimExpr>> bindings_;
   std::vector<std::pair<Var, PrimExpr>> thread_bounds_;
   std::vector<PrimExpr> active_assumptions_;
+  std::vector<LoopInfo> outer_serial_;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -1307,12 +1286,12 @@ public:
       assumptions_.insert(assumptions_.end(), vf_assumes.assumptions.begin(),
                           vf_assumes.assumptions.end());
       LegalityAnalyzer analyzer(*facts_, &out, assumptions_, bindings_,
-                                thread_bounds_);
+                                thread_bounds_, outer_serial_);
       analyzer.AnalyzeVF(ffi::GetRef<SBlock>(op), vf);
       for (size_t i = 0; i < analyzer.nest_statuses.size(); ++i) {
         region_statuses.push_back(VSimdMemoryRegionStatus{
             vf, static_cast<int>(i), analyzer.nest_statuses[i],
-            analyzer.nest_roots[i]});
+            analyzer.nest_roots[i], analyzer.nest_reasons[i]});
       }
       assumptions_.resize(saved_assumptions);
       return;
@@ -1333,6 +1312,12 @@ public:
   }
 
   void VisitStmt_(const ForNode *op) final {
+    if (op->kind == ForKind::kSerial) {
+      outer_serial_.push_back(LoopInfo{op->loop_var, op->min, op->extent});
+      StmtExprVisitor::VisitStmt_(op);
+      outer_serial_.pop_back();
+      return;
+    }
     if (op->kind == ForKind::kThreadBinding) {
       thread_bounds_.emplace_back(op->loop_var, op->extent);
       StmtExprVisitor::VisitStmt_(op);
@@ -1362,6 +1347,7 @@ public:
 private:
   const FunctionCollector *facts_{nullptr};
   int vf_index_{0};
+  std::vector<LoopInfo> outer_serial_;
   std::vector<PrimExpr> assumptions_;
   std::vector<std::pair<Var, PrimExpr>> bindings_;
   std::vector<std::pair<Var, PrimExpr>> thread_bounds_;

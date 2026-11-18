@@ -11,6 +11,7 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -632,19 +633,84 @@ VSimdRegionMatch CompareRegionWithOriginal(const VSimdRegion &region,
   return result;
 }
 
+/*!
+ * \brief Whether a Parallel subtree allocates or touches a ``local.fragment``.
+ *
+ * ``T.alloc_fragment`` reaches P1 as an ``alloc_buffers`` entry of a block, and
+ * a nest that reads or writes the tile shows up as a ``local.fragment`` buffer
+ * access. Fragment vectorization is not supported on this branch, so P1 reports
+ * every nest that touches one as OPAQUE and retains its original body;
+ * nests that do not touch a fragment are unaffected and stay independent
+ * planning units.
+ */
+std::string FragmentRejectionReason(const For &loop) {
+  class Collector final : public StmtExprVisitor {
+  public:
+    bool found{false};
+
+    void VisitStmt_(const SBlockNode *op) final {
+      for (const Buffer &buffer : op->alloc_buffers) {
+        if (buffer.scope() == "local.fragment") {
+          found = true;
+          return;
+        }
+      }
+      if (!found)
+        StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitExpr_(const BufferLoadNode *op) final {
+      if (op->buffer.scope() == "local.fragment") {
+        found = true;
+        return;
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const BufferStoreNode *op) final {
+      if (op->buffer.scope() == "local.fragment") {
+        found = true;
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+  } collector;
+  collector(loop);
+  return collector.found
+             ? "nest touches a local.fragment buffer (T.alloc_fragment); "
+               "fragment vectorization is not supported"
+             : "";
+}
+
 VSimdRegionLift BuildRegion(const VSimdCaptureInfo &info,
-                            const std::string &memory_status,
-                            bool verify_body) {
+                            const std::string &memory_status, bool verify_body,
+                            const std::string &memory_reason) {
   VSimdRegionLift result;
+  if (info.root_for != nullptr) {
+    result.reason = FragmentRejectionReason(ffi::GetRef<For>(info.root_for));
+    if (!result.reason.empty())
+      return result;
+  }
   if (info.status != "CLOSED") {
     // Keep the per-nest diagnostic: an unsupported nest knows exactly which
     // statement it could not model, and the reason is the user-facing part.
     result.reason =
         info.message.empty() ? "capture/scope is not CLOSED" : info.message;
+    for (const std::string &error : info.errors)
+      result.reason += "; " + error;
+    // Unsupported syntax is collected once and shared by capture and memory.
+    // Retain genuinely different findings without repeating the shared cause.
+    if (!memory_reason.empty() && memory_reason != info.message &&
+        std::find(info.errors.begin(), info.errors.end(), memory_reason) ==
+            info.errors.end())
+      result.reason +=
+          "; memory legality is " + memory_status + ": " + memory_reason;
     return result;
   }
   if (memory_status != "LEGAL") {
     result.reason = "memory legality is " + memory_status;
+    if (!memory_reason.empty())
+      result.reason += ": " + memory_reason;
     return result;
   }
   if (info.domain.empty()) {
@@ -705,9 +771,6 @@ VSimdRegionLift BuildRegion(const VSimdCaptureInfo &info,
 
   std::string verify_error;
   if (!VerifyRegion(region, &verify_error)) {
-    LOG(WARNING) << "[vsimd] internal region verification failed (compiler "
-                    "bug): "
-                 << verify_error;
     result.internal_error = true;
     result.reason = "internal region verification failed: " + verify_error;
     return result;
@@ -716,17 +779,12 @@ VSimdRegionLift BuildRegion(const VSimdCaptureInfo &info,
   std::string unsupported;
   Stmt expanded = ExpandVSimdRegionToLoops(region, &unsupported);
   if (!unsupported.empty() || !expanded.defined()) {
-    LOG(WARNING) << "[vsimd] internal region expansion failed (compiler bug): "
-                 << unsupported;
     result.internal_error = true;
     result.reason = "internal expander failure: " + unsupported;
     return result;
   }
   VSimdRegionVerify verify = VerifyExpandedRegion(region, expanded);
   if (!verify.ok) {
-    LOG(WARNING) << "[vsimd] internal region expansion verification failed "
-                    "(compiler bug): "
-                 << verify.reason;
     result.internal_error = true;
     result.reason = "internal expander verification failed: " + verify.reason;
     return result;
@@ -739,9 +797,6 @@ VSimdRegionLift BuildRegion(const VSimdCaptureInfo &info,
     VSimdRegionMatch match =
         CompareRegionWithOriginal(region, ffi::GetRef<Stmt>(info.root_for));
     if (!match.ok) {
-      LOG(WARNING) << "[vsimd] region does not match the original Parallel "
-                      "body (compiler bug): "
-                   << match.reason;
       result.internal_error = true;
       result.reason =
           "region does not match the original Parallel body: " + match.reason;
@@ -907,20 +962,23 @@ RenderVSimdRegionReport(const std::vector<VSimdCaptureInfo> &infos,
     // Gate each nest on its own legality status: an illegal sibling nest must
     // not disable a legal one (the P1 pass already works per nest).
     std::string memory_status = "MISSING";
+    std::string memory_reason;
     for (const VSimdMemoryRegionStatus &status : memory) {
       if (status.vf_index == info.vf_index &&
           status.nest_index == info.nest_index) {
         memory_status = status.status;
+        memory_reason = status.reason;
         break;
       }
     }
-    VSimdRegionLift lift = BuildRegion(info, memory_status, verify_body);
+    VSimdRegionLift lift =
+        BuildRegion(info, memory_status, verify_body, memory_reason);
     out << "VF#" << info.vf_index << " nest " << info.nest_index << ": ";
     if (!lift.lifted) {
       if (lift.internal_error) {
         out << "status=INTERNAL_ERROR reason=" << lift.reason << "\n";
       } else {
-        out << "status=FALLBACK reason=" << lift.reason << "\n";
+        out << "status=OPAQUE reason=" << lift.reason << "\n";
       }
       continue;
     }

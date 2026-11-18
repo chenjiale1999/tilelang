@@ -24,14 +24,20 @@ namespace tl {
 struct VSimdRegionLift {
   bool lifted{false};
   bool internal_error{false}; // builder self-check failed: compiler bug
-  std::string reason;         // fallback/internal-error reason
+  std::string reason;         // rejection/internal-error reason
   vsimd::VSimdRegion region;  // valid only when lifted=true
 };
+
+/*! \brief Shared fragment rejection for the annotation pass and region report.
+ * Returns an empty string when the subtree does not touch a fragment.
+ */
+TVM_DLL std::string FragmentRejectionReason(const tirx::For &loop);
 
 /*!
  * \brief Build a region for a proven, closed, rectangular nest.
  *
  * `memory_status` is the legality status of this nest (LEGAL is required).
+ * `memory_reason` retains the analysis explanation when the nest is rejected.
  * All other cases return lifted=false with a diagnostic; this function never
  * mutates IR. The built region carries the collapsed Parallel axes, the
  * ordered store ops of the innermost body, and the captured context.
@@ -44,7 +50,8 @@ struct VSimdRegionLift {
  */
 TVM_DLL VSimdRegionLift BuildRegion(const VSimdCaptureInfo &info,
                                     const std::string &memory_status,
-                                    bool verify_body = true);
+                                    bool verify_body = true,
+                                    const std::string &memory_reason = "");
 
 /*!
  * \brief Reconstruct serial scalar / structured IR from a region.
