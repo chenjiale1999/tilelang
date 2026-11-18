@@ -18,6 +18,8 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <sstream>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -105,11 +107,35 @@ MakeRegionOptions(const vsimd::VSimdRegion &region,
 }
 
 /*!
+ * \brief Fail when a region P1 lifted cannot be vectorized by P2 or P3.
+ *
+ * P1 LIFTED regions are the only units this chain owns: P1 has already proved
+ * the nest legal, so leaving it as a scalar ``T.Parallel`` inside
+ * ``__simd_vf__`` would lower to scalar instructions, which ccec rejects far
+ * from the actual cause. Report the region and the planner/emitter reason at
+ * the stage that owns the failure instead of deferring to codegen.
+ */
+void FailUnvectorizedRegion(const char *stage, int64_t vf_index,
+                            int64_t region_index, const Unsupported &error) {
+  std::ostringstream message;
+  message << "[vsimd] " << stage << " cannot vectorize VF#" << vf_index
+          << " region#" << region_index
+          << " that P1 lifted: " << error.message();
+  for (const std::string &diagnostic : error.diagnostics())
+    message << "\n  " << diagnostic;
+  message << "\nLeaving scalar code inside T.SimdVF is rejected by ccec; fix "
+             "the nest shape so P2/P3 can vectorize it.";
+  LOG(FATAL) << message.str();
+}
+
+/*!
  * \brief Plan every annotated top-level Parallel of one VF.
  *
- * An annotated loop is either planned (``tl.vsimd.plan`` is attached to it) or
- * left untouched. Nothing else in the VF body is inspected, so top-level
- * tile-ops are not consumed by this chain.
+ * A LIFTED annotated loop is planned and gets ``tl.vsimd.plan``. A LIFTED
+ * region the planner cannot handle is a hard error: it would otherwise remain
+ * scalar inside the VF. OPAQUE regions are P1-owned and are left untouched.
+ * Nothing else in the VF body is inspected, so top-level tile-ops are not
+ * consumed by this chain.
  */
 class VfRegionPlanner final : public StmtMutator {
 public:
@@ -131,7 +157,8 @@ public:
     }
     const vsimd::VSimdRegion &typed = region.value();
     if (typed->status != String(vsimd::region_status::kLifted)) {
-      // OPAQUE regions stay with the legacy lowering.
+      // P1 already decided this nest is outside the automatic chain (OPAQUE).
+      // Keep its original IR; this pass neither plans nor rewrites it.
       return loop;
     }
     try {
@@ -142,10 +169,9 @@ public:
       loop.CopyOnWrite()->annotations.Set(kPlanKey, ffi::Any(plan));
       return loop;
     } catch (const Unsupported &e) {
-      LOG(WARNING) << "[vsimd] P2 left region " << typed->region_index
-                   << " to legacy: " << e.message();
-      return loop;
+      FailUnvectorizedRegion("P2", typed->vf_index, typed->region_index, e);
     }
+    return loop; // unreachable: FailUnvectorizedRegion aborts
   }
 
 private:
@@ -183,8 +209,10 @@ Stmt StripLoopAnnotations(For loop) {
  *
  * The plan lives on the loop it describes, so replacement needs no span or
  * kind check: a plan annotation is by construction attached to the loop it was
- * built from. A failed emission keeps that loop (per-loop rollback); every
- * annotation is stripped either way so P1/P2 metadata never reaches codegen.
+ * built from. A failed emission is a hard error: P1 already lifted the region,
+ * so leaving the scalar loop inside ``__simd_vf__`` would be rejected by ccec
+ * later. Every annotation is stripped on the success path so P1/P2 metadata
+ * never reaches codegen.
  */
 class RegionEmitter final : public StmtMutator {
 public:
@@ -205,12 +233,19 @@ public:
           }
           return emitted;
         } catch (const Unsupported &e) {
-          LOG(WARNING) << "[vsimd] P3 left region " << plan->region_index
-                       << " to legacy: " << e.message();
+          FailUnvectorizedRegion("P3", plan->vf_index, plan->region_index, e);
         }
+      } else if (plan_node == nullptr) {
+        LOG(FATAL) << "[vsimd] P3 found a malformed tl.vsimd.plan payload; "
+                      "leaving the loop scalar inside T.SimdVF is rejected by "
+                      "ccec";
       } else {
-        LOG(WARNING) << "[vsimd] P3 ignored an incompatible tl.vsimd.plan "
-                        "payload";
+        LOG(FATAL) << "[vsimd] P3 found an incompatible tl.vsimd.plan on VF#"
+                   << plan_node->vf_index << " region#"
+                   << plan_node->region_index << " (version "
+                   << plan_node->version << ", expected " << kRegionPlanVersion
+                   << "); leaving the loop scalar inside T.SimdVF is rejected "
+                      "by ccec";
       }
     }
     const bool serial = op->kind == ForKind::kSerial;

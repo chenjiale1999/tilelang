@@ -373,9 +373,9 @@ def test_parallel_lane_uniform_branch_with_sibling_elementwise_loops():
     The flag is run both set and clear, so the masked-off arm is checked too.
 
     A row *reduction* cannot be expressed this way: it needs a ``T.Parallel``
-    axis (``s[i] += a[i,m]`` cannot use ``m`` as the lane axis), but a nested
-    ``T.Parallel`` under an ``if`` is not lifted by P1 ("not a single
-    rectangular nest") and a guarded cross-lane reduction is unsupported.  This
+    axis (``s[i] += a[i,m]`` cannot use ``m`` as the lane axis), but P1 only
+    gives the top-level rectangular nest a region, so a ``T.Parallel`` under an
+    ``if`` stays OPAQUE and a guarded cross-lane reduction is unsupported.  This
     case therefore covers the element-wise shape the pipeline supports.
     """
     rows, k = 8, 64

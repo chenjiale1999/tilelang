@@ -245,7 +245,13 @@ def test_parallel_under_a_serial_shell():
 
 
 @tilelang.testing.requires_ascend
-def test_parallel_sibling_reduction_shells_are_fissioned():
+def test_parallel_sibling_reduction_shells_share_one_region():
+    """Two sibling reduction shells stay in one region and both are vectorized.
+
+    P1 models the original outermost ``T.Parallel`` as one region (no fission);
+    P2's tree planner materializes each shell independently, so the generated
+    code still contains one cross-lane reduction per shell.
+    """
     rows, k = 8, 64
 
     @T.prim_func
@@ -274,7 +280,7 @@ def test_parallel_sibling_reduction_shells_are_fissioned():
             T.copy(d_ub, D)
 
     kernel, source = _compile(main, out_idx=[-2, -1])
-    assert source.count("simd_inst::vcadd(") == 2, "one reduction per fissioned nest"
+    assert source.count("simd_inst::vcadd(") == 2, "one reduction per sibling shell"
 
     a = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 5).to(torch.float32)
     b = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 3).to(torch.float32)
@@ -619,9 +625,9 @@ def test_parallel_elementwise_nz_and_row_reduction_are_planned_independently():
     """Elementwise + NZ and a row reduction in one VF, each in its own nest.
 
     The two recipes have no common vector axis. Keeping them in one
-    ``T.Parallel`` nest would make the reduction ignore an axis, which P1
-    rejects as a DSL error (it cannot fall back to scalar code inside a
-    ``T.SimdVF``), so the program uses one nest per recipe.
+    ``T.Parallel`` nest would make the reduction ignore an axis; P1 reports that
+    nest as OPAQUE/ILLEGAL and leaves the original IR (scalar code inside a
+    ``T.SimdVF`` is rejected by ccec), so the program uses one nest per recipe.
     """
 
     @T.prim_func

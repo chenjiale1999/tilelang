@@ -5,15 +5,17 @@ The chain vectorizes ``T.Parallel`` loops inside a ``SIMD_VF`` and nothing else:
 * P1 attaches ``tl.vsimd.region`` (``tl.vsimd.Region``) to every top-level
   Parallel;
 * P2 plans each LIFTED region and attaches ``tl.vsimd.plan``
-  (``tl.parallel_vectorize.VSimdRegionPlan``) to the **same loop**; a region the
-  planner cannot handle keeps no plan;
+  (``tl.parallel_vectorize.VSimdRegionPlan``) to the **same loop**; a LIFTED
+  region the planner cannot handle fails the compilation;
 * P3 replaces every loop carrying a plan and strips both annotations
-  unconditionally.
+  unconditionally; a plan it cannot emit or an incompatible payload also fails
+  the compilation.
 
 Tile-ops outside a Parallel (top-level in the VF) are not part of this chain:
 they keep their statements and belong to the regular tile-op lowering.
 """
 
+import pytest
 import tilelang
 import tilelang.ascend.language as T
 import tvm
@@ -127,6 +129,19 @@ def _simple(A: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
         with T.SimdVF():
             for i in T.Parallel(64):
                 c_ub[i] = a_ub[i] + 1.0
+        T.copy(c_ub, C)
+
+
+@T.prim_func
+def _unsupported_dtype(A: T.Tensor((64,), "float64"), C: T.Tensor((64,), "float64")):
+    """P1 can prove the nest independent, but P2 has no fp64 vector recipe."""
+    with T.Kernel(1):
+        a_ub = T.alloc_shared((64,), "float64")
+        c_ub = T.alloc_shared((64,), "float64")
+        T.copy(A, a_ub)
+        with T.SimdVF():
+            for i in T.Parallel(64):
+                c_ub[i] = a_ub[i] * 2.0
         T.copy(c_ub, C)
 
 
@@ -577,7 +592,7 @@ def test_parallel_under_a_serial_shell_closes_each_iteration():
     assert "VST_VLD" in body
 
 
-def test_parallel_under_a_branch_is_left_to_the_legacy_path():
+def test_parallel_under_a_branch_is_not_lifted():
     """Not a top-level nest: P1 attaches no region and logs why."""
     lifted = _lift(_parallel_under_branch)
     assert _regions(lifted) == []
@@ -626,7 +641,7 @@ def test_guarded_same_buffer_disjoint_arms_are_vectorized():
     assert "tl.simd.vscatter" in body and "tl.simd.pnot" in body
 
 
-def test_guarded_same_buffer_overlapping_arms_keep_the_legacy_loop():
+def test_guarded_same_buffer_overlapping_arms_keep_the_original_loop():
     """``c[2i]`` and ``c[i]`` intersect across lanes: the nest must stay scalar."""
     lifted = _lift(_guarded_same_buffer_overlapping_arms)
     region = _regions(lifted)[0]
@@ -693,12 +708,45 @@ def test_partial_lift_plans_only_the_lifted_parallel():
     emitted = _emit(planned)
     body = str(emitted["main"].body)
     assert "tl.simd.vadds" in body, "the lifted Parallel is vectorized"
-    assert "T.parallel" in body, "the opaque Parallel stays for legacy"
+    assert "T.parallel" in body, "the opaque Parallel keeps its original form"
     assert _regions(emitted) == []
     assert _plans(emitted) == []
 
 
-def test_fragment_access_is_left_to_legacy():
+def test_lifted_region_p2_cannot_plan_fails():
+    """P1 approved the region; leaving it scalar inside the VF is a hard error."""
+    lifted = _lift(_unsupported_dtype)
+    assert [region.status for region in _regions(lifted)] == ["LIFTED"]
+
+    with pytest.raises(tvm.error.InternalError, match="P2 cannot vectorize"):
+        _plan(lifted)
+
+
+def test_incompatible_plan_payload_fails():
+    """P3 must not silently ignore a plan payload it cannot trust."""
+    planned = _plan(_lift(_simple))
+
+    def rebuild(node):
+        if isinstance(node, tvm.tirx.For) and PLAN_KEY in dict(node.annotations):
+            return tvm.tirx.For(
+                node.loop_var,
+                node.min,
+                node.extent,
+                node.kind,
+                node.body,
+                node.thread_binding,
+                {PLAN_KEY: tvm.tirx.IntImm("int64", 0)},
+                node.step,
+            )
+        return None
+
+    mutated = tvm.tirx.stmt_functor.ir_transform(planned["main"].body, None, rebuild)
+    func = planned["main"].with_body(mutated)
+    with pytest.raises(tvm.error.InternalError, match="malformed tl.vsimd.plan"):
+        _emit(tvm.IRModule({"main": func}))
+
+
+def test_fragment_access_is_not_vectorized():
     lifted = _lift(_fragment_fallback)
     regions = _regions(lifted)
     assert [region.status for region in regions] == ["OPAQUE", "OPAQUE"]
@@ -787,7 +835,7 @@ def test_pipeline_uses_the_region_path_by_default():
     assert "tl.vsimd.plan" not in out.kernel_source
 
 
-def test_p1_disabled_leaves_the_legacy_path():
+def test_p1_disabled_leaves_the_original_loop():
     with tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT: False}):
         lifted = _lift(_simple)
         assert _regions(lifted) == []

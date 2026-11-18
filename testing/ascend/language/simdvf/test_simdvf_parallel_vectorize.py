@@ -2,8 +2,8 @@
 
 Every case is a ``T.SimdVF`` kernel whose ``T.Parallel`` nest is lifted by P1,
 planned by P2 and emitted by P3.  The test first asserts that the generated CCE
-really contains the expected vector intrinsic (so a silent fallback to the
-legacy scalar path cannot pass), then runs the kernel on an Ascend NPU and
+really contains the expected vector intrinsic (so a silent scalar lowering
+cannot pass), then runs the kernel on an Ascend NPU and
 compares it with a torch golden computed from the *scalar* semantics of the
 source program.
 

@@ -251,9 +251,10 @@ def AscendPlanVSimd():
 
     The body is unchanged. Every LIFTED region is planned independently and the
     resulting ``tl.parallel_vectorize.VSimdRegionPlan`` is attached to that loop as
-    ``tl.vsimd.plan``; a region the planner cannot handle keeps no plan and is
-    left to the legacy lowering. Only Parallel loops are considered: tile-ops
-    outside a Parallel belong to the regular tile-op lowering.
+    ``tl.vsimd.plan``; a LIFTED region the planner cannot handle is a hard error,
+    because leaving scalar code inside ``T.SimdVF`` is rejected by ccec. OPAQUE
+    (P1-rejected) regions are not planned. Only Parallel loops are considered:
+    tile-ops outside a Parallel belong to the regular tile-op lowering.
     """
     return _ffi_api.AscendPlanVSimd()  # type: ignore
 

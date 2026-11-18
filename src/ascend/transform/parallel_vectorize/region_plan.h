@@ -12,8 +12,10 @@
  *
  * Keeping the plan on the loop means P3 does not need spans, flattened body
  * indices or fingerprints: the annotation is the contract, and P3 replaces the
- * loop it is attached to. Loops P2 could not plan carry no plan annotation and
- * stay for the legacy lowering.
+ * loop it is attached to. P2 only plans LIFTED regions; a LIFTED region it
+ * cannot plan is a hard error, because leaving scalar code inside
+ * ``T.SimdVF`` is rejected by ccec. OPAQUE regions carry no plan and are not
+ * part of this chain.
  */
 #ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_REGION_PLAN_H_
 #define TVM_TL_ASCEND_TRANSFORM_PARALLEL_VECTORIZE_REGION_PLAN_H_
